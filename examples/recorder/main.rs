@@ -1,6 +1,6 @@
 // author: kodeholic (powered by Claude)
 //! 예제 녹음기 — 서버사이드 SDK(oxpeer)로 방에 녹음 참가자(`participant_type:1`)로 들어가 ★발언 한 건마다 Ogg Opus 파일 하나를 쓴다.
-//! 발언 경계는 발언권 화자 사건(`Speaker`)이 정한다 — 화자가 서면 새 파일 · 사라지거나 바뀌면 닫는다. 무전 슬롯 오디오(PTT)를 받는다.
+//! 발언 경계는 발언권 화자 사건(`Speaker`)이 정한다 — 화자가 서면 새 파일 · 사라지거나 바뀌면 닫는다. 무전 슬롯 오디오(PTT)만 담는다(개인 트랙은 센다).
 //!
 //!   cargo run --example recorder -- --base http://127.0.0.1:1974/media --room ch-1 --out ./rec [--secs 30] [--hidden] [--user rec-1]
 //!
@@ -102,10 +102,16 @@ async fn main() {
     let mut done: Vec<Value> = Vec::new();
     let mut n = 0u32;
     let mut orphan = 0u64;
+    let mut other_audio = 0u64;
     // 경계 밖 패킷마다 — seq · 서버 침묵 프레임인가 · 마지막 화자 사건(taken · idle · none)과 그 뒤 경과
     let mut orphans: Vec<Value> = Vec::new();
     let mut last_speaker: (&str, Instant) = ("none", Instant::now());
     let mut seen_events: Vec<String> = Vec::new();
+    // 복구 사실 — 세션 · 연결 상태가 바뀐 차례(같은 값이 이어지면 한 번) · 다시 세움 · 입장 · 재동기 횟수(2층 복구 시나리오가 읽는다)
+    let mut session_flow: Vec<String> = Vec::new();
+    let mut link_flow: Vec<String> = Vec::new();
+    let (mut rebuilt, mut joined, mut resync) = (0u32, 0u32, 0u32);
+    let mut join_failed: Vec<u16> = Vec::new();
     loop {
         tokio::select! {
             _ = &mut stop => break,
@@ -124,6 +130,22 @@ async fn main() {
                             }
                         }
                     }
+                    Event::Session(i) => {
+                        let s = format!("{:?}", i.state);
+                        if session_flow.last() != Some(&s) {
+                            session_flow.push(s);
+                        }
+                    }
+                    Event::Link(l) => {
+                        let s = format!("{:?}", l.state);
+                        if link_flow.last() != Some(&s) {
+                            link_flow.push(s);
+                        }
+                    }
+                    Event::Rebuilt => rebuilt += 1,
+                    Event::Joined { room } if *room == a.room => joined += 1,
+                    Event::Resync { room } if *room == a.room => resync += 1,
+                    Event::JoinFailed { room, error } if *room == a.room => join_failed.push(error.code),
                     Event::Closed { code, name, .. } => {
                         eprintln!("[recorder] 세션이 끝났다 {code} {name}");
                         break;
@@ -135,6 +157,11 @@ async fn main() {
             p = media.next() => {
                 let Some(p) = p else { break };
                 if p.room != a.room || p.kind != "audio" || !p.codec.eq_ignore_ascii_case("opus") {
+                    continue;
+                }
+                // 무전 슬롯 오디오만 담는다(주인 없는 트랙 — 화자는 발언권이 알린다) · 개인 트랙(전이중)은 세기만
+                if p.user_id.is_some() {
+                    other_audio += 1;
                     continue;
                 }
                 match cur.as_mut() {
@@ -159,10 +186,17 @@ async fn main() {
         "utterances": done,
         "orphan_packets": orphan,
         "orphans": orphans,
+        "other_audio": other_audio,
         "media_dropped": stats.media_dropped,
         "media_unrouted": stats.media_unrouted,
         "decrypt_fail": stats.decrypt_fail,
         "events": seen_events,
+        "session_flow": session_flow,
+        "link_flow": link_flow,
+        "rebuilt": rebuilt,
+        "joined": joined,
+        "resync": resync,
+        "join_failed": join_failed,
     });
     println!("{out}");
 }

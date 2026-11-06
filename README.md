@@ -43,7 +43,19 @@ cargo run --example recorder -- --base http://127.0.0.1:1974/media --room ch-1 -
 scripts/gate.sh        # 생성본 어긋남(peer_sync --check) · clippy -D warnings · cargo test
 ```
 
-2층은 labs(`oxlens-labs/oxe2epy` 시나리오 `peer_recorder`)가 예제 녹음기를 띄워 「봇이 보낸 Opus = 녹음 파일」로 견준다 — 재는 쪽은 labs 다.
+2층은 labs(`oxlens-labs/oxe2epy`)가 예제 녹음기를 띄워 「봇이 보낸 Opus = 녹음 파일」로 견준다 — 재는 쪽은 labs 다.
+
+| 시나리오 | 자극 | 복구 길 |
+|---|---|---|
+| `peer_recorder` | 없음(2봇 화자 전환) | — |
+| `peer_recorder_ws_cut` | 하네스 중계가 WS 만 끊는다(발언 중) | 이어받기(RESUME) — 녹음이 끊기지 않는다 |
+| `peer_recorder_session_cut` | 운영 절단(`/admin/users/{user}/cut`) | 세션 재구축 — 방 다시 들어가기 · 연결 새로 |
+| `peer_recorder_resync` | 발행 봇 송신 멈춤 → 서버 `sync_required` | 재동기(HTTP `GET /rooms`) |
+| `peer_recorder_freeze` | 프로세스 35초 얼림 | 이어받기 + ICE 재시작 |
+| `peer_recorder_freeze_long` | 프로세스 95초 얼림(서버 재개 창 밖) | 새 세션 — 다시 세움 |
+| `peer_recorder_unit_down` | 방을 든 미디어 유닛 내림 | 그 서버 재구축 → 방 없음(3001)으로 끝 · 세션은 산다 |
+
+DC 만 닫히는 경우(같은 연관 위 DC 다시 열기)는 바깥에서 걸 자극이 없어(서버 운영 표면에 그 손잡이가 없다) 1층 벡터(상태기)만 지난다.
 
 ## 첫 단계 범위
 

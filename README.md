@@ -50,7 +50,12 @@ cargo run --example recorder -- --base http://127.0.0.1:1974/media --room conf-1
 
 ```sh
 scripts/gate.sh        # 생성본 어긋남(peer_sync --check) · clippy -D warnings · cargo test
+scripts/media_check.sh # 재생기 호환 실측 — ffmpeg(libvpx · libx264 · libopus)가 있어야 돈다
 ```
+
+`media_check.sh` — ffmpeg 가 진짜 VP8 · H264 · Opus 를 짓고(해상도가 640x360 → 320x180 으로 바뀌는 판 — 시뮬캐스트 층 바뀜 흉내) →
+lib 시험(`media_fixture_*` · `#[ignore]`)이 libwebrtc 꼴 RTP(VP8 서술자 · H264 STAP-A · FU-A)로 쪼개 뒤바뀜 · RTX 복구를 섞어 수신 정리층에 넣고 원본과 바이트 대조 →
+예제 `mkvcheck` 가 녹화기의 MKV 쓰개로 파일을 짓고 → ffprobe · ffmpeg 가 디코드 오류 0 · 해상도 바뀜 · 길이 · 시간 이동을 본다.
 
 2층은 labs(`oxlens-labs/oxe2epy`)가 예제 녹음 · 녹화기를 띄워 「봇이 보낸 것 = 파일」로 견준다(봇 본문 표지 — 보낸 ssrc · 번호) — 재는 쪽은 labs 다.
 

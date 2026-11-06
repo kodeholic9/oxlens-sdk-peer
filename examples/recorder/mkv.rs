@@ -3,7 +3,9 @@
 //! VP8 은 그대로 · H264 는 Annex-B 를 길이 앞붙임(avcC)으로 바꾼다(Matroska `V_MPEG4/ISO/AVC`) · Opus 는 그대로(`A_OPUS`).
 //! 블록 시각은 RTP 시각 차(그 코덱 시계)로 센다 — SR 이 늦게 와도 뒤로 가지 않는다. 파일 시작 벽시계(DateUTC)는 첫 SR 동기 프레임에서
 //! 거꾸로 셈해 닫을 때 고쳐 쓴다(동기 프레임이 없으면 첫 프레임을 받은 시각).
-//! Segment · Cluster 는 크기를 모르는 꼴(라이브 Matroska)로 쓴다 — 쓰는 동안 앞으로 돌아가 크기를 고치지 않는다.
+//! Segment · Cluster 는 크기 모르는 꼴(라이브 Matroska)로 열어 쓰고 ★닫을 때 고쳐 쓴다 — 클러스터는 다음 클러스터를 열 때 크기를,
+//! 파일은 닫을 때 Segment 크기 · Duration · Cues(키프레임 클러스터 찾기 표) · SeekHead(Info · Tracks · Cues 자리)를. 도중에 죽어도 라이브 꼴로 읽힌다.
+//! (20261107 재생기 실측 — 크기 모르는 꼴만으로는 ffprobe 길이가 N/A 였다 · 시간 이동은 ffmpeg 가 파일을 훑어 됐다 — Cues 는 훑지 않는 재생기 몫.)
 
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
@@ -15,6 +17,11 @@ const ID_SEGMENT: u32 = 0x1853_8067;
 const ID_INFO: u32 = 0x1549_A966;
 const ID_TRACKS: u32 = 0x1654_AE6B;
 const ID_CLUSTER: u32 = 0x1F43_B675;
+const ID_CUES: u32 = 0x1C53_BB6B;
+const ID_SEEKHEAD: u32 = 0x114D_9B74;
+const ID_VOID: u32 = 0xEC;
+/// SeekHead 를 나중에 채울 빈 자리(Void 전체 바이트)
+const SEEKHEAD_ROOM: usize = 96;
 const UNKNOWN_SIZE: [u8; 8] = [0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
 /// Matroska 날짜의 바닥(2001-01-01T00:00:00Z) — 유닉스 초
 const MKV_EPOCH: u64 = 978_307_200;
@@ -68,6 +75,13 @@ fn el(id: u32, body: &[u8]) -> Vec<u8> {
     v
 }
 
+/// 크기 8바이트 꼴(나중에 같은 자리를 고쳐 쓴다)
+fn size8(n: u64) -> [u8; 8] {
+    let mut b = n.to_be_bytes();
+    b[0] = 0x01;
+    b
+}
+
 fn uint(id: u32, n: u64) -> Vec<u8> {
     let b = n.to_be_bytes();
     let skip = b.iter().take_while(|x| **x == 0).count().min(7);
@@ -80,6 +94,14 @@ fn float(id: u32, f: f64) -> Vec<u8> {
 
 fn text(id: u32, s: &str) -> Vec<u8> {
     el(id, s.as_bytes())
+}
+
+/// 빈 자리(Void) — 전체 `n` 바이트(머리 포함)
+fn void(n: usize) -> Vec<u8> {
+    let mut v = id_bytes(ID_VOID);
+    v.extend(vint_size((n - 2) as u64));
+    v.resize(n, 0);
+    v
 }
 
 /// Annex-B → NAL 목록
@@ -281,6 +303,19 @@ pub struct Mkv {
     f: File,
     codec: Codec,
     date_at: u64,
+    duration_at: u64,
+    seg_size_at: u64,
+    seg_data: u64,
+    seekhead_at: u64,
+    info_at: u64,
+    tracks_at: u64,
+    /// 열린 클러스터의 (크기 자리, 본문 시작)
+    cluster_open: Option<(u64, u64)>,
+    /// 찾기 표 — (클러스터 시각 ms, Segment 본문 기준 클러스터 위치)
+    cues: Vec<(u64, u64)>,
+    /// 마지막 블록의 RTP 틱 · 그 앞 블록과의 틱 차(길이 = 마지막 블록 + 한 간격)
+    last_ticks: u64,
+    last_gap: u64,
     first_ts: Option<u32>,
     unwrapped: u64,
     last_ts: u32,
@@ -301,18 +336,27 @@ impl Mkv {
         let ebml = [uint(0x4286, 1), uint(0x42F7, 1), uint(0x42F2, 4), uint(0x42F3, 8), text(0x4282, "matroska"), uint(0x4287, 4), uint(0x4285, 2)].concat();
         f.write_all(&el(ID_EBML, &ebml))?;
         let mut seg = id_bytes(ID_SEGMENT);
+        let seg_size_at = f.stream_position()? + seg.len() as u64;
         seg.extend_from_slice(&UNKNOWN_SIZE);
         f.write_all(&seg)?;
-        // Info — DateUTC 는 8바이트 자리를 두고 닫을 때 고쳐 쓴다
+        let seg_data = f.stream_position()?;
+        let seekhead_at = seg_data;
+        f.write_all(&void(SEEKHEAD_ROOM))?;
+        // Info — DateUTC · Duration 은 8바이트 자리를 두고 닫을 때 고쳐 쓴다
+        let info_at = f.stream_position()?;
         let head = [uint(0x2AD7B1, 1_000_000), text(0x4D80, "oxpeer recorder"), text(0x5741, "oxpeer recorder")].concat();
         let date = el(0x4461, &[0u8; 8]);
-        let info_body_len = head.len() + date.len();
+        let dur = el(0x4489, &[0u8; 8]);
+        let info_body_len = head.len() + date.len() + dur.len();
         let mut info = id_bytes(ID_INFO);
         info.extend(vint_size(info_body_len as u64));
         info.extend(&head);
-        let date_at = f.stream_position()? + info.len() as u64 + (date.len() - 8) as u64;
+        let date_at = info_at + info.len() as u64 + (date.len() - 8) as u64;
         info.extend(&date);
+        let duration_at = info_at + info.len() as u64 + (dur.len() - 8) as u64;
+        info.extend(&dur);
         f.write_all(&info)?;
+        let tracks_at = f.stream_position()?;
         let (id, kind, private, media) = match codec {
             Codec::Vp8 => {
                 let (w, h) = vp8_dims(first).unwrap_or((0, 0));
@@ -342,7 +386,32 @@ impl Mkv {
         }
         entry.extend(media);
         f.write_all(&el(ID_TRACKS, &el(0xAE, &entry)))?;
-        Ok(Mkv { f, codec, date_at, first_ts: None, unwrapped: 0, last_ts: 0, cluster_at: None, start_wall: None, frames: 0, keyframes: 0, synced: 0, first_rtp: None, last_rtp: 0, last_ms: 0 })
+        Ok(Mkv {
+            f,
+            codec,
+            date_at,
+            duration_at,
+            seg_size_at,
+            seg_data,
+            seekhead_at,
+            info_at,
+            tracks_at,
+            cluster_open: None,
+            cues: Vec::new(),
+            last_ticks: 0,
+            last_gap: 0,
+            first_ts: None,
+            unwrapped: 0,
+            last_ts: 0,
+            cluster_at: None,
+            start_wall: None,
+            frames: 0,
+            keyframes: 0,
+            synced: 0,
+            first_rtp: None,
+            last_rtp: 0,
+            last_ms: 0,
+        })
     }
 
     /// 프레임 하나 — RTP 시각 · 키프레임 · 벽시계(SR 로 이은 것이면 synced)
@@ -374,10 +443,16 @@ impl Mkv {
             Some(c) => ms < c || ms - c >= CLUSTER_SPAN_MS || (video && key) || (!video && ms - c >= AUDIO_CLUSTER_MS),
         };
         if new_cluster {
+            self.close_cluster()?;
+            let at = self.f.stream_position()?;
             let mut cl = id_bytes(ID_CLUSTER);
             cl.extend_from_slice(&UNKNOWN_SIZE);
+            let size_at = at + 4;
+            let data_at = at + cl.len() as u64;
             cl.extend(uint(0xE7, ms));
             self.f.write_all(&cl)?;
+            self.cluster_open = Some((size_at, data_at));
+            self.cues.push((ms, at - self.seg_data));
             self.cluster_at = Some(ms);
         }
         let rel = (ms - self.cluster_at.unwrap_or(ms)) as i16;
@@ -391,12 +466,48 @@ impl Mkv {
         if key {
             self.keyframes += 1;
         }
+        if self.frames > 1 {
+            self.last_gap = self.unwrapped.saturating_sub(self.last_ticks);
+        }
+        self.last_ticks = self.unwrapped;
         self.last_ms = ms;
+        Ok(())
+    }
+
+    /// 열린 클러스터의 크기를 고쳐 쓴다(끝에서 돌아와)
+    fn close_cluster(&mut self) -> io::Result<()> {
+        if let Some((size_at, data_at)) = self.cluster_open.take() {
+            let end = self.f.stream_position()?;
+            self.f.seek(SeekFrom::Start(size_at))?;
+            self.f.write_all(&size8(end - data_at))?;
+            self.f.seek(SeekFrom::Start(end))?;
+        }
         Ok(())
     }
 
     /// 닫는다 — DateUTC 를 고쳐 쓰고 파일 시작 벽시계(유닉스 ms)를 돌려준다
     pub fn finish(mut self) -> io::Result<Option<u64>> {
+        self.close_cluster()?;
+        // Cues — 클러스터마다 한 점(영상은 클러스터가 키프레임에서 시작한다)
+        let cues_at = self.f.stream_position()?;
+        let points: Vec<u8> = self
+            .cues
+            .iter()
+            .flat_map(|(ms, pos)| el(0xBB, &[uint(0xB3, *ms), el(0xB7, &[uint(0xF7, 1), uint(0xF1, *pos)].concat())].concat()))
+            .collect();
+        self.f.write_all(&el(ID_CUES, &points))?;
+        let end = self.f.stream_position()?;
+        self.f.seek(SeekFrom::Start(self.seg_size_at))?;
+        self.f.write_all(&size8(end - self.seg_data))?;
+        let seek = |id: u32, at: u64| el(0x4DBB, &[el(0x53AB, &id.to_be_bytes()), uint(0x53AC, at)].concat());
+        let rel = |at: u64| at - self.seg_data;
+        let head = el(ID_SEEKHEAD, &[seek(ID_INFO, rel(self.info_at)), seek(ID_TRACKS, rel(self.tracks_at)), seek(ID_CUES, rel(cues_at))].concat());
+        let mut room = head.clone();
+        room.extend(void(SEEKHEAD_ROOM - head.len()));
+        self.f.seek(SeekFrom::Start(self.seekhead_at))?;
+        self.f.write_all(&room)?;
+        self.f.seek(SeekFrom::Start(self.duration_at))?;
+        self.f.write_all(&((self.last_ticks + self.last_gap) as f64 * 1_000.0 / self.codec.clock() as f64).to_be_bytes())?;
         let start = self.start_wall.and_then(|w| w.duration_since(UNIX_EPOCH).ok());
         if let Some(s) = start {
             let ns = (s.as_nanos() as i128 - i128::from(MKV_EPOCH) * 1_000_000_000) as i64;
@@ -457,6 +568,93 @@ mod tests {
         let b = std::fs::read(&p).unwrap();
         assert_eq!(&b[..4], &[0x1A, 0x45, 0xDF, 0xA3]);
         assert!(b.windows(4).any(|w| w == [0x81, 0x00, 0x14, 0x80]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn rd_id(b: &[u8], at: usize) -> (u32, usize) {
+        let n = b[at].leading_zeros() as usize + 1;
+        (b[at..at + n].iter().fold(0u32, |a, x| (a << 8) | u32::from(*x)), n)
+    }
+
+    fn rd_size(b: &[u8], at: usize) -> (u64, usize) {
+        let n = b[at].leading_zeros() as usize + 1;
+        let v = b[at + 1..at + n].iter().fold(u64::from(b[at] & 0xFFu8.checked_shr(n as u32).unwrap_or(0)), |a, x| (a << 8) | u64::from(*x));
+        (v, n)
+    }
+
+    fn rd_uint(b: &[u8]) -> u64 {
+        b.iter().fold(0, |a, x| (a << 8) | u64::from(*x))
+    }
+
+    /// 닫은 파일의 뼈대 — Segment 크기 = 파일 끝 · 클러스터 크기를 따라 걸으면 다음 요소에 닿는다 · SeekHead → Cues · Cue → Cluster · Duration
+    #[test]
+    fn finished_file_is_sized_indexed_and_has_duration() {
+        let dir = std::env::temp_dir().join(format!("oxpeer-mkv-idx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("v.mkv");
+        let key = [0x10, 0x02, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x02, 0xe0, 0x01];
+        let mut m = Mkv::create(&p, Codec::Vp8, &key, 1).unwrap();
+        let t0 = UNIX_EPOCH;
+        for i in 0..90u32 {
+            let k = i % 30 == 0;
+            m.push(i * 3000, k, if k { &key } else { &[0x01, 0x00] }, t0, false).unwrap();
+        }
+        m.finish().unwrap();
+        let b = std::fs::read(&p).unwrap();
+        let (_, n) = rd_id(&b, 0);
+        let (sz, k) = rd_size(&b, n);
+        let seg = n + k + sz as usize;
+        let (sid, n) = rd_id(&b, seg);
+        assert_eq!(sid, ID_SEGMENT);
+        let (ssz, k) = rd_size(&b, seg + n);
+        let data = seg + n + k;
+        assert_eq!(data + ssz as usize, b.len(), "Segment 크기 = 파일 끝");
+        let (mut at, mut clusters, mut cues_at, mut cue_pos, mut dur) = (data, Vec::new(), None, Vec::new(), None);
+        while at < b.len() {
+            let (id, n) = rd_id(&b, at);
+            let (size, k) = rd_size(&b, at + n);
+            let body = &b[at + n + k..at + n + k + size as usize];
+            match id {
+                ID_SEEKHEAD => {
+                    let mut i = 0;
+                    while i < body.len() {
+                        let (_, n1) = rd_id(body, i);
+                        let (s1, k1) = rd_size(body, i + n1);
+                        let seek = &body[i + n1 + k1..i + n1 + k1 + s1 as usize];
+                        let (_, n2) = rd_id(seek, 0);
+                        let (s2, k2) = rd_size(seek, n2);
+                        let sid = rd_uint(&seek[n2 + k2..n2 + k2 + s2 as usize]) as u32;
+                        let rest = &seek[n2 + k2 + s2 as usize..];
+                        let (_, n3) = rd_id(rest, 0);
+                        let (s3, k3) = rd_size(rest, n3);
+                        if sid == ID_CUES {
+                            cues_at = Some(data + rd_uint(&rest[n3 + k3..n3 + k3 + s3 as usize]) as usize);
+                        }
+                        i += n1 + k1 + s1 as usize;
+                    }
+                }
+                ID_INFO => {
+                    if let Some(i) = body.windows(3).position(|w| w == [0x44, 0x89, 0x88]) {
+                        dur = Some(f64::from_be_bytes(body[i + 3..i + 11].try_into().unwrap()));
+                    }
+                }
+                ID_CLUSTER => clusters.push(at),
+                ID_CUES => {
+                    for w in body.windows(2).enumerate().filter(|(_, w)| w[0] == 0xF1) {
+                        let (s, k) = rd_size(body, w.0 + 1);
+                        cue_pos.push(data + rd_uint(&body[w.0 + 1 + k..w.0 + 1 + k + s as usize]) as usize);
+                    }
+                }
+                _ => {}
+            }
+            at += n + k + size as usize;
+        }
+        assert_eq!(at, b.len(), "요소 크기를 따라 걸으면 파일 끝에 정확히 닿는다");
+        assert_eq!(clusters.len(), 3, "키프레임마다 클러스터");
+        let ca = cues_at.expect("SeekHead 에 Cues 자리");
+        assert_eq!(rd_id(&b, ca).0, ID_CUES);
+        assert_eq!(cue_pos, clusters, "Cue 마다 클러스터 자리");
+        assert_eq!(dur, Some(3_000.0), "Duration = (마지막 블록 + 한 간격) RTP 틱 → ms");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

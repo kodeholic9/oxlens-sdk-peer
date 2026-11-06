@@ -3,6 +3,8 @@
 //! SDP 가 없다 — 서버는 클라 SDP 를 받지 않고 자격(`server_config.ice`)과 배정표로 붙는다. 협상 = 배정표를 받는 경로표에 싣는 것이다.
 
 pub(crate) mod depack;
+#[cfg(test)]
+mod media_fixture_test;
 pub(crate) mod recv;
 pub(crate) mod stun;
 pub(crate) mod transport;

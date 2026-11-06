@@ -1,0 +1,45 @@
+# author: kodeholic (powered by Claude)
+# 서버사이드 SDK — 녹음 · 녹화 · AI 에이전트 같은 서버 쪽 프로그램이 방에 peer 로 들어가는 Rust 라이브러리(SDK:RULE-PLAT-SERVER).
+# 서버 크레이트를 물지 않는다 — wire · 영역 상태기는 규격 원천의 Rust 생성본(src/gen · context/spec 의 npm run sync:peer)이고,
+# 미디어 스택만 서버와 같은 webrtc-rs 계열 · 같은 판이다(dtls · webrtc-srtp · webrtc-util 0.17 · sctp-proto 0.9).
+[package]
+name = "oxpeer"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Tae Goo Kang <kodeholic99@gmail.com>"]
+description = "OxLens server-side SDK — recorders and agents join rooms as peers"
+publish = false
+
+[features]
+default = ["serde"]
+# 생성 상태기(src/gen/*_client.rs)의 serde 파생 — 1층 벡터 시험이 TS 판이 낸 호출을 Rust 판에 넣어 맞댄다
+serde = []
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+async-trait = "0.1"
+dtls = "0.17.1"
+webrtc-srtp = "0.17.1"
+webrtc-util = "0.17.1"
+sctp-proto = "0.9"
+hmac = "0.12"
+sha1 = "0.10"
+crc32fast = "1"
+getrandom = { version = "0.3", features = ["std"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[[example]]
+name = "recorder"
+path = "examples/recorder/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"

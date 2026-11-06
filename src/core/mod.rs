@@ -17,10 +17,11 @@ use dtls::crypto::Certificate;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::api::{Config, Event, Stats};
+use crate::api::{Config, Event, Layer, Stats};
 use crate::error::Error;
 use crate::generated::{floor_client as flr, session_client as sc};
 use crate::http;
+use crate::link::recv::{MediaFrame, Unit};
 use crate::link::transport::{LinkFact, MediaPacket, MediaSink};
 use crate::sig::{Outcome, Purpose, Sig, SockIn};
 
@@ -34,6 +35,8 @@ pub(crate) enum Cmd {
     Leave(String, oneshot::Sender<Result<(), Error>>),
     Close(oneshot::Sender<()>),
     Stats(oneshot::Sender<Stats>),
+    SetUnit(String, Unit),
+    SetLayer(String, Layer, oneshot::Sender<Result<(), Error>>),
 }
 
 /// 재동기 응답(HTTP — 루프 밖 태스크가 받아 넘긴다)
@@ -169,6 +172,11 @@ pub(crate) struct Core {
     pub(crate) fact_tx: mpsc::UnboundedSender<LinkFact>,
     pub(crate) http_tx: mpsc::UnboundedSender<HttpDone>,
     pub(crate) sink: MediaSink,
+    /// 받는 단위 — 앱 기본 · 트랙마다 고친 것
+    pub(crate) unit: Unit,
+    pub(crate) units: HashMap<String, Unit>,
+    /// 트랙마다 층을 바꾼 차례(정리층이 키프레임을 기다리는 표시)
+    pub(crate) layer_gen: HashMap<String, u64>,
     pub(crate) cert: Certificate,
     pub(crate) connect_waiters: Vec<oneshot::Sender<Result<(), Error>>>,
     /// ACTIVE 를 기다리는 입장(SDK:RULE-API-ASYNC 연결 전 요청)
@@ -181,14 +189,25 @@ pub(crate) struct Core {
     trace: bool,
 }
 
-pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::Sender<MediaPacket>) -> Result<mpsc::UnboundedSender<Cmd>, Error> {
+pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::Sender<MediaPacket>, frames: mpsc::Sender<MediaFrame>) -> Result<mpsc::UnboundedSender<Cmd>, Error> {
     let (auth, prefix) = http::split_base(&cfg.base)?;
     let cert = Certificate::generate_self_signed(vec!["oxpeer".to_string()]).map_err(|e| Error::transport(format!("인증서: {e}")))?;
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (sock_tx, sock_rx) = mpsc::unbounded_channel();
     let (fact_tx, fact_rx) = mpsc::unbounded_channel();
     let (http_tx, http_rx) = mpsc::unbounded_channel();
-    let sink = MediaSink { routes: Arc::default(), tx: media, dropped: Arc::new(AtomicU64::new(0)), unrouted: Arc::new(AtomicU64::new(0)), decrypt_fail: Arc::new(AtomicU64::new(0)) };
+    let sink = MediaSink {
+        routes: Arc::default(),
+        tx: media,
+        frames,
+        dropped: Arc::new(AtomicU64::new(0)),
+        frames_dropped: Arc::new(AtomicU64::new(0)),
+        counters: Arc::default(),
+        qa_drop_every: std::env::var("OXPEER_QA_DROP_VIDEO_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+        qa_dropped: Arc::new(AtomicU64::new(0)),
+        unrouted: Arc::new(AtomicU64::new(0)),
+        decrypt_fail: Arc::new(AtomicU64::new(0)),
+    };
     let req = Duration::from_millis(sc::timer_ms(sc::TimerName::TReq).unwrap_or(30_000) as u64);
     let core = Core {
         base: cfg.base.clone(),
@@ -216,6 +235,9 @@ pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::
         fact_tx,
         http_tx,
         sink,
+        unit: cfg.unit,
+        units: HashMap::new(),
+        layer_gen: HashMap::new(),
         cert,
         connect_waiters: Vec::new(),
         parked: Vec::new(),
@@ -330,12 +352,28 @@ impl Core {
                 let _ = tx.send(());
             }
             Cmd::Stats(tx) => {
+                let c = &self.sink.counters;
+                let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
                 let _ = tx.send(Stats {
-                    media_dropped: self.sink.dropped.load(Ordering::Relaxed),
-                    media_unrouted: self.sink.unrouted.load(Ordering::Relaxed),
-                    decrypt_fail: self.sink.decrypt_fail.load(Ordering::Relaxed),
+                    media_dropped: n(&self.sink.dropped),
+                    media_unrouted: n(&self.sink.unrouted),
+                    decrypt_fail: n(&self.sink.decrypt_fail),
+                    frames_dropped: n(&self.sink.frames_dropped),
+                    nack_sent: n(&c.nack_sent),
+                    rtx_recovered: n(&c.rtx_recovered),
+                    lost: n(&c.lost),
+                    pli_sent: n(&c.pli_sent),
+                    rr_sent: n(&c.rr_sent),
+                    frames_broken: n(&c.frames_broken),
+                    frames_skipped: n(&c.frames_skipped),
+                    qa_dropped: n(&self.sink.qa_dropped),
                 });
             }
+            Cmd::SetUnit(track, unit) => {
+                self.units.insert(track, unit);
+                self.rebuild_routes();
+            }
+            Cmd::SetLayer(track, layer, tx) => self.set_layer(track, layer, tx),
         }
     }
 
@@ -426,6 +464,7 @@ impl Core {
             Purpose::RoomJoin { room, epoch, jid } => self.join_reply(&room, epoch, jid, o),
             Purpose::RoomLeave { room, epoch } => self.leave_reply(&room, epoch, o),
             Purpose::Ready { room, epoch } => self.ready_reply(&room, epoch, o),
+            Purpose::Layer { room, epoch, id } => self.layer_reply(&room, epoch, id, o),
             Purpose::IceRestart { server, req } => self.restart_reply(&server, req, o),
         }
     }

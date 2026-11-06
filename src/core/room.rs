@@ -10,9 +10,9 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use super::{Core, Tk};
-use crate::api::Event;
+use crate::api::{Event, Layer};
 use crate::error::{Category, Error};
-use crate::generated::ws_wire::{MemberInfo, Op, TrackEntry, TrackEntryType};
+use crate::generated::ws_wire::{MemberInfo, Op, SubscribeLayerReqTargets, TrackEntry, TrackEntryType};
 use crate::generated::{floor_client as fc, ptt_binding as pb, room_binding as rb, room_client as rc, session_client as sc, sub_binding as ub, sub_client as uc, trk_binding as tb, trk_client as tc};
 use crate::sig::{Outcome, Purpose};
 use crate::wire::dc;
@@ -51,6 +51,12 @@ pub(crate) struct Room {
     pub(crate) rebuilding: bool,
     forced_cause: String,
     closed: bool,
+    /// 앱이 고른 층(트랙마다 · 합친 것) — 다시 들어가면 다시 보낸다(서버는 새 입장에서 모른다)
+    layers: BTreeMap<String, SubscribeLayerReqTargets>,
+    /// 다음 SUBSCRIBE_LAYER 가 답할 앱 요청 · 보낸 요청마다 기다리는 앱
+    layer_next: Option<oneshot::Sender<Result<(), Error>>>,
+    layer_waiters: BTreeMap<u64, oneshot::Sender<Result<(), Error>>>,
+    layer_seq: u64,
 }
 
 impl Room {
@@ -81,6 +87,10 @@ impl Room {
             rebuilding: false,
             forced_cause: "kick".into(),
             closed: false,
+            layers: BTreeMap::new(),
+            layer_next: None,
+            layer_waiters: BTreeMap::new(),
+            layer_seq: 0,
         }
     }
 
@@ -172,7 +182,12 @@ impl Core {
                         r.req_epoch += 1;
                     }
                     let rid = id.to_string();
-                    self.sig.forget(|p| matches!(p, Purpose::RoomJoin { room, .. } | Purpose::RoomLeave { room, .. } | Purpose::Ready { room, .. } if *room == rid));
+                    self.sig.forget(|p| matches!(p, Purpose::RoomJoin { room, .. } | Purpose::RoomLeave { room, .. } | Purpose::Ready { room, .. } | Purpose::Layer { room, .. } if *room == rid));
+                    if let Some(r) = self.rooms.get_mut(id) {
+                        for (_, tx) in std::mem::take(&mut r.layer_waiters) {
+                            let _ = tx.send(Err(Error::closed("ABANDONED")));
+                        }
+                    }
                 }
             }
         }
@@ -609,6 +624,9 @@ impl Core {
                     r.join_pending = true;
                 }
                 self.emit(Event::Joined { room: id.to_string() });
+                if self.rooms.get(id).is_some_and(|r| !r.layers.is_empty()) {
+                    self.sub_enter(id, "layer", |s| Some(uc::layer(s)), "joined");
+                }
             }
             Some(rb::RoomEvent::JoinFailed) => {
                 let Some(r) = self.rooms.get_mut(id) else { return };
@@ -802,8 +820,7 @@ impl Core {
         for tx in &plan.send {
             match tx {
                 uc::Tx::Ready => self.send_ready(id),
-                // 레이어 고르기는 녹화 단계 몫(20261106c 미결) — 첫 단계는 내지 않는다
-                uc::Tx::SubscribeLayer => {}
+                uc::Tx::SubscribeLayer => self.send_layer(id),
             }
         }
         for sm in &plan.seams {
@@ -832,6 +849,86 @@ impl Core {
         }
         let epoch = r.req_epoch;
         self.request(Op::Ready, body, Purpose::Ready { room: id.to_string(), epoch });
+    }
+
+    /// 앱의 층 고르기(SDK:IMPL-TRK-RECEIVE `RemoteTrack.setLayer`) — 값은 상한 · `scalability` 밖은 그 축의 끝으로 자른다(연:RULE-SUB-LAYER-PROC)
+    pub(super) fn set_layer(&mut self, track: String, layer: Layer, tx: oneshot::Sender<Result<(), Error>>) {
+        let id = self.rooms.values().find(|r| !r.closed && r.st.rs == rc::RoomSt::JOINED && r.entries.contains_key(&track)).map(|r| r.id.clone());
+        let Some(id) = id else {
+            let _ = tx.send(Err(Error::sdk("NO_TRACK", Category::State)));
+            return;
+        };
+        let Some(r) = self.rooms.get_mut(&id) else { return };
+        let (smax, tmax) = r.entries.get(&track).and_then(|t| t.scalability.as_deref()).and_then(scalability).unwrap_or((u8::MAX, u8::MAX));
+        let t = r.layers.entry(track.clone()).or_insert_with(|| SubscribeLayerReqTargets { track_id: track.clone(), spatial: None, temporal: None, paused: None, priority: None });
+        if let Some(v) = layer.spatial {
+            t.spatial = Some(v.min(smax));
+        }
+        if let Some(v) = layer.temporal {
+            t.temporal = Some(v.min(tmax));
+        }
+        if let Some(v) = layer.paused {
+            t.paused = Some(v);
+        }
+        if let Some(v) = layer.priority {
+            t.priority = Some(v);
+        }
+        r.layer_next = Some(tx);
+        *self.layer_gen.entry(track).or_default() += 1;
+        self.rebuild_routes();
+        self.sub_enter(&id, "layer", |s| Some(uc::layer(s)), "setLayer");
+    }
+
+    /// SUBSCRIBE_LAYER — 이 방에서 고른 층 전부(생략한 칸은 안 바꾸는 부분 갱신이라 다시 보내도 같다)
+    fn send_layer(&mut self, id: &str) {
+        let Some(r) = self.rooms.get_mut(id) else { return };
+        let tx = r.layer_next.take();
+        if r.layers.is_empty() {
+            if let Some(tx) = tx {
+                let _ = tx.send(Ok(()));
+            }
+            return;
+        }
+        r.layer_seq += 1;
+        let wid = r.layer_seq;
+        if let Some(tx) = tx {
+            r.layer_waiters.insert(wid, tx);
+        }
+        let mut body = json!({ "room_id": id, "targets": r.layers.values().collect::<Vec<_>>() });
+        if let Some(j) = self.jids.str(r.st.jid) {
+            body["join_id"] = Value::String(j.to_string());
+        }
+        let epoch = r.req_epoch;
+        self.request(Op::SubscribeLayer, body, Purpose::Layer { room: id.to_string(), epoch, id: wid });
+    }
+
+    pub(super) fn layer_reply(&mut self, id: &str, epoch: u64, wid: u64, o: Outcome) {
+        let Some(r) = self.rooms.get_mut(id) else { return };
+        let tx = r.layer_waiters.remove(&wid);
+        if r.req_epoch != epoch {
+            if let Some(tx) = tx {
+                let _ = tx.send(Err(Error::closed("ABANDONED")));
+            }
+            return;
+        }
+        let res = match o {
+            Outcome::Ok(_) => Ok(()),
+            Outcome::Fail(b) => Err(Error::from_failure(&b)),
+            // 기한을 넘겼다 — 다시 보낸다(부분 갱신이라 멱등) · 기다리는 앱은 다음 응답이 답한다
+            Outcome::Expired => {
+                r.layer_next = tx;
+                self.send_layer(id);
+                return;
+            }
+            Outcome::Transport | Outcome::Closed => Err(Error::closed("CLOSED")),
+        };
+        let ok = res.is_ok();
+        if let Some(tx) = tx {
+            let _ = tx.send(res);
+        }
+        if ok {
+            self.sub_enter(id, "layerRes", |s| Some(uc::layer_res(s)), "SUBSCRIBE_LAYER.res");
+        }
     }
 
     pub(super) fn ready_reply(&mut self, id: &str, epoch: u64, o: Outcome) {
@@ -915,4 +1012,13 @@ impl Core {
         }
         self.floor_enter(&room, "receive", |s| Some(fc::receive(s, &rx)), "DC");
     }
+}
+
+/// `L{S}T{T}` → 축마다 가장 큰 인덱스(연:TRK.type.TrackEntry `scalability`)
+fn scalability(v: &str) -> Option<(u8, u8)> {
+    let rest = v.strip_prefix('L')?;
+    let (s, t) = rest.split_once('T')?;
+    let s: u8 = s.parse().ok()?;
+    let t: u8 = t.trim_end_matches(|c: char| !c.is_ascii_digit()).parse().ok()?;
+    Some((s.checked_sub(1)?, t.checked_sub(1)?))
 }

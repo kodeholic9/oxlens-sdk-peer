@@ -97,6 +97,7 @@ pub(crate) enum Purpose {
     RoomJoin { room: String, epoch: u64, jid: i64 },
     RoomLeave { room: String, epoch: u64 },
     Ready { room: String, epoch: u64 },
+    Layer { room: String, epoch: u64, id: u64 },
     IceRestart { server: String, req: i64 },
 }
 

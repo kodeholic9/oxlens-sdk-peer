@@ -4,7 +4,6 @@
 //! 2pc(SDK:RULE-PLAT-SERVER pc_mode) — 전송 둘(발행 · 구독)이 한 묶음이다. ICE 는 둘 다 서야 선 것 · DC 는 발행 연결에.
 //! ★협상 = 배정표를 받는 경로표(ssrc → 트랙)에 싣는 것이다(SDP 가 없다) — 늘 성공한다 · 결과는 입구 negoRes 로 넣는다.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -14,7 +13,7 @@ use super::{Core, Job, Tk};
 use crate::api::{Event, LinkInfo, LinkState};
 use crate::generated::ws_wire::{IceRestartRes, MlineTable, Op, ServerConfig, TrackEntryType};
 use crate::generated::{link_binding as lb, link_client as lc, room_client as rc, sdk_defaults as dflt, session_client as sc, sub_client as uc};
-use crate::link::transport::{Creds, Fact, IceState, LinkFact, Role, Route, Transport};
+use crate::link::transport::{Creds, Fact, IceState, LinkFact, Role, Route, Routes, Transport};
 use crate::sig::{Outcome, Purpose};
 
 pub(crate) struct Link {
@@ -323,7 +322,7 @@ impl Core {
 
     /// 그 트랙의 첫 복호 패킷 — receiving · 무전 슬롯 오디오면 발언권 입구 rtpRx(재생은 서버사이드 대상 아님)
     fn first_rtp(&mut self, server: &str, ssrc: u32) {
-        let route = self.sink.routes.read().ok().and_then(|g| g.get(&ssrc).cloned());
+        let route = self.sink.routes.read().ok().and_then(|g| g.media.get(&ssrc).cloned());
         let Some(r) = route else { return };
         self.emit(Event::Receiving { room: r.room.clone(), track_id: r.track_id.clone() });
         let slot_audio = r.kind == "audio" && self.rooms.get(&r.room).and_then(|x| x.entries.get(&r.track_id)).is_some_and(|t| t.type_ == TrackEntryType::Slot);
@@ -769,18 +768,38 @@ impl Core {
         self.surface(false);
     }
 
-    /// 받는 경로표 — 배정표 줄(ssrc · mid · 트랙) + 방 보관본(주인) · 미디어 경로가 이것으로 가른다
+    /// 받는 경로표 — 배정표 줄(ssrc · mid · 트랙 · RTX 짝) + 방 보관본(주인) + 서버 코덱 정책(`rtcp_fb`) + 앱이 고른 단위 · 층 차례 · 미디어 경로가 이것으로 가른다
     pub(super) fn rebuild_routes(&mut self) {
-        let mut routes: HashMap<u32, Route> = HashMap::new();
+        let mut routes = Routes::default();
         for l in self.links.values() {
             let Some(t) = &l.table else { continue };
+            // 구독 피드백은 `codecs_sub` 가 오면 그것 · 없으면 `codecs`(연:RULE-LINK-SDP-SUB-MLINE)
+            let policy = l.sc.codecs_sub.as_ref().unwrap_or(&l.sc.codecs);
             for m in &t.mlines {
                 let Some(tid) = &m.track_id else { continue };
                 let room = m.room_id.clone().or_else(|| self.rooms.values().find(|r| r.sfu.as_deref() == Some(l.server.as_str()) && r.entries.contains_key(tid)).map(|r| r.id.clone()));
                 let Some(room) = room else { continue };
                 let entry = self.rooms.get(&room).and_then(|r| r.entries.get(tid));
                 let kind = serde_json::to_value(m.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
-                routes.insert(m.ssrc, Route { room, track_id: tid.clone(), user_id: entry.and_then(|e| e.user_id.clone()), kind, codec: m.codec.clone(), mid: m.mid.clone() });
+                let fb: Vec<&str> = policy.iter().filter(|c| c.kind == m.kind && c.name.eq_ignore_ascii_case(&m.codec)).flat_map(|c| c.rtcp_fb.iter().map(String::as_str)).collect();
+                let route = Route {
+                    room,
+                    track_id: tid.clone(),
+                    user_id: entry.and_then(|e| e.user_id.clone()),
+                    kind,
+                    codec: m.codec.clone(),
+                    mid: m.mid.clone(),
+                    ssrc: m.ssrc,
+                    pt: m.pt,
+                    nack: fb.contains(&"nack"),
+                    pli: fb.contains(&"nack pli"),
+                    unit: self.units.get(tid).copied().unwrap_or(self.unit),
+                    layer_gen: self.layer_gen.get(tid).copied().unwrap_or(0),
+                };
+                if let Some(x) = m.rtx_ssrc {
+                    routes.rtx.insert(x, m.ssrc);
+                }
+                routes.media.insert(m.ssrc, route);
             }
         }
         if let Ok(mut g) = self.sink.routes.write() {

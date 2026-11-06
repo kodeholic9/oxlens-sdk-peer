@@ -5,6 +5,8 @@ OxLens **서버사이드 SDK**. 녹음 · 녹화 · AI 에이전트 같은 서�
 
 - 서버 코어(hub · sfud)는 이 SDK 를 모른다 — 뒷문이 없다. 참가자 종류(`participant_type` 1 녹음 · 2 봇)와 투명(`hidden`)은 앱이 발급받은 토큰의 클레임이 정한다.
 - 미디어 엔진은 서버와 같은 webrtc-rs 계열(DTLS · SRTP · SCTP)이다. 장치 · 재생이 없어 libwebrtc 를 쓰지 않는다 — 받은 것은 SRTP 를 푼 RTP(코덱 페이로드 그대로)이고 디코딩은 앱 몫이다.
+- ★브라우저에서 libwebrtc 수신 쪽이 하던 일은 SDK 의 **수신 정리층**이 한다(`SDK:RULE-PLAT-SERVER` 수신 정리층) — 재정렬 · 영상만 NACK(RTX 를 원래 seq 로 푼다) · PLI · RR · SR 로 벽시계 잇기. 무엇을 보낼지는 그 줄의 `rtcp_fb` 가 정한다. 앱은 RTCP 를 짓지 않는다.
+- 받는 단위는 트랙마다 고른다 — **패킷**(`Media` · 받은 순서 그대로) 또는 **프레임**(`Frames` · 순서대로 조립한 코덱 프레임 — H264 Annex-B · VP8 서술자 뗀 것 · Opus 패킷 · 영상은 키프레임부터 · SR 로 이은 벽시계). 조립은 디코딩이 아니다.
 - 2pc 로 붙는다(능력표에 `oxpeer` 행이 없다 — `SDK:RULE-PLAT-PC-MODE`).
 
 ## 쓰는 법
@@ -13,18 +15,25 @@ OxLens **서버사이드 SDK**. 녹음 · 녹화 · AI 에이전트 같은 서�
 let req = oxpeer::TokenReq { api_key: "…".into(), api_secret: "…".into(), user_id: "rec-1".into(),
                              participant_type: Some(1), hidden: Some(true), metadata: None, permission: None };
 let token = oxpeer::issue_token("http://127.0.0.1:1974/media", &req).await?;
-let (client, mut events, mut media) = oxpeer::Client::connect(oxpeer::Config::new("http://127.0.0.1:1974/media", token)).await?;
+let mut cfg = oxpeer::Config::new("http://127.0.0.1:1974/media", token);
+cfg.unit = oxpeer::Unit::Frame;              // 받는 단위 기본(트랙마다는 client.set_unit)
+let (client, mut events, mut media, mut frames) = oxpeer::Client::connect(cfg).await?;
 client.join("ch-1").await?;                 // 듣기(select:false)로 들어간다
 // events.next() — Session · Joined · Tracks · Speaker{user_id} · Link · Closed …(SDK 정의서 효과 표의 이름)
-// media.next()  — MediaPacket{room, track_id, kind, codec, sequence, timestamp, payload …}
+// media.next()  — MediaPacket{room, track_id, kind, codec, sequence, timestamp, payload …}(단위 Packet 인 트랙)
+// frames.next() — MediaFrame{room, track_id, kind, codec, timestamp, keyframe, data, wallclock, synced …}(단위 Frame 인 트랙)
+client.set_layer("t…", oxpeer::Layer { spatial: Some(0), ..Default::default() }).await?;   // 층 상한(실제 선택은 서버)
 client.close().await;
 ```
 
-예제 녹음기 — 발언 한 건마다 Ogg Opus 파일 하나(화자 사건 `Speaker` 가 경계):
+예제 — 녹음(발언 한 건마다 Ogg Opus 파일 하나 · 화자 사건 `Speaker` 가 경계)과 녹화(`--video` — 트랙마다 Matroska 하나 · 무전 슬롯은 발언마다):
 
 ```sh
 cargo run --example recorder -- --base http://127.0.0.1:1974/media --room ch-1 --out ./rec --secs 30 --hidden
+cargo run --example recorder -- --base http://127.0.0.1:1974/media --room conf-1 --out ./rec --video [--spatial 0] [--layer-plan 4:0,8:1]
 ```
+
+녹화 파일은 트랙마다 따로다 — 사람 · 트랙 합치기(음성 + 영상)는 예제 밖이다(ffmpeg 등). 블록 시각은 RTP 시각 차 · 파일 시작 벽시계(`DateUTC`)는 첫 SR 동기 프레임에서 거꾸로 셈한다 — 트랙끼리 그 값으로 맞춘다.
 
 ## 구조
 
@@ -32,10 +41,10 @@ cargo run --example recorder -- --base http://127.0.0.1:1974/media --room ch-1 -
 |---|---|
 | `src/generated/` | ★**생성본 — 손으로 고치지 않는다.** 영역 클라 상태기(세션 · 방 · 연결 · 구독 · 트랙 · 발언권) · 결합 · WS wire · 발언권 코덱 · 정책 SDK 기본값. 규격 저장소에서 `npm run sync:peer` 로 옮긴다 |
 | `src/core/` | SDK 루프 하나 — 입구 표 · 효과 표 · 이음매 집행 · 시계(절차는 생성 상태기가 정한다) |
-| `src/link/` | 전송(UDP · ICE consent · DTLS · SRTP · SCTP/DCEP) — 층마다 사실을 낸다 |
+| `src/link/` | 전송(UDP · ICE consent · DTLS · SRTP · SCTP/DCEP) — 층마다 사실을 낸다 · `recv.rs` 수신 정리층 · `depack.rs` RTP 꼴 → 코덱 꼴 |
 | `src/sig.rs` · `src/wire/` | WS 소켓 · 대기표 · 프레임 머리(WS · DC) |
 | `tests/vectors/` | 규격 짓기의 재생 시험이 TS 판 상태기에 넣은 호출과 결과 — Rust 판이 같은 결과를 내는지 1층이 맞댄다 |
-| `examples/recorder/` | 예제 녹음기(Ogg Opus) |
+| `examples/recorder/` | 예제 녹음 · 녹화기(Ogg Opus · `--video` Matroska) |
 
 ## 게이트
 
@@ -43,7 +52,7 @@ cargo run --example recorder -- --base http://127.0.0.1:1974/media --room ch-1 -
 scripts/gate.sh        # 생성본 어긋남(peer_sync --check) · clippy -D warnings · cargo test
 ```
 
-2층은 labs(`oxlens-labs/oxe2epy`)가 예제 녹음기를 띄워 「봇이 보낸 Opus = 녹음 파일」로 견준다 — 재는 쪽은 labs 다.
+2층은 labs(`oxlens-labs/oxe2epy`)가 예제 녹음 · 녹화기를 띄워 「봇이 보낸 것 = 파일」로 견준다(봇 본문 표지 — 보낸 ssrc · 번호) — 재는 쪽은 labs 다.
 
 | 시나리오 | 자극 | 복구 길 |
 |---|---|---|
@@ -57,6 +66,15 @@ scripts/gate.sh        # 생성본 어긋남(peer_sync --check) · clippy -D war
 
 DC 만 닫히는 경우(같은 연관 위 DC 다시 열기)는 바깥에서 걸 자극이 없어(서버 운영 표면에 그 손잡이가 없다) 1층 벡터(상태기)만 지난다.
 
-## 첫 단계 범위
+녹화(context 202611/20261107a):
 
-세션 · 연결 · 방 · 받는 트랙 · 구독 + 발언권 듣기. **아직 없는 것** — 발행 · 발언 요청 · 레이어 고르기(`SUBSCRIBE_LAYER`) · RTCP 보내기(RR · NACK · PLI) · `https`/`wss` · 같은 `Client` 로 다시 `connect`(닫으면 새로 만든다).
+| 시나리오 | 보는 것 |
+|---|---|
+| `peer_record_video` · `peer_record_video_h264` | 봇이 세 조각으로 보낸 프레임(VP8 이어지는 조각 · H264 FU-A)을 이어 키프레임부터 번호가 빠짐없이 · 파일 시작 벽시계 = 봇 SR 로 셈한 값(±3ms) |
+| `peer_record_simulcast` | `set_layer` 상한(1 → 0 → 1)대로 받은 층 표지(h/l)가 바뀐다 — 그 파일의 RTP 시각축에서 견준다 |
+| `peer_record_loss` | ★QA 스위치 `OXPEER_QA_DROP_VIDEO_EVERY=N`(받은 영상 원본 N 개마다 하나를 정리층 앞에서 버림 · RTX 는 안 버림 · 시험 수단)로 흉내 낸 손실을 NACK → RTX 로 다 메운다 |
+| `peer_record_ptt_video` | 무전 슬롯 — 종류마다 발언 한 건 = 파일 하나 · 화자 차례 = 허가 차례 |
+
+## 범위
+
+세션 · 연결 · 방 · 받는 트랙 · 구독 + 발언권 듣기(첫 단계) · 수신 정리층 · 프레임 단위 수신 · 층 고르기(녹화 단계). **아직 없는 것** — 발행 · 발언 요청(에이전트 단계) · `https`/`wss` · 같은 `Client` 로 다시 `connect`(닫으면 새로 만든다).

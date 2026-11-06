@@ -2,7 +2,8 @@
 //! 전송 하나(웹의 PeerConnection 한 개 자리) — UDP 소켓 하나 · 첫 바이트로 가른다(RFC 7983: STUN 0-3 · DTLS 20-63 · RTP/RTCP 128-191).
 //! ICE(서버 ICE-lite · 클라 controlling · consent) → DTLS 능동(서버가 클라 인증서를 요구한다) → SRTP 키 → (발행 연결이면) SCTP + DCEP `"unreliable"`.
 //! 층마다 사실을 따로 낸다(SDK:RULE-LINK-LAYERS — ICE · DTLS · SCTP · DC 를 섞지 않는다) · 판정은 SDK 루프의 연결 상태기가 한다.
-//! 받은 RTP 는 SDK 루프를 거치지 않고 복호해 미디어 통로로 바로 낸다 — 어느 방 · 트랙인지는 루프가 고쳐 두는 경로표(ssrc → 트랙)로 가른다.
+//! 받은 RTP 는 SDK 루프를 거치지 않고 복호해 수신 정리층(`recv`)을 지나 미디어 통로로 바로 낸다 — 어느 방 · 트랙인지는 루프가 고쳐 두는 경로표(ssrc → 트랙)로 가른다.
+//! 정리층이 짓는 RTCP(NACK · PLI · RR)는 이 수신 태스크가 SRTCP 로 싸서 보내고 · 받은 SRTCP 에서는 SR 만 읽는다.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -25,6 +26,7 @@ use webrtc_srtp::context::Context;
 use webrtc_srtp::protection_profile::ProtectionProfile;
 use webrtc_util::conn::Conn;
 
+use super::recv::{self, Counters, MediaFrame, Out, Recv, Rtp, Unit};
 use super::stun;
 use crate::wire::dc::CHANNEL_LABEL;
 
@@ -39,6 +41,8 @@ const DCEP_OPEN: u8 = 0x03;
 const DCEP_ACK: u8 = 0x02;
 /// DCEP 채널 종류 — 순서 없음 · 재전송 횟수 한도(웹 `ordered:false · maxRetransmits:0` 과 같다)
 const DCEP_PARTIAL_REXMIT_UNORDERED: u8 = 0x81;
+/// 수신 정리층 시계 — NACK 을 이만큼 안에 낸다
+const RECV_TICK: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Role {
@@ -84,7 +88,7 @@ pub(crate) struct LinkFact {
     pub fact: Fact,
 }
 
-/// 받는 트랙 하나의 경로 — 배정표 줄 + 트랙 보관본에서 루프가 짓는다
+/// 받는 트랙 하나의 경로 — 배정표 줄 + 트랙 보관본 + 서버 코덱 정책에서 루프가 짓는다
 #[derive(Clone, Debug)]
 pub(crate) struct Route {
     pub room: String,
@@ -93,6 +97,22 @@ pub(crate) struct Route {
     pub kind: String,
     pub codec: String,
     pub mid: String,
+    /// 줄 ssrc(다운링크) · PT
+    pub ssrc: u32,
+    pub pt: u8,
+    /// 그 줄의 `rtcp_fb` 에 `nack` · `nack pli` 가 있나(연:RULE-LINK-SDP-SUB-MLINE)
+    pub nack: bool,
+    pub pli: bool,
+    pub unit: Unit,
+    /// 앱이 이 트랙의 층을 바꾼 차례 — 바뀌면 정리층이 키프레임을 기다린다
+    pub layer_gen: u64,
+}
+
+/// 경로표 — 줄 ssrc → 경로 · RTX ssrc → 줄 ssrc
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Routes {
+    pub media: HashMap<u32, Route>,
+    pub rtx: HashMap<u32, u32>,
 }
 
 /// 받은 RTP 한 패킷(SRTP 를 푼 것 · 코덱 페이로드 그대로 — 디코딩은 앱 몫, SDK:RULE-PLAT-SERVER `mediaStreamTrack` 의 뜻)
@@ -118,10 +138,16 @@ pub struct MediaPacket {
 /// 경로표와 미디어 통로 — 모든 구독 연결이 같이 쓴다
 #[derive(Clone)]
 pub(crate) struct MediaSink {
-    pub routes: Arc<RwLock<HashMap<u32, Route>>>,
+    pub routes: Arc<RwLock<Routes>>,
     pub tx: mpsc::Sender<MediaPacket>,
+    pub frames: mpsc::Sender<MediaFrame>,
     /// 통로가 가득 차 버린 패킷 수(앱이 늦게 꺼낸다)
     pub dropped: Arc<AtomicU64>,
+    pub frames_dropped: Arc<AtomicU64>,
+    pub counters: Arc<Counters>,
+    /// ★QA 스위치(`OXPEER_QA_DROP_VIDEO_EVERY`) — 받은 영상 원본 패킷 N 개마다 하나를 정리층 앞에서 버린다(망 손실 흉내 · RTX 는 안 버린다). 0 = 끔 · 2층 손실 시나리오의 시험 수단
+    pub qa_drop_every: u64,
+    pub qa_dropped: Arc<AtomicU64>,
     /// 경로표에 없는 ssrc 로 온 패킷 수
     pub unrouted: Arc<AtomicU64>,
     pub decrypt_fail: Arc<AtomicU64>,
@@ -222,25 +248,51 @@ async fn run(server: SocketAddr, mut creds: Creds, cert: Certificate, role: Role
     let (inner_tx, mut inner_rx) = mpsc::unbounded_channel::<Inner>();
     let (dtls_tx, dtls_rx) = mpsc::channel::<Vec<u8>>(256);
     let rx_ctx: Arc<OnceLock<Mutex<Context>>> = Arc::default();
+    let tx_ctx: Arc<OnceLock<Mutex<Context>>> = Arc::default();
 
-    let (s2, i2, rx2, say2, sink2) = (sock.clone(), inner_tx.clone(), rx_ctx.clone(), say.clone(), sink.clone());
+    let (s2, i2, rx2, tx2, say2, sink2) = (sock.clone(), inner_tx.clone(), rx_ctx.clone(), tx_ctx.clone(), say.clone(), sink.clone());
     let demux = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
         let mut seen: HashSet<u32> = HashSet::new();
+        let mut qa_n = 0u64;
+        let mut me = [0u8; 4];
+        let _ = getrandom::fill(&mut me);
+        let mut rv = Recv::new(u32::from_be_bytes(me), sink2.counters.clone());
+        let mut tick = tokio::time::interval(RECV_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let Ok((n, from)) = s2.recv_from(&mut buf).await else { break };
-            if n == 0 || from != server {
-                continue;
-            }
-            let b0 = buf[0];
-            if b0 <= 3 {
-                if let Some(tid) = stun::binding_success(&buf[..n]) {
-                    let _ = i2.send(Inner::StunOk(tid));
+            tokio::select! {
+                r = s2.recv_from(&mut buf) => {
+                    let Ok((n, from)) = r else { break };
+                    if n == 0 || from != server {
+                        continue;
+                    }
+                    let b0 = buf[0];
+                    if b0 <= 3 {
+                        if let Some(tid) = stun::binding_success(&buf[..n]) {
+                            let _ = i2.send(Inner::StunOk(tid));
+                        }
+                    } else if (20..=63).contains(&b0) {
+                        let _ = dtls_tx.try_send(buf[..n].to_vec());
+                    } else if (128..=191).contains(&b0) && n >= 2 {
+                        if (192..=223).contains(&buf[1]) {
+                            on_rtcp(&buf[..n], &rx2, &mut rv);
+                        } else {
+                            on_rtp(&buf[..n], &rx2, &sink2, &mut seen, &say2, &mut rv, &mut qa_n);
+                        }
+                    }
                 }
-            } else if (20..=63).contains(&b0) {
-                let _ = dtls_tx.try_send(buf[..n].to_vec());
-            } else if (128..=191).contains(&b0) && n >= 2 && !(192..=223).contains(&buf[1]) {
-                on_rtp(&buf[..n], &rx2, &sink2, &mut seen, &say2);
+                _ = tick.tick() => {
+                    let live = sink2.routes.read().map(|g| g.media.iter().map(|(k, r)| (*k, r.track_id.clone())).collect::<HashMap<u32, String>>()).unwrap_or_default();
+                    rv.retain(|k, t| live.get(&k).is_some_and(|x| x == t));
+                    let (outs, rtcp) = rv.tick(Instant::now());
+                    deliver(outs, &sink2);
+                    if let Some(p) = rtcp
+                        && let Some(enc) = tx2.get().and_then(|c| c.lock().ok().and_then(|mut c| c.encrypt_rtcp(&p).ok()))
+                    {
+                        let _ = s2.send_to(&enc, server).await;
+                    }
+                }
             }
         }
     });
@@ -297,14 +349,14 @@ async fn run(server: SocketAddr, mut creds: Creds, cert: Certificate, role: Role
                     }
                 }
                 Inner::Dtls(r) => {
-                    let (conn, tx_ctx, rx) = match *r {
+                    let (conn, tx, rx) = match *r {
                         Ok(x) => x,
                         Err(why) => {
                             say.send(Fact::Dtls(false));
                             return Err(why);
                         }
                     };
-                    drop(tx_ctx);
+                    let _ = tx_ctx.set(Mutex::new(tx));
                     let _ = rx_ctx.set(Mutex::new(rx));
                     say.send(Fact::Dtls(true));
                     if role == Role::Publish {
@@ -345,7 +397,8 @@ async fn run(server: SocketAddr, mut creds: Creds, cert: Certificate, role: Role
     }
 }
 
-fn on_rtp(pkt: &[u8], rx: &Arc<OnceLock<Mutex<Context>>>, sink: &MediaSink, seen: &mut HashSet<u32>, say: &Say) {
+#[allow(clippy::too_many_arguments)]
+fn on_rtp(pkt: &[u8], rx: &Arc<OnceLock<Mutex<Context>>>, sink: &MediaSink, seen: &mut HashSet<u32>, say: &Say, rv: &mut Recv, qa_n: &mut u64) {
     let Some(ctx) = rx.get() else { return };
     let plain = ctx.lock().ok().and_then(|mut c| c.decrypt_rtp(pkt).ok());
     let Some(p) = plain else {
@@ -353,31 +406,64 @@ fn on_rtp(pkt: &[u8], rx: &Arc<OnceLock<Mutex<Context>>>, sink: &MediaSink, seen
         return;
     };
     let Some(h) = rtp_header(&p) else { return };
-    let route = sink.routes.read().ok().and_then(|g| g.get(&h.ssrc).cloned());
+    let (route, rtx) = match sink.routes.read() {
+        Ok(g) => match g.media.get(&h.ssrc) {
+            Some(r) => (Some(r.clone()), false),
+            None => (g.rtx.get(&h.ssrc).and_then(|m| g.media.get(m)).cloned(), true),
+        },
+        Err(_) => (None, false),
+    };
     let Some(r) = route else {
         sink.unrouted.fetch_add(1, Ordering::Relaxed);
         return;
     };
-    if seen.insert(h.ssrc) {
-        say.send(Fact::FirstRtp(h.ssrc));
-    }
-    let m = MediaPacket {
-        room: r.room,
-        track_id: r.track_id,
-        user_id: r.user_id,
-        kind: r.kind,
-        codec: r.codec,
-        mid: r.mid,
-        ssrc: h.ssrc,
-        payload_type: h.pt,
-        sequence: h.seq,
-        timestamp: h.ts,
-        marker: h.marker,
-        payload: p.slice(h.start..h.end),
-        received_at: Instant::now(),
+    let body = p.slice(h.start..h.end);
+    let rtp = if rtx {
+        // RFC 4588 §4 — 앞 두 바이트가 원래 seq(OSN) · 나머지가 원래 페이로드. 그보다 짧으면 채움(대역 탐침)이라 버린다
+        if body.len() < 2 {
+            return;
+        }
+        Rtp { seq: u16::from_be_bytes([body[0], body[1]]), ts: h.ts, marker: h.marker, pt: r.pt, payload: body.slice(2..), recovered: true }
+    } else {
+        if seen.insert(h.ssrc) {
+            say.send(Fact::FirstRtp(h.ssrc));
+        }
+        if sink.qa_drop_every > 0 && r.kind == "video" {
+            *qa_n += 1;
+            if (*qa_n).is_multiple_of(sink.qa_drop_every) {
+                sink.qa_dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        Rtp { seq: h.seq, ts: h.ts, marker: h.marker, pt: h.pt, payload: body, recovered: false }
     };
-    if sink.tx.try_send(m).is_err() {
-        sink.dropped.fetch_add(1, Ordering::Relaxed);
+    let outs = rv.on_rtp(&r, rtp, Instant::now(), std::time::SystemTime::now());
+    deliver(outs, sink);
+}
+
+fn on_rtcp(pkt: &[u8], rx: &Arc<OnceLock<Mutex<Context>>>, rv: &mut Recv) {
+    let Some(ctx) = rx.get() else { return };
+    let Some(p) = ctx.lock().ok().and_then(|mut c| c.decrypt_rtcp(pkt).ok()) else { return };
+    let now = Instant::now();
+    for (ssrc, ntp, rtp) in recv::sender_reports(&p) {
+        rv.on_sr(ssrc, ntp, rtp, now);
+    }
+}
+
+fn deliver(outs: Vec<Out>, sink: &MediaSink) {
+    for o in outs {
+        match o {
+            Out::Packet(m) => {
+                if sink.tx.try_send(m).is_err() {
+                    sink.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Out::Frame(f) => {
+                if sink.frames.try_send(f).is_err() {
+                    sink.frames_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
     }
 }
 

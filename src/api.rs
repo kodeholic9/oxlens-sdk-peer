@@ -1,5 +1,5 @@
 // author: kodeholic (powered by Claude)
-//! 앱 표면 — 핸들(`Client`) · 사건 통(`Events`) · 미디어 통(`Media`). 콜백을 받지 않는다 — 앱이 통에서 꺼내 간다.
+//! 앱 표면 — 핸들(`Client`) · 사건 통(`Events`) · 미디어 통 둘(`Media` 패킷 · `Frames` 프레임 — 트랙마다 고른 단위대로). 콜백을 받지 않는다 — 앱이 통에서 꺼내 간다.
 //! 사건 이름은 SDK 정의서 효과 표의 것이다(SDK:IMPL-API-EVENT-MAP — 플랫폼 공유 계약) · 서버사이드에 해당하지 않는 것(장치 · 재생 · 발행)은 없다(SDK:RULE-PLAT-SERVER).
 
 use std::time::Duration;
@@ -8,7 +8,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::core::{self, Cmd};
 use crate::error::Error;
-pub use crate::generated::ws_wire::{MemberInfo, Permission, TokenReq, TrackEntry};
+pub use crate::generated::ws_wire::{Kind, MemberInfo, Permission, TokenReq, TrackEntry, TrackEntryType};
+pub use crate::link::recv::{MediaFrame, Unit};
 pub use crate::link::transport::MediaPacket;
 
 /// 접속 설정 — `base` 는 앱이 준다(연:RULE-TRN-BASE-GIVEN) · `token` 은 앱이 발급받은 것(연:SES.http.TOKEN)
@@ -19,12 +20,25 @@ pub struct Config {
     pub token: String,
     /// 미디어 통 크기(패킷) — 앱이 늦게 꺼내 가득 차면 버리고 센다(`Stats::media_dropped`)
     pub media_capacity: usize,
+    /// 프레임 통 크기 — 가득 차면 버리고 센다(`Stats::frames_dropped`)
+    pub frames_capacity: usize,
+    /// 받는 단위 기본(SDK:RULE-PLAT-SERVER 수신 단위 · 시각) — 트랙마다는 `Client::set_unit`
+    pub unit: Unit,
 }
 
 impl Config {
     pub fn new(base: impl Into<String>, token: impl Into<String>) -> Config {
-        Config { base: base.into(), token: token.into(), media_capacity: 4_096 }
+        Config { base: base.into(), token: token.into(), media_capacity: 4_096, frames_capacity: 1_024, unit: Unit::Packet }
     }
+}
+
+/// 받을 층(SDK:IMPL-TRK-RECEIVE `RemoteTrack.setLayer`) — ★값은 상한이고 실제 선택은 서버다 · 생략한 칸은 안 바꾼다(연:RULE-SUB-LAYER-PROC)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Layer {
+    pub spatial: Option<u8>,
+    pub temporal: Option<u8>,
+    pub paused: Option<bool>,
+    pub priority: Option<u8>,
 }
 
 /// 세션 연결 상태(SDK:IMPL-SES-API `session.state`) — 위 상태 넷 그대로
@@ -112,12 +126,24 @@ pub enum Event {
     Error { room: Option<String>, error: Error },
 }
 
-/// 수치 — 미디어 경로의 계수
+/// 수치 — 미디어 경로와 수신 정리층의 계수
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub media_dropped: u64,
     pub media_unrouted: u64,
     pub decrypt_fail: u64,
+    pub frames_dropped: u64,
+    /// 보낸 NACK 묶음 수 · RTX 로 메운 패킷 · 다 묻고도 못 받아 넘긴 패킷
+    pub nack_sent: u64,
+    pub rtx_recovered: u64,
+    pub lost: u64,
+    pub pli_sent: u64,
+    pub rr_sent: u64,
+    /// 조각이 빠져 버린 프레임 · 키프레임을 기다리느라 버린 프레임
+    pub frames_broken: u64,
+    pub frames_skipped: u64,
+    /// QA 스위치가 버린 영상 패킷(`OXPEER_QA_DROP_VIDEO_EVERY` — 시험 수단 · 평소 0)
+    pub qa_dropped: u64,
 }
 
 /// 클라이언트 핸들 — 복제해도 같은 SDK 루프다
@@ -137,7 +163,7 @@ impl Events {
     }
 }
 
-/// 미디어 통 — 받은 RTP(복호한 것)
+/// 미디어 통 — 받은 RTP(복호한 것) · 단위가 `Packet` 인 트랙
 pub struct Media {
     rx: mpsc::Receiver<MediaPacket>,
 }
@@ -148,17 +174,29 @@ impl Media {
     }
 }
 
+/// 프레임 통 — 단위가 `Frame` 인 트랙
+pub struct Frames {
+    rx: mpsc::Receiver<MediaFrame>,
+}
+
+impl Frames {
+    pub async fn next(&mut self) -> Option<MediaFrame> {
+        self.rx.recv().await
+    }
+}
+
 impl Client {
     /// 접속 — 세션이 ACTIVE 에 닿으면 돌아온다(SDK:IMPL-SES-API `connect`). 최초 접속의 토큰 요구 · 거절은 `Err`(auth)
-    pub async fn connect(cfg: Config) -> Result<(Client, Events, Media), Error> {
+    pub async fn connect(cfg: Config) -> Result<(Client, Events, Media, Frames), Error> {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let (media_tx, media_rx) = mpsc::channel(cfg.media_capacity.max(16));
-        let cmd = core::spawn(cfg, ev_tx, media_tx)?;
+        let (frames_tx, frames_rx) = mpsc::channel(cfg.frames_capacity.max(16));
+        let cmd = core::spawn(cfg, ev_tx, media_tx, frames_tx)?;
         let c = Client { cmd };
         let (tx, rx) = oneshot::channel();
         c.send(Cmd::Connect(tx))?;
         rx.await.map_err(|_| Error::closed("CLOSED"))??;
-        Ok((c, Events { rx: ev_rx }, Media { rx: media_rx }))
+        Ok((c, Events { rx: ev_rx }, Media { rx: media_rx }, Frames { rx: frames_rx }))
     }
 
     fn send(&self, c: Cmd) -> Result<(), Error> {
@@ -190,6 +228,18 @@ impl Client {
         if self.send(Cmd::Close(tx)).is_ok() {
             let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
         }
+    }
+
+    /// 이 트랙을 받는 단위 — 다음 패킷부터
+    pub fn set_unit(&self, track_id: impl Into<String>, unit: Unit) -> Result<(), Error> {
+        self.send(Cmd::SetUnit(track_id.into(), unit))
+    }
+
+    /// 받을 층 — 서버가 받으면 돌아온다. 입장한 방의 받는 트랙만(`NO_TRACK`) · 다시 들어가면 SDK 가 다시 보낸다
+    pub async fn set_layer(&self, track_id: &str, layer: Layer) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Cmd::SetLayer(track_id.to_string(), layer, tx))?;
+        rx.await.map_err(|_| Error::closed("CLOSED"))?
     }
 
     pub async fn stats(&self) -> Stats {

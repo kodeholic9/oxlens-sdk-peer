@@ -7,12 +7,13 @@
 //! # async fn f() -> Result<(), oxpeer::Error> {
 //! let req = oxpeer::TokenReq { api_key: "k".into(), api_secret: "s".into(), user_id: "rec-1".into(), participant_type: Some(1), hidden: Some(true), metadata: None, permission: None };
 //! let token = oxpeer::issue_token("http://127.0.0.1:19745/media", &req).await?;
-//! let (client, mut events, mut media) = oxpeer::Client::connect(oxpeer::Config::new("http://127.0.0.1:19745/media", token)).await?;
+//! let (client, mut events, mut media, _frames) = oxpeer::Client::connect(oxpeer::Config::new("http://127.0.0.1:19745/media", token)).await?;
 //! client.join("ch-1").await?;
 //! while let Some(p) = media.next().await { let _ = (p.track_id, p.payload); }
 //! # let _ = events.next().await; Ok(()) }
 //! ```
-//! 첫 단계 범위(context 202611/20261106c A3): 세션 · 연결 · 방 · 받는 트랙 · 구독 + 발언권 듣기. 발행 · 발언 요청 · 레이어 고르기는 아직 없다.
+//! 범위(context 202611/20261106c A3 · 20261107a): 세션 · 연결 · 방 · 받는 트랙 · 구독 + 발언권 듣기 · 수신 정리층(재정렬 · NACK · RTX · PLI · RR · SR) · 프레임 단위 수신 · 층 고르기.
+//! 발행 · 발언 요청은 아직 없다(에이전트 단계).
 
 mod api;
 mod core;
@@ -27,6 +28,6 @@ mod wire;
 #[cfg(all(test, feature = "serde"))]
 mod vectors_test;
 
-pub use api::{Client, Config, Event, Events, Health, LinkInfo, LinkState, Media, MediaPacket, MemberInfo, Permission, SessionInfo, SessionState, Stats, TokenReq, TrackEntry};
+pub use api::{Client, Config, Event, Events, Frames, Health, Kind, Layer, LinkInfo, LinkState, Media, MediaFrame, MediaPacket, MemberInfo, Permission, SessionInfo, SessionState, Stats, TokenReq, TrackEntry, TrackEntryType, Unit};
 pub use error::{Category, Error};
 pub use token::issue_token;

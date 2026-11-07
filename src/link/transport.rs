@@ -116,6 +116,18 @@ pub(crate) struct Route {
 pub(crate) struct Routes {
     pub media: HashMap<u32, Route>,
     pub rtx: HashMap<u32, u32>,
+    /// 출처 번호(CSRC) → 주인 — 트랙 목록 `csrc`(연:RULE-TRK-CSRC) · `TAKEN` 화자 출처 번호(연:RULE-FLR-SLOT-SOURCES)
+    pub sources: HashMap<u32, Source>,
+}
+
+/// 패킷 · 프레임의 출처 — 다운링크 패킷의 CSRC(연:RULE-LINK-EGRESS-REWRITE ⑤) · ★발행 신원의 정본(SDK:RULE-PLAT-SERVER 「출처 표지」)
+/// 주인을 아직 모르면(목록 · `TAKEN` 이 아직 안 왔다) `user_id` · `track_id` 가 비고 번호만 든다 — 번호는 트랙이 사는 동안 같다
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Source {
+    pub csrc: u32,
+    pub user_id: Option<String>,
+    /// 개인 트랙이면 그 `track_id` — 반이중 발행(무전 슬롯)은 목록에 없어 비어 있다
+    pub track_id: Option<String>,
 }
 
 /// 받은 RTP 한 패킷(SRTP 를 푼 것 · 코덱 페이로드 그대로 — 디코딩은 앱 몫, SDK:RULE-PLAT-SERVER `mediaStreamTrack` 의 뜻)
@@ -136,6 +148,8 @@ pub struct MediaPacket {
     pub marker: bool,
     pub payload: Bytes,
     pub received_at: Instant,
+    /// 이 패킷의 발행 출처 — 없으면 서버가 지은 패킷(예열 · 해제 침묵)
+    pub source: Option<Source>,
 }
 
 /// 경로표와 미디어 통로 — 모든 구독 연결이 같이 쓴다
@@ -444,12 +458,15 @@ fn on_rtp(pkt: &[u8], rx: &Arc<OnceLock<Mutex<Context>>>, sink: &MediaSink, seen
         return;
     };
     let Some(h) = rtp_header(&p) else { return };
-    let (route, rtx) = match sink.routes.read() {
-        Ok(g) => match g.media.get(&h.ssrc) {
-            Some(r) => (Some(r.clone()), false),
-            None => (g.rtx.get(&h.ssrc).and_then(|m| g.media.get(m)).cloned(), true),
-        },
-        Err(_) => (None, false),
+    let (route, rtx, source) = match sink.routes.read() {
+        Ok(g) => {
+            let source = h.csrc.map(|c| g.sources.get(&c).cloned().unwrap_or(Source { csrc: c, user_id: None, track_id: None }));
+            match g.media.get(&h.ssrc) {
+                Some(r) => (Some(r.clone()), false, source),
+                None => (g.rtx.get(&h.ssrc).and_then(|m| g.media.get(m)).cloned(), true, source),
+            }
+        }
+        Err(_) => (None, false, None),
     };
     let Some(r) = route else {
         sink.unrouted.fetch_add(1, Ordering::Relaxed);
@@ -461,7 +478,7 @@ fn on_rtp(pkt: &[u8], rx: &Arc<OnceLock<Mutex<Context>>>, sink: &MediaSink, seen
         if body.len() < 2 {
             return;
         }
-        Rtp { seq: u16::from_be_bytes([body[0], body[1]]), ts: h.ts, marker: h.marker, pt: r.pt, payload: body.slice(2..), recovered: true }
+        Rtp { seq: u16::from_be_bytes([body[0], body[1]]), ts: h.ts, marker: h.marker, pt: r.pt, payload: body.slice(2..), recovered: true, source }
     } else {
         if seen.insert(h.ssrc) {
             say.send(Fact::FirstRtp(h.ssrc));
@@ -473,7 +490,7 @@ fn on_rtp(pkt: &[u8], rx: &Arc<OnceLock<Mutex<Context>>>, sink: &MediaSink, seen
                 return;
             }
         }
-        Rtp { seq: h.seq, ts: h.ts, marker: h.marker, pt: h.pt, payload: body, recovered: false }
+        Rtp { seq: h.seq, ts: h.ts, marker: h.marker, pt: h.pt, payload: body, recovered: false, source }
     };
     let outs = rv.on_rtp(&r, rtp, Instant::now(), std::time::SystemTime::now());
     deliver(outs, sink);
@@ -531,6 +548,7 @@ pub(crate) struct RtpHeader {
     pub seq: u16,
     pub ts: u32,
     pub ssrc: u32,
+    pub csrc: Option<u32>,
     pub start: usize,
     pub end: usize,
 }
@@ -563,6 +581,7 @@ pub(crate) fn rtp_header(p: &[u8]) -> Option<RtpHeader> {
         seq: u16::from_be_bytes([p[2], p[3]]),
         ts: u32::from_be_bytes([p[4], p[5], p[6], p[7]]),
         ssrc: u32::from_be_bytes([p[8], p[9], p[10], p[11]]),
+        csrc: (cc > 0).then(|| u32::from_be_bytes([p[12], p[13], p[14], p[15]])),
         start,
         end,
     })
@@ -804,7 +823,10 @@ mod tests {
         let h = rtp_header(&p).unwrap();
         assert!(h.marker);
         assert_eq!((h.pt, h.seq, h.ts, h.ssrc), (0x60, 5, 9, 7));
+        assert_eq!(h.csrc, Some(1));
         assert_eq!(&p[h.start..h.end], &[0xAA, 0xBB]);
+        let plain = [0x80, 0x60, 0, 5, 0, 0, 0, 9, 0, 0, 0, 7, 0xAA];
+        assert_eq!(rtp_header(&plain).unwrap().csrc, None);
     }
 
     #[test]

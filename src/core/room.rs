@@ -1083,6 +1083,16 @@ impl Core {
         if self.rooms.get(&room).and_then(|r| r.sfu.as_deref()) != Some(server) {
             return;
         }
+        // 화자의 출처 번호(연:RULE-FLR-SLOT-SOURCES) — 반이중 발행은 트랙 목록에 없어 슬롯 패킷의 CSRC 는 이것으로 주인을 안다
+        if let fc::Rx::Taken(m) = &rx {
+            let fresh: Vec<u32> = m.sources.iter().flatten().filter_map(|c| u32::try_from(*c).ok()).filter(|c| self.talk_sources.get(c) != Some(&m.speaker)).collect();
+            if !fresh.is_empty() {
+                for c in fresh {
+                    self.talk_sources.insert(c, m.speaker.clone());
+                }
+                self.rebuild_routes();
+            }
+        }
         self.floor_enter(&room, "receive", |s| Some(fc::receive(s, &rx)), "DC");
     }
 }

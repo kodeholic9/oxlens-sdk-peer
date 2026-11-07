@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 
 use super::depack::{self, Codec};
-use super::transport::{MediaPacket, Route};
+use super::transport::{MediaPacket, Route, Source};
 
 /// NACK 다시 묻기 간격 · 횟수 — libwebrtc NackRequester 기본(RTT 를 모를 때 100ms · 10회)과 같다. 다 묻고도 안 오면 그 패킷을 포기한다
 const NACK_INTERVAL: Duration = Duration::from_millis(100);
@@ -61,6 +61,8 @@ pub struct MediaFrame {
     pub wallclock: SystemTime,
     pub synced: bool,
     pub received_at: Instant,
+    /// 이 프레임의 발행 출처(조각마다 같아야 한다 — 갈리면 깨진 프레임) · 없으면 서버가 지은 것
+    pub source: Option<Source>,
 }
 
 /// 정리층이 내는 것
@@ -98,6 +100,7 @@ pub(crate) struct Rtp {
     pub pt: u8,
     pub payload: Bytes,
     pub recovered: bool,
+    pub source: Option<Source>,
 }
 
 #[derive(Clone, Copy)]
@@ -124,6 +127,7 @@ struct Asm {
     data: Vec<u8>,
     key: bool,
     broken: bool,
+    source: Option<Source>,
     at: Instant,
     wall: SystemTime,
 }
@@ -260,6 +264,7 @@ impl Stream {
             marker: r.marker,
             payload: r.payload.clone(),
             received_at: at,
+            source: r.source.clone(),
         }
     }
 
@@ -306,7 +311,10 @@ impl Stream {
             self.finish(a, c, out);
         }
         let piece = depack::unpack(self.codec, &p.rtp.payload);
-        let a = self.asm.get_or_insert_with(|| Asm { ts: p.rtp.ts, data: Vec::new(), key: false, broken: piece.as_ref().is_some_and(|x| !x.start), at: p.at, wall: p.wall });
+        let a = self.asm.get_or_insert_with(|| Asm { ts: p.rtp.ts, data: Vec::new(), key: false, broken: piece.as_ref().is_some_and(|x| !x.start), source: p.rtp.source.clone(), at: p.at, wall: p.wall });
+        if a.source.as_ref().map(|s| s.csrc) != p.rtp.source.as_ref().map(|s| s.csrc) {
+            a.broken = true;
+        }
         match piece {
             Some(x) => {
                 a.data.extend_from_slice(&x.data);
@@ -357,6 +365,7 @@ impl Stream {
             wallclock,
             synced,
             received_at: a.at,
+            source: a.source,
         }));
     }
 
@@ -618,7 +627,7 @@ mod tests {
     }
 
     fn rtp(seq: u16, ts: u32, marker: bool, payload: &[u8]) -> Rtp {
-        Rtp { seq, ts, marker, pt: 96, payload: Bytes::copy_from_slice(payload), recovered: false }
+        Rtp { seq, ts, marker, pt: 96, payload: Bytes::copy_from_slice(payload), recovered: false, source: None }
     }
 
     fn frames(o: &[Out]) -> Vec<(u32, bool, Vec<u8>)> {
@@ -660,6 +669,26 @@ mod tests {
         let o = r.on_rtp(&rt, rtp(11, 900, true, &VP8_CONT), t0, w);
         assert_eq!(frames(&o), vec![(900, true, vec![0x00, 0xaa, 0xbb]), (3900, false, vec![0x01])]);
         assert_eq!(c.lost.load(Ordering::Relaxed), 0);
+    }
+
+    fn tagged(seq: u16, ts: u32, marker: bool, payload: &[u8], csrc: u32) -> Rtp {
+        Rtp { source: Some(Source { csrc, user_id: Some(format!("u{csrc}")), track_id: None }), ..rtp(seq, ts, marker, payload) }
+    }
+
+    #[test]
+    fn frame_carries_source_and_breaks_on_mixed_source() {
+        let c = Arc::new(Counters::default());
+        let mut r = Recv::new(9, c.clone());
+        let rt = route("video", "VP8", Unit::Frame);
+        let (t0, w) = (Instant::now(), SystemTime::now());
+        r.on_rtp(&rt, tagged(10, 900, false, &VP8_KEY_A, 3), t0, w);
+        let o = r.on_rtp(&rt, tagged(11, 900, true, &VP8_CONT, 3), t0, w);
+        let src: Vec<_> = o.iter().filter_map(|x| if let Out::Frame(f) = x { Some(f.source.as_ref().map(|s| s.csrc)) } else { None }).collect();
+        assert_eq!(src, vec![Some(3)]);
+        r.on_rtp(&rt, tagged(12, 1800, false, &VP8_KEY_A, 3), t0, w);
+        let o = r.on_rtp(&rt, tagged(13, 1800, true, &VP8_CONT, 4), t0, w);
+        assert!(frames(&o).is_empty(), "조각마다 출처가 갈리면 프레임을 내지 않는다");
+        assert_eq!(c.frames_broken.load(Ordering::Relaxed), 1);
     }
 
     #[test]

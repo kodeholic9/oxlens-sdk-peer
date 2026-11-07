@@ -143,6 +143,8 @@ async fn main() {
 async fn echo(client: &Client, events: &mut oxpeer::Events, media: &mut oxpeer::Media, track: LocalTrack, me: &str, room: &str, stop: &mut std::pin::Pin<&mut impl std::future::Future<Output = ()>>, out: &mut Value) {
     let mut speaker: Option<String> = None;
     let mut heard: Vec<Bytes> = Vec::new();
+    // 들은 패킷의 출처 주인(SDK:RULE-PLAT-SERVER 「출처 표지」) — 「누가 말했나」를 화자 사건이 아니라 패킷이 알린다
+    let mut heard_from: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut echoes: Vec<Value> = Vec::new();
     let mut ptt: Vec<Value> = Vec::new();
     let t0 = Instant::now();
@@ -158,6 +160,7 @@ async fn echo(client: &Client, events: &mut oxpeer::Events, media: &mut oxpeer::
                         // 남의 발언이 끝났다 — 되울린다
                         if speaker.is_none() && let Some(from) = was && !heard.is_empty() {
                             let packets = std::mem::take(&mut heard);
+                            let sources: Vec<String> = std::mem::take(&mut heard_from).into_iter().collect();
                             let at = t0.elapsed().as_millis() as u64;
                             let granted = press_and_wait(client, events, room, &mut ptt, t0).await;
                             let mut sent = 0u32;
@@ -172,7 +175,7 @@ async fn echo(client: &Client, events: &mut oxpeer::Events, media: &mut oxpeer::
                                 track.drain().await;
                             }
                             let _ = client.ptt_release(room).await;
-                            echoes.push(json!({ "from": from, "heard": packets.len(), "sent": sent, "granted": granted, "at_ms": at, "released_ms": t0.elapsed().as_millis() as u64 }));
+                            echoes.push(json!({ "from": from, "sources": sources, "heard": packets.len(), "sent": sent, "granted": granted, "at_ms": at, "released_ms": t0.elapsed().as_millis() as u64 }));
                         }
                     }
                     Event::Ptt { room: r, event, state } if r == room => ptt.push(json!({ "event": event, "state": state, "ms": t0.elapsed().as_millis() as u64 })),
@@ -182,8 +185,12 @@ async fn echo(client: &Client, events: &mut oxpeer::Events, media: &mut oxpeer::
             }
             p = media.next() => {
                 let Some(p) = p else { break };
-                // 무전 슬롯 오디오(주인 없음)만 · 남이 말하는 동안만 · 서버 침묵 프레임은 빼고
-                if p.room == room && p.kind == "audio" && p.user_id.is_none() && speaker.is_some() && p.payload.as_ref() != SILENCE {
+                // 무전 슬롯 오디오(주인 없음)만 · 남이 말하는 동안만 · ★출처가 남인 패킷만(출처 없음 = 서버가 지은 침묵 · 예열)
+                let from = p.source.as_ref().and_then(|s| s.user_id.clone());
+                if p.room == room && p.kind == "audio" && p.user_id.is_none() && speaker.is_some() && p.source.is_some() && from.as_deref() != Some(me) {
+                    if let Some(u) = from {
+                        heard_from.insert(u);
+                    }
                     heard.push(p.payload.clone());
                 }
             }

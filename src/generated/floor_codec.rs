@@ -23,6 +23,7 @@ pub mod tlv {
     pub const PREV: u8 = 26;
     pub const REASON: u8 = 27;
     pub const ROOM: u8 = 29;
+    pub const SOURCES: u8 = 31;
 }
 
 pub const RETIRED: &[u8] = &[7, 28, 30];

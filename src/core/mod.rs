@@ -194,6 +194,8 @@ pub(crate) struct Core {
     pub(crate) units: HashMap<String, Unit>,
     /// 트랙마다 층을 바꾼 차례(정리층이 키프레임을 기다리는 표시)
     pub(crate) layer_gen: HashMap<String, u64>,
+    /// 화자 출처 번호 → 사용자 — `TAKEN` 이 준다(연:RULE-FLR-SLOT-SOURCES · 번호는 트랙이 사는 동안 같다)
+    pub(crate) talk_sources: BTreeMap<u32, String>,
     pub(crate) cert: Certificate,
     pub(crate) connect_waiters: Vec<oneshot::Sender<Result<(), Error>>>,
     /// ACTIVE 를 기다리는 입장(SDK:RULE-API-ASYNC 연결 전 요청)
@@ -271,6 +273,7 @@ pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::
         unit: cfg.unit,
         units: HashMap::new(),
         layer_gen: HashMap::new(),
+        talk_sources: BTreeMap::new(),
         cert,
         connect_waiters: Vec::new(),
         parked: Vec::new(),

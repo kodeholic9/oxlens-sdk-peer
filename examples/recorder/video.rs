@@ -1,6 +1,7 @@
 // author: kodeholic (powered by Claude)
 //! 녹화 갈래(`--video` · 20261107a B4 · B5) — 받는 트랙마다 Matroska 파일 하나. SDK 가 조립한 프레임(영상은 키프레임부터 · 깨진 프레임 없음)을 그대로 담는다.
-//! 개인 트랙은 녹화 내내 파일 하나 · 무전 슬롯은 발언 한 건 = 파일 하나(녹음과 같은 경계 — 화자 사건). 슬롯 영상 파일은 화자가 선 뒤 첫 키프레임부터 연다.
+//! 개인 트랙은 녹화 내내 파일 하나 · 무전 슬롯은 발언 한 건 = 파일 하나(녹음과 같은 경계 — ★프레임의 출처 · SDK:RULE-PLAT-SERVER 「출처 표지」).
+//! 슬롯 파일은 출처가 바뀌면 닫고 새로 연다 — 영상은 새 출처의 첫 키프레임부터. 출처 없는 프레임(서버가 지은 침묵)은 경계 밖이다.
 //! 층은 앱이 고른다(B3) — 시뮬캐스트 트랙은 `--spatial` 이 없으면 최고 단을 상한으로 · `--layer-plan` 이 있으면 그 초에 바꾼다.
 
 use std::collections::{BTreeMap, HashSet};
@@ -19,6 +20,8 @@ struct Rec {
     ssrc: u32,
     last_at: Instant,
     rebased: u64,
+    /// 슬롯 파일의 출처 번호(CSRC) — 바뀌면 그 파일을 닫는다
+    csrc: Option<u32>,
     file: PathBuf,
     track_id: String,
     kind: String,
@@ -80,7 +83,6 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut frames: Frame
     let started = Instant::now();
     let mut recs: BTreeMap<String, Rec> = BTreeMap::new();
     let mut done: Vec<Value> = Vec::new();
-    let mut speaker: Option<String> = None;
     let mut n = 0u32;
     let (mut orphan_frames, mut until_key, mut unknown_codec) = (0u64, 0u64, 0u64);
     let mut video: BTreeMap<String, TrackEntry> = BTreeMap::new();
@@ -113,15 +115,6 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut frames: Frame
             e = events.next() => {
                 let Some(e) = e else { break };
                 match &e {
-                    Event::Speaker { room, user_id } if *room == a.room => {
-                        let slots: Vec<String> = recs.iter().filter(|(_, r)| r.slot).map(|(k, _)| k.clone()).collect();
-                        for k in slots {
-                            if let Some(r) = recs.remove(&k) {
-                                close(r, &mut done);
-                            }
-                        }
-                        speaker = user_id.clone();
-                    }
                     Event::Tracks { room, tracks } if *room == a.room => {
                         for t in tracks.iter().filter(|t| t.kind == oxpeer::Kind::Video) {
                             video.insert(t.track_id.clone(), t.clone());
@@ -144,7 +137,7 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut frames: Frame
             }
             f = frames.next() => {
                 let Some(f) = f else { break };
-                on_frame(a, f, &speaker, &mut recs, &mut n, &mut orphan_frames, &mut until_key, &mut unknown_codec);
+                on_frame(a, f, &mut recs, &mut done, &mut n, &mut orphan_frames, &mut until_key, &mut unknown_codec);
             }
         }
     }
@@ -170,7 +163,7 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut frames: Frame
 }
 
 #[allow(clippy::too_many_arguments)]
-fn on_frame(a: &Args, f: MediaFrame, speaker: &Option<String>, recs: &mut BTreeMap<String, Rec>, n: &mut u32, orphan: &mut u64, until_key: &mut u64, unknown: &mut u64) {
+fn on_frame(a: &Args, f: MediaFrame, recs: &mut BTreeMap<String, Rec>, done: &mut Vec<Value>, n: &mut u32, orphan: &mut u64, until_key: &mut u64, unknown: &mut u64) {
     if f.room != a.room {
         return;
     }
@@ -179,21 +172,33 @@ fn on_frame(a: &Args, f: MediaFrame, speaker: &Option<String>, recs: &mut BTreeM
         return;
     };
     let slot = f.user_id.is_none();
-    if slot && speaker.is_none() {
-        *orphan += 1;
-        return;
+    // 파일 열쇠 — 개인 트랙은 ★출처의 `track_id`(줄의 지금 트랙이 아니라 · 재배정 직후 늦은 옛 트랙 패킷도 제 파일로) · 슬롯은 슬롯 트랙
+    let key = if slot { f.track_id.clone() } else { f.source.as_ref().and_then(|s| s.track_id.clone()).unwrap_or_else(|| f.track_id.clone()) };
+    if slot {
+        let Some(src) = f.source.as_ref() else {
+            if let Some(r) = recs.remove(&key) {
+                close(r, done);
+            }
+            *orphan += 1;
+            return;
+        };
+        if recs.get(&key).is_some_and(|r| r.csrc != Some(src.csrc))
+            && let Some(r) = recs.remove(&key)
+        {
+            close(r, done);
+        }
     }
-    if !recs.contains_key(&f.track_id) {
+    if !recs.contains_key(&key) {
         if f.kind == "video" && !f.keyframe {
             *until_key += 1;
             return;
         }
         *n += 1;
-        let who = if slot { speaker.clone().unwrap_or_default() } else { f.user_id.clone().unwrap_or_default() };
+        let who = if slot { f.source.as_ref().and_then(|s| s.user_id.clone()).unwrap_or_default() } else { f.user_id.clone().unwrap_or_default() };
         let file = a.out.join(format!("{}-{:03}-{}-{}.mkv", safe(&a.room), n, safe(&who), f.kind));
         match Mkv::create(&file, codec, &f.data, u64::from(*n)) {
             Ok(m) => {
-                recs.insert(f.track_id.clone(), Rec { ssrc: f.ssrc, last_at: f.received_at, rebased: 0, file, track_id: f.track_id.clone(), kind: f.kind.clone(), codec: f.codec.clone(), who, slot, m });
+                recs.insert(key.clone(), Rec { ssrc: f.ssrc, last_at: f.received_at, rebased: 0, csrc: f.source.as_ref().map(|s| s.csrc), file, track_id: key.clone(), kind: f.kind.clone(), codec: f.codec.clone(), who, slot, m });
             }
             Err(e) => {
                 eprintln!("파일을 못 만들었다 {}: {e}", file.display());
@@ -201,7 +206,7 @@ fn on_frame(a: &Args, f: MediaFrame, speaker: &Option<String>, recs: &mut BTreeM
             }
         }
     }
-    if let Some(r) = recs.get_mut(&f.track_id) {
+    if let Some(r) = recs.get_mut(&key) {
         // ★줄마다 RTP 시각 기준이 다르다(연:RULE-SUB-FILL 재배정 — 줄의 SSRC · seq · ts 는 줄 것) — 다른 줄로 옮겨 온 첫 프레임은 RTP 시각 차 대신 받은 시각 차로 잇는다
         if r.ssrc != f.ssrc {
             r.m.rebase(f.timestamp, f.received_at.saturating_duration_since(r.last_at));

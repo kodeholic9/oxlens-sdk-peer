@@ -1,6 +1,7 @@
 // author: kodeholic (powered by Claude)
 //! 예제 녹음 · 녹화기 — 서버사이드 SDK(oxpeer)로 방에 녹음 참가자(`participant_type:1`)로 들어간다.
-//! 기본(녹음) — ★발언 한 건마다 Ogg Opus 파일 하나. 발언 경계는 발언권 화자 사건(`Speaker`)이 정한다 — 화자가 서면 새 파일 · 사라지거나 바뀌면 닫는다.
+//! 기본(녹음) — ★발언 한 건마다 Ogg Opus 파일 하나. 발언 경계는 ★패킷의 출처(CSRC — SDK:RULE-PLAT-SERVER 「출처 표지」)가 정한다 —
+//!   출처가 바뀌면 새 파일 · 출처 없는 패킷(서버가 지은 예열 · 해제 침묵)은 경계 밖이고 열린 파일을 닫는다. 화자 사건과 도착 시각을 맞대지 않는다.
 //!   무전 슬롯 오디오(PTT)만 담는다(개인 트랙은 센다).
 //! `--video`(녹화 · 20261107a) — ★트랙마다 Matroska 파일 하나(영상 · 음성 모두 · SDK 가 조립한 프레임 · 영상은 키프레임부터). 무전 슬롯은 발언 한 건 = 파일 하나.
 //!   `--spatial N` 은 영상 트랙의 층 상한(기본은 최고 단) · `--layer-plan 4:0,8:1` 은 입장 뒤 그 초에 상한을 바꾼다.
@@ -64,7 +65,8 @@ fn args() -> Args {
 
 struct Utterance {
     file: PathBuf,
-    speaker: String,
+    csrc: u32,
+    speaker: Option<String>,
     w: ogg::OggOpus,
     first_seq: Option<u16>,
     last_seq: u16,
@@ -74,7 +76,7 @@ fn close(cur: &mut Option<Utterance>, done: &mut Vec<Value>) {
     if let Some(u) = cur.take() {
         let packets = u.w.packets;
         let granule = u.w.finish().unwrap_or(0);
-        done.push(json!({ "file": u.file, "speaker": u.speaker, "packets": packets, "samples": granule, "first_seq": u.first_seq, "last_seq": u.last_seq }));
+        done.push(json!({ "file": u.file, "speaker": u.speaker, "csrc": u.csrc, "packets": packets, "samples": granule, "first_seq": u.first_seq, "last_seq": u.last_seq }));
     }
 }
 
@@ -138,15 +140,6 @@ async fn main() {
                 match &e {
                     Event::Speaker { room, user_id } if *room == a.room => {
                         last_speaker = (if user_id.is_some() { "taken" } else { "idle" }, Instant::now());
-                        close(&mut cur, &mut done);
-                        if let Some(u) = user_id {
-                            n += 1;
-                            let file = a.out.join(format!("{}-{n:03}-{u}.ogg", a.room));
-                            match ogg::OggOpus::create(&file, n) {
-                                Ok(w) => cur = Some(Utterance { file, speaker: u.clone(), w, first_seq: None, last_seq: 0 }),
-                                Err(err) => eprintln!("파일을 못 만들었다 {}: {err}", file.display()),
-                            }
-                        }
                     }
                     _ => {
                         if flow.on(&e, &a.room) {
@@ -166,16 +159,31 @@ async fn main() {
                     other_audio += 1;
                     continue;
                 }
-                match cur.as_mut() {
-                    Some(u) => {
-                        let _ = u.w.push(&p.payload);
-                        u.first_seq.get_or_insert(p.sequence);
-                        u.last_seq = p.sequence;
+                let Some(src) = p.source.clone() else {
+                    close(&mut cur, &mut done);
+                    orphan += 1;
+                    orphans.push(json!({ "seq": p.sequence, "silence": p.payload.as_ref() == [0xF8, 0xFF, 0xFE], "last": last_speaker.0, "since_ms": last_speaker.1.elapsed().as_millis() as u64 }));
+                    continue;
+                };
+                if cur.as_ref().is_some_and(|u| u.csrc != src.csrc) {
+                    close(&mut cur, &mut done);
+                }
+                if cur.is_none() {
+                    n += 1;
+                    let who = src.user_id.clone().unwrap_or_else(|| format!("csrc{}", src.csrc));
+                    let file = a.out.join(format!("{}-{n:03}-{who}.ogg", a.room));
+                    match ogg::OggOpus::create(&file, n) {
+                        Ok(w) => cur = Some(Utterance { file, csrc: src.csrc, speaker: src.user_id.clone(), w, first_seq: None, last_seq: 0 }),
+                        Err(err) => eprintln!("파일을 못 만들었다 {}: {err}", file.display()),
                     }
-                    None => {
-                        orphan += 1;
-                        orphans.push(json!({ "seq": p.sequence, "silence": p.payload.as_ref() == [0xF8, 0xFF, 0xFE], "last": last_speaker.0, "since_ms": last_speaker.1.elapsed().as_millis() as u64 }));
+                }
+                if let Some(u) = cur.as_mut() {
+                    if u.speaker.is_none() {
+                        u.speaker = src.user_id.clone();
                     }
+                    let _ = u.w.push(&p.payload);
+                    u.first_seq.get_or_insert(p.sequence);
+                    u.last_seq = p.sequence;
                 }
             }
         }

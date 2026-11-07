@@ -1,5 +1,5 @@
 // ★생성 파일 — gen/floor_client.mts 가 원천(context/spec/protocol · areas/flr/behavior/client.ts)에서 짓는다. 손으로 고치지 않는다.
-// IR sha256 ef3fbde580019854 · 3GPP TS 24.380 §6.2.4 floor participant · Rust 판 — 같은 생성기의 TS 판과 한 뿌리(같은 입구 · 같은 칸 · 같은 라벨).
+// IR sha256 8ede3bb190c1f4ab · 3GPP TS 24.380 §6.2.4 floor participant · Rust 판 — 같은 생성기의 TS 판과 한 뿌리(같은 입구 · 같은 칸 · 같은 라벨).
 // 집행은 부르는 쪽 몫이다 — out(DC 로 보낼 것) · ack(ACK 으로 답할 것) · fx(마이크 · 화면 · 앱 알림) · start(다시 걸 타이머). armed() 밖의 타이머는 멈춘다.
 #![allow(dead_code, unused_variables, unused_mut, unused_parens, non_camel_case_types, clippy::all)]
 
@@ -149,6 +149,7 @@ pub struct RxTaken {
     #[cfg_attr(feature = "serde", serde(default))]
     pub ack: bool,
     pub speaker: String,
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))] pub sources: Option<Vec<i64>>,
     pub seq: i64,
 }
 
@@ -551,8 +552,9 @@ pub fn rx_from_tlv(msg_type: u8, ack: bool, tlvs: &[(u8, Vec<u8>)]) -> Option<(S
         2 => {
             let room = get(29).and_then(|v| Some(String::from_utf8_lossy(v).into_owned()))?;
             let speaker = get(4).and_then(|v| Some(String::from_utf8_lossy(v).into_owned()))?;
+            let sources = get(31).and_then(|v| Some(v.chunks_exact(4).map(|c| i64::from(u32::from_be_bytes([c[0], c[1], c[2], c[3]]))).collect::<Vec<i64>>()));
             let seq = get(8).and_then(|v| (if v.len() >= 2 { Some(i64::from(u16::from_be_bytes([v[0], v[1]]))) } else { None }))?;
-            Some((room, Rx::Taken(RxTaken { ack, speaker, seq })))
+            Some((room, Rx::Taken(RxTaken { ack, speaker, sources, seq })))
         }
         5 => {
             let room = get(29).and_then(|v| Some(String::from_utf8_lossy(v).into_owned()))?;

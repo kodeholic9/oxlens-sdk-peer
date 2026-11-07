@@ -91,7 +91,9 @@ mod tests {
     #[test]
     fn taken_idle_round() {
         let taken = wrap(&unhex("020308020007040275321d027231"), SVC_FLOOR).unwrap();
-        assert_eq!(parse(&taken), Some(("r1".to_string(), Rx::Taken(RxTaken { ack: false, speaker: "u2".into(), seq: 7 }))));
+        assert_eq!(parse(&taken), Some(("r1".to_string(), Rx::Taken(RxTaken { ack: false, speaker: "u2".into(), sources: None, seq: 7 }))));
+        let with_src = wrap(&encode(&Msg { msg_type: 2, ack: false, tlvs: vec![(4, b"u2".to_vec()), (8, vec![0, 7]), (29, b"r1".to_vec()), (31, vec![0, 0, 0, 3, 0, 0, 0, 4])] }).unwrap(), SVC_FLOOR).unwrap();
+        assert_eq!(parse(&with_src), Some(("r1".to_string(), Rx::Taken(RxTaken { ack: false, speaker: "u2".into(), sources: Some(vec![3, 4]), seq: 7 }))));
         let idle = wrap(&encode(&Msg { msg_type: 5, ack: true, tlvs: vec![(8, vec![0, 9]), (29, b"r1".to_vec())] }).unwrap(), SVC_FLOOR).unwrap();
         assert_eq!(parse(&idle), Some(("r1".to_string(), Rx::Idle(RxIdle { ack: true, prev: None, seq: 9 }))));
         let ackb = ack(&Ack { of: AckOf::TAKEN }, "r1").unwrap();

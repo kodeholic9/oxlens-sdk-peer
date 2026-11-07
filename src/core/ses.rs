@@ -141,7 +141,8 @@ impl Core {
     fn ses_send(&mut self, tx: &sc::Tx) {
         match tx {
             sc::Tx::Bind { pc_mode, session_id, .. } => {
-                let mut body = json!({ "token": self.token, "pc_mode": pc_mode.as_str() });
+                // 출처 표지는 늘 켠다 — 패킷마다 발행 신원(SDK:RULE-PLAT-SERVER 「출처 표지」 · 연:RULE-SES-SOURCE-TAG-SESSION)
+                let mut body = json!({ "token": self.token, "pc_mode": pc_mode.as_str(), "source_tag": true });
                 if let Some(s) = session_id.and_then(|id| self.sids.str(id).map(str::to_string)) {
                     body["session_id"] = Value::String(s);
                 }

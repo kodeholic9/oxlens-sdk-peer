@@ -13,7 +13,7 @@ use super::{Core, Job, Tk};
 use crate::api::{Event, LinkInfo, LinkState};
 use crate::generated::ws_wire::{IceRestartRes, MlineTable, Op, ServerConfig, TrackEntryType};
 use crate::generated::{link_binding as lb, link_client as lc, room_client as rc, sdk_defaults as dflt, session_client as sc, sub_client as uc};
-use crate::link::transport::{Creds, Fact, IceState, LinkFact, Role, Route, Routes, Transport};
+use crate::link::transport::{Creds, Fact, IceState, LinkFact, Role, Route, Routes, Source, Transport};
 use crate::sig::{Outcome, Purpose};
 
 pub(crate) struct Link {
@@ -813,6 +813,16 @@ impl Core {
                 }
                 routes.media.insert(m.ssrc, route);
             }
+        }
+        for r in self.rooms.values() {
+            for (tid, e) in &r.entries {
+                if let Some(c) = e.csrc {
+                    routes.sources.insert(c, Source { csrc: c, user_id: e.user_id.clone(), track_id: Some(tid.clone()) });
+                }
+            }
+        }
+        for (c, u) in &self.talk_sources {
+            routes.sources.entry(*c).or_insert_with(|| Source { csrc: *c, user_id: Some(u.clone()), track_id: None });
         }
         if let Ok(mut g) = self.sink.routes.write() {
             *g = routes;

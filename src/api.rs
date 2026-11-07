@@ -11,7 +11,7 @@ use crate::error::Error;
 pub use crate::generated::ws_wire::{Duplex, Kind, MemberInfo, Permission, TokenReq, TrackEntry, TrackEntryType};
 pub use crate::link::recv::{MediaFrame, Unit};
 pub use crate::link::send::OutFrame;
-pub use crate::link::transport::MediaPacket;
+pub use crate::link::transport::{MediaPacket, Source};
 
 /// 접속 설정 — `base` 는 앱이 준다(연:RULE-TRN-BASE-GIVEN) · `token` 은 앱이 발급받은 것(연:SES.http.TOKEN)
 #[derive(Clone, Debug)]

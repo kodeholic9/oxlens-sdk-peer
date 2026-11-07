@@ -15,6 +15,10 @@ use crate::mkv::{Codec, Mkv};
 use crate::{Args, Flow};
 
 struct Rec {
+    /// 지금 이 트랙을 싣는 다운링크 ssrc(줄) · 마지막 프레임을 받은 때 — 트랙이 다른 줄로 옮겨 가면 시각축을 받은 시각으로 다시 잇는다
+    ssrc: u32,
+    last_at: Instant,
+    rebased: u64,
     file: PathBuf,
     track_id: String,
     kind: String,
@@ -33,12 +37,12 @@ fn unix_ms() -> u64 {
 }
 
 fn close(r: Rec, done: &mut Vec<Value>) {
-    let (frames, keyframes, synced, first_rtp, last_rtp, dur) = (r.m.frames, r.m.keyframes, r.m.synced, r.m.first_rtp, r.m.last_rtp, r.m.last_ms);
+    let (frames, keyframes, synced, first_rtp, last_rtp, dur, rebased) = (r.m.frames, r.m.keyframes, r.m.synced, r.m.first_rtp, r.m.last_rtp, r.m.last_ms, r.rebased);
     let start = r.m.finish().ok().flatten();
     done.push(json!({
         "file": r.file, "track_id": r.track_id, "kind": r.kind, "codec": r.codec, "who": r.who, "slot": r.slot,
         "frames": frames, "keyframes": keyframes, "synced": synced, "first_rtp": first_rtp, "last_rtp": last_rtp,
-        "duration_ms": dur, "start_wall_ms": start,
+        "duration_ms": dur, "start_wall_ms": start, "rebased": rebased,
     }));
 }
 
@@ -189,7 +193,7 @@ fn on_frame(a: &Args, f: MediaFrame, speaker: &Option<String>, recs: &mut BTreeM
         let file = a.out.join(format!("{}-{:03}-{}-{}.mkv", safe(&a.room), n, safe(&who), f.kind));
         match Mkv::create(&file, codec, &f.data, u64::from(*n)) {
             Ok(m) => {
-                recs.insert(f.track_id.clone(), Rec { file, track_id: f.track_id.clone(), kind: f.kind.clone(), codec: f.codec.clone(), who, slot, m });
+                recs.insert(f.track_id.clone(), Rec { ssrc: f.ssrc, last_at: f.received_at, rebased: 0, file, track_id: f.track_id.clone(), kind: f.kind.clone(), codec: f.codec.clone(), who, slot, m });
             }
             Err(e) => {
                 eprintln!("파일을 못 만들었다 {}: {e}", file.display());
@@ -198,6 +202,13 @@ fn on_frame(a: &Args, f: MediaFrame, speaker: &Option<String>, recs: &mut BTreeM
         }
     }
     if let Some(r) = recs.get_mut(&f.track_id) {
+        // ★줄마다 RTP 시각 기준이 다르다(연:RULE-SUB-FILL 재배정 — 줄의 SSRC · seq · ts 는 줄 것) — 다른 줄로 옮겨 온 첫 프레임은 RTP 시각 차 대신 받은 시각 차로 잇는다
+        if r.ssrc != f.ssrc {
+            r.m.rebase(f.timestamp, f.received_at.saturating_duration_since(r.last_at));
+            r.ssrc = f.ssrc;
+            r.rebased += 1;
+        }
+        r.last_at = f.received_at;
         let _ = r.m.push(f.timestamp, f.keyframe, &f.data, f.wallclock, f.synced);
     }
 }

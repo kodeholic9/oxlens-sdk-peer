@@ -474,6 +474,15 @@ impl Mkv {
         Ok(())
     }
 
+    /// 다음 프레임(RTP 시각 `ts`)을 마지막 프레임에서 `gap` 뒤로 잇는다 — 트랙이 시각 기준이 다른 줄로 옮겨 왔을 때(RTP 시각 차가 뜻이 없다)
+    pub fn rebase(&mut self, ts: u32, gap: std::time::Duration) {
+        if self.first_ts.is_none() {
+            return;
+        }
+        let ticks = (gap.as_secs_f64() * self.codec.clock() as f64).round() as u32;
+        self.last_ts = ts.wrapping_sub(ticks.max(1));
+    }
+
     /// 열린 클러스터의 크기를 고쳐 쓴다(끝에서 돌아와)
     fn close_cluster(&mut self) -> io::Result<()> {
         if let Some((size_at, data_at)) = self.cluster_open.take() {
@@ -584,6 +593,23 @@ mod tests {
 
     fn rd_uint(b: &[u8]) -> u64 {
         b.iter().fold(0, |a, x| (a << 8) | u64::from(*x))
+    }
+
+    #[test]
+    fn rebase_keeps_time_across_row_move() {
+        let dir = std::env::temp_dir().join(format!("oxpeer-mkv-rb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut m = Mkv::create(&dir.join("a.mkv"), Codec::Opus, &[0xf8], 1).unwrap();
+        m.push(1_000, true, &[0xf8], UNIX_EPOCH, false).unwrap();
+        m.push(1_960, true, &[0xf8], UNIX_EPOCH, false).unwrap();
+        // 다른 줄 — RTP 시각 기준이 전혀 다르다(뒤로 · 크게). 받은 시각으로 500ms 뒤에 잇는다
+        m.rebase(4_000_000_000, std::time::Duration::from_millis(500));
+        m.push(4_000_000_000, true, &[0xf8], UNIX_EPOCH, false).unwrap();
+        assert_eq!(m.last_ms, 20 + 500);
+        m.push(4_000_000_960, true, &[0xf8], UNIX_EPOCH, false).unwrap();
+        assert_eq!(m.last_ms, 540);
+        m.finish().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 닫은 파일의 뼈대 — Segment 크기 = 파일 끝 · 클러스터 크기를 따라 걸으면 다음 요소에 닿는다 · SeekHead → Cues · Cue → Cluster · Duration

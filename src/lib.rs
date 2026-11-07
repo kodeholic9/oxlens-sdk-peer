@@ -12,8 +12,8 @@
 //! while let Some(p) = media.next().await { let _ = (p.track_id, p.payload); }
 //! # let _ = events.next().await; Ok(()) }
 //! ```
-//! 범위(context 202611/20261106c A3 · 20261107a): 세션 · 연결 · 방 · 받는 트랙 · 구독 + 발언권 듣기 · 수신 정리층(재정렬 · NACK · RTX · PLI · RR · SR) · 프레임 단위 수신 · 층 고르기.
-//! 발행 · 발언 요청은 아직 없다(에이전트 단계).
+//! 범위(context 202611/20261106c A3 · 20261107a · 20261107c): 세션 · 연결 · 방 · 받는 트랙 · 구독 + 발언권 듣기 · 수신 정리층(재정렬 · NACK · RTX · PLI · RR · SR) ·
+//! 프레임 단위 수신 · 층 고르기 · ★말하기 — 발행(앱이 인코딩한 프레임 · 송신 시계 · 음량 표시 · SR · RTX 응답 · PLI 사건) · 발언 방(소속) · 발언 누름 · 메시지 · 지금 값.
 
 mod api;
 mod core;
@@ -28,6 +28,6 @@ mod wire;
 #[cfg(all(test, feature = "serde"))]
 mod vectors_test;
 
-pub use api::{Client, Config, Event, Events, Frames, Health, Kind, Layer, LinkInfo, LinkState, Media, MediaFrame, MediaPacket, MemberInfo, Permission, SessionInfo, SessionState, Stats, TokenReq, TrackEntry, TrackEntryType, Unit};
+pub use api::{Client, Config, Duplex, Event, Events, Frames, Health, Kind, Layer, LinkInfo, LinkState, LocalTrack, Media, MediaFrame, MediaPacket, MemberInfo, OutFrame, Permission, PttInfo, RoomView, SessionInfo, SessionState, Snapshot, Stats, TokenReq, TrackEntry, TrackEntryType, TrackSpec, Unit};
 pub use error::{Category, Error};
 pub use token::issue_token;

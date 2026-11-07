@@ -1,5 +1,5 @@
 // author: kodeholic (powered by Claude)
-//! 진짜 코덱 표본(ffmpeg 가 지은 VP8 · H264 · Opus — `scripts/media_check.sh`)을 libwebrtc 꼴 RTP 로 쪼개 수신 정리층에 넣고,
+//! 진짜 코덱 표본(ffmpeg 가 지은 VP8 · H264 · Opus — `scripts/media_check.sh`)을 보내는 쪽 패킷화(`send::packetize` — libwebrtc 꼴)로 쪼개 수신 정리층에 넣고,
 //! 나온 프레임이 원본과 같은지 바이트로 견준다(20261107a 미결 — 재생기 호환 실측의 앞 절반). 뒤바뀜 · RTX 복구를 섞는다.
 //! 나온 프레임은 `frames_<코덱>.bin` 으로 남긴다 — 예제 `mkvcheck` 가 녹화기의 MKV 쓰개로 파일을 짓고 스크립트가 ffprobe · ffmpeg 로 읽는다.
 //! 표본 폴더는 `OXPEER_MEDIA_DIR` — 없으면 돌지 않는다(`#[ignore]`).
@@ -10,11 +10,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 
+use super::depack::Codec;
 use super::recv::{Counters, Out, Recv, Rtp, Unit};
+use super::send;
 use super::transport::Route;
-
-/// libwebrtc 의 RTP 페이로드 상한 근처
-const MTU: usize = 1_150;
 
 struct Frame {
     ts: u32,
@@ -96,51 +95,14 @@ fn read_ogg(p: &Path) -> Vec<Vec<u8>> {
     out.split_off(2)
 }
 
-/// RFC 7741 — 서술자 한 바이트(S · PID 0) · MTU 로 자른다
-fn pack_vp8(f: &[u8]) -> Vec<Vec<u8>> {
-    f.chunks(MTU).enumerate().map(|(i, c)| [&[if i == 0 { 0x10 } else { 0x00 }][..], c].concat()).collect()
+/// 제품 패킷화(`send::packetize` — 보내는 쪽과 같은 것)로 쪼갠다
+fn pack(codec: Codec, f: &[u8]) -> Vec<Vec<u8>> {
+    send::packetize(codec, f)
 }
 
-/// RFC 6184 packetization-mode 1 — 작은 NAL 들(SPS · PPS)은 STAP-A 로 묶고 · 큰 NAL 은 FU-A · 나머지는 단일 NAL(libwebrtc 꼴)
-fn pack_h264(nals: &[Vec<u8>]) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut stap: Vec<&Vec<u8>> = Vec::new();
-    let flush = |stap: &mut Vec<&Vec<u8>>, out: &mut Vec<Vec<u8>>| {
-        match stap.len() {
-            0 => {}
-            1 => out.push(stap[0].clone()),
-            _ => {
-                let nri = stap.iter().map(|n| n[0] & 0x60).max().unwrap_or(0);
-                let mut p = vec![nri | 24];
-                for n in stap.iter() {
-                    p.extend((n.len() as u16).to_be_bytes());
-                    p.extend_from_slice(n);
-                }
-                out.push(p);
-            }
-        }
-        stap.clear();
-    };
-    for n in nals {
-        let t = n[0] & 0x1f;
-        if (t == 7 || t == 8) && n.len() < 200 {
-            stap.push(n);
-            continue;
-        }
-        flush(&mut stap, &mut out);
-        if n.len() <= MTU {
-            out.push(n.clone());
-            continue;
-        }
-        let parts: Vec<&[u8]> = n[1..].chunks(MTU - 2).collect();
-        for (i, c) in parts.iter().enumerate() {
-            let s = if i == 0 { 0x80 } else { 0 };
-            let e = if i == parts.len() - 1 { 0x40 } else { 0 };
-            out.push([&[(n[0] & 0xe0) | 28, s | e | t][..], c].concat());
-        }
-    }
-    flush(&mut stap, &mut out);
-    out
+/// 접근 단위(NAL 목록) → Annex-B
+fn annexb(nals: &[Vec<u8>]) -> Vec<u8> {
+    nals.iter().flat_map(|n| [&[0, 0, 0, 1][..], n].concat()).collect()
 }
 
 fn route(kind: &str, codec: &str) -> Route {
@@ -212,7 +174,7 @@ fn save(dir: &Path, name: &str, fs: &[Frame]) {
 fn media_fixture_vp8_resolution_switch() {
     let Some(d) = dir() else { return };
     let src: Vec<Vec<u8>> = read_ivf(&d.join("vp8_a.ivf")).into_iter().chain(read_ivf(&d.join("vp8_b.ivf"))).collect();
-    let frames: Vec<(u32, Vec<Vec<u8>>)> = src.iter().enumerate().map(|(i, f)| (i as u32 * 3000, pack_vp8(f))).collect();
+    let frames: Vec<(u32, Vec<Vec<u8>>)> = src.iter().enumerate().map(|(i, f)| (i as u32 * 3000, pack(Codec::Vp8, f))).collect();
     let multi = frames.iter().filter(|(_, p)| p.len() > 1).count();
     let (got, c) = run(&route("video", "VP8"), &frames);
     assert_eq!(got.len(), src.len(), "프레임 수");
@@ -229,7 +191,7 @@ fn media_fixture_vp8_resolution_switch() {
 fn media_fixture_h264_resolution_switch() {
     let Some(d) = dir() else { return };
     let aus: Vec<Vec<Vec<u8>>> = read_h264(&d.join("h264_a.h264")).into_iter().chain(read_h264(&d.join("h264_b.h264"))).collect();
-    let frames: Vec<(u32, Vec<Vec<u8>>)> = aus.iter().enumerate().map(|(i, a)| (i as u32 * 3000, pack_h264(a))).collect();
+    let frames: Vec<(u32, Vec<Vec<u8>>)> = aus.iter().enumerate().map(|(i, a)| (i as u32 * 3000, pack(Codec::H264, &annexb(a)))).collect();
     let (stap, fua) = frames.iter().flat_map(|(_, p)| p).fold((0, 0), |(s, f), p| (s + usize::from(p[0] & 0x1f == 24), f + usize::from(p[0] & 0x1f == 28)));
     let (got, c) = run(&route("video", "H264"), &frames);
     assert_eq!(got.len(), aus.len(), "프레임 수");

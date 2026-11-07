@@ -8,8 +8,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::core::{self, Cmd};
 use crate::error::Error;
-pub use crate::generated::ws_wire::{Kind, MemberInfo, Permission, TokenReq, TrackEntry, TrackEntryType};
+pub use crate::generated::ws_wire::{Duplex, Kind, MemberInfo, Permission, TokenReq, TrackEntry, TrackEntryType};
 pub use crate::link::recv::{MediaFrame, Unit};
+pub use crate::link::send::OutFrame;
 pub use crate::link::transport::MediaPacket;
 
 /// 접속 설정 — `base` 는 앱이 준다(연:RULE-TRN-BASE-GIVEN) · `token` 은 앱이 발급받은 것(연:SES.http.TOKEN)
@@ -124,6 +125,59 @@ pub enum Event {
     Resync { room: String },
     /// 방 · 구독의 요청이 실패했다(내 요청이 아닌 것)
     Error { room: Option<String>, error: Error },
+    // ── 말하는 쪽(20261107c) ──
+    /// 내 발행이 섰다(SDK 효과 표 `published`) · 실패했다 · 끝났다(서버가 지웠다 — `ended`)
+    Published { room: String, track_id: String },
+    PublishFailed { room: String },
+    TrackEnded { room: String, track_id: String },
+    /// 서버가 내 발행에 키프레임을 청했다(PLI) — 앱이 인코더에 키프레임을 시킨다(SDK 는 인코딩하지 않는다)
+    KeyframeRequested { room: String, track_id: String },
+    /// 발언권 누름 쪽(SDK:IMPL-FLR-EXPOSE) — event = granted · denied · queued · revoked · state · state = 위 클라 상태
+    Ptt { room: String, event: String, state: String },
+    /// 발언 방이 바뀌었다(소속 응답 — None = 없다)
+    SpeakingRoom { room: Option<String> },
+    /// 방 문자(연:AUX.op.MESSAGE)
+    Message { room: String, user_id: String, content: String },
+    /// 내 권한이 바뀌었다(PARTICIPANT_STATE — 투명 참가자도 본인에겐 온다)
+    Permission { room: String, permission: Option<Permission> },
+}
+
+/// 발행할 트랙 — 코덱은 그 방의 미디어 코덱이다(연:RULE-PUB-PUBLISH-PROC — 앱이 고르는 칸이 없다)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackSpec {
+    pub kind: Kind,
+    /// `Full` = 전이중(늘 보낸다) · `Half` = 반이중(발언권 허가 사이에만 — 무전)
+    pub duplex: Duplex,
+}
+
+/// 지금 값(SDK:IMPL-SES-API 상태 읽기 — 사건을 놓친 앱이 다시 맞춘다)
+#[derive(Clone, Debug, PartialEq)]
+pub struct Snapshot {
+    pub session: Option<SessionInfo>,
+    pub speaking_room: Option<String>,
+    pub rooms: Vec<RoomView>,
+    /// 게이트가 닫혀 버린 프레임 · 보낸 프레임(발행 전부)
+    pub gated: u64,
+    pub sent: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoomView {
+    pub room: String,
+    pub joined: bool,
+    pub server: Option<String>,
+    pub speaker: Option<String>,
+    pub ptt: PttInfo,
+    pub permission: Option<Permission>,
+    /// 이 방의 내 발행(track_id)
+    pub published: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PttInfo {
+    /// 위 클라 상태 이름(NOPERM · PREQ · PERM · QUEUED …)
+    pub state: String,
+    pub trusted: bool,
 }
 
 /// 수치 — 미디어 경로와 수신 정리층의 계수
@@ -144,6 +198,50 @@ pub struct Stats {
     pub frames_skipped: u64,
     /// QA 스위치가 버린 영상 패킷(`OXPEER_QA_DROP_VIDEO_EVERY` — 시험 수단 · 평소 0)
     pub qa_dropped: u64,
+    /// 보내는 쪽 — RTX 로 다시 보낸 패킷 · 서버가 준 대역 상한(REMB) · 보낸 프레임 · 게이트가 닫혀 버린 프레임
+    pub rtx_sent: u64,
+    pub remb_bps: u64,
+    pub frames_sent: u64,
+    pub frames_gated: u64,
+    /// QA 스위치가 보내지 않은 영상 패킷(`OXPEER_QA_DROP_SEND_EVERY` — 시험 수단 · 평소 0)
+    pub qa_send_dropped: u64,
+}
+
+/// 내 발행 하나 — 앱이 인코딩한 프레임을 넣는다. 송신 시계가 프레임 길이대로 내보내고 · 통이 차면 `write` 가 기다린다(SDK:RULE-PLAT-SERVER 송신 시계)
+pub struct LocalTrack {
+    id: u64,
+    pub room: String,
+    pub track_id: String,
+    frames: mpsc::Sender<OutFrame>,
+    cmd: mpsc::UnboundedSender<Cmd>,
+}
+
+impl LocalTrack {
+    /// 프레임 하나 — 통이 차면 기다린다(역압)
+    pub async fn write(&self, f: OutFrame) -> Result<(), Error> {
+        self.frames.send(f).await.map_err(|_| Error::closed("CLOSED"))
+    }
+
+    /// 넣은 프레임을 송신 시계가 다 내보낼 때까지 기다린다 — 발언을 놓기 전에 부른다(놓으면 게이트가 닫혀 통에 남은 것은 버려진다)
+    pub async fn drain(&self) {
+        while self.frames.capacity() < self.frames.max_capacity() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // 통에서 꺼낸 마지막 프레임이 제 때를 기다리고 있을 수 있다 — 한 프레임 길이(넉넉히)
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    }
+
+    /// 반이중 ↔ 전이중(SDK:IMPL-PUB-API `setDuplex` · TRACK_SET) — 응답이 오면 돌아온다
+    pub async fn set_duplex(&self, duplex: Duplex) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd.send(Cmd::SetDuplex(self.id, duplex == Duplex::Half, tx)).map_err(|_| Error::closed("CLOSED"))?;
+        rx.await.map_err(|_| Error::closed("CLOSED"))?
+    }
+
+    /// 발행을 내린다(`LocalTrack.stop()`)
+    pub fn unpublish(self) {
+        let _ = self.cmd.send(Cmd::Unpublish(self.id));
+    }
 }
 
 /// 클라이언트 핸들 — 복제해도 같은 SDK 루프다
@@ -228,6 +326,57 @@ impl Client {
         if self.send(Cmd::Close(tx)).is_ok() {
             let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
         }
+    }
+
+    /// 이 방에서 말하려고 들어간다(발언 방 — select:true 입장 · 이미 발언 방이 있으면 들어간 뒤 옮긴다)
+    pub async fn join_speaking(&self, room: &str) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Cmd::JoinSpeaking(room.to_string(), tx))?;
+        rx.await.map_err(|_| Error::closed("CLOSED"))?
+    }
+
+    /// 발언 방을 들어가 있는 이 방으로(소속 전환 — 연:AFF)
+    pub async fn set_speaking_room(&self, room: &str) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Cmd::SetSpeakingRoom(room.to_string(), tx))?;
+        rx.await.map_err(|_| Error::closed("CLOSED"))?
+    }
+
+    /// 발행 — 서버가 받으면(`published`) 돌아온다. 전이중은 곧 보내고 · 반이중은 발언권 허가 사이에만 보낸다
+    pub async fn publish(&self, room: &str, spec: TrackSpec) -> Result<LocalTrack, Error> {
+        let (ftx, frx) = mpsc::channel(crate::core::FRAME_QUEUE);
+        let (tx, rx) = oneshot::channel();
+        self.send(Cmd::Publish(room.to_string(), spec, frx, tx))?;
+        let (id, track_id) = rx.await.map_err(|_| Error::closed("CLOSED"))??;
+        Ok(LocalTrack { id, room: room.to_string(), track_id, frames: ftx, cmd: self.cmd.clone() })
+    }
+
+    /// 발언 누름(SDK:IMPL-FLR-BUTTON `ptt.press`) — 위 입구에 닿으면 돌아온다 · 허가는 사건 `Ptt{granted}` 로
+    pub async fn ptt_press(&self, room: &str, priority: u8) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Cmd::PttPress(room.to_string(), priority, tx))?;
+        rx.await.map_err(|_| Error::closed("CLOSED"))?
+    }
+
+    /// 발언 놓음(`ptt.release`)
+    pub async fn ptt_release(&self, room: &str) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Cmd::PttRelease(room.to_string(), tx))?;
+        rx.await.map_err(|_| Error::closed("CLOSED"))?
+    }
+
+    /// 방 문자 보내기(연:AUX.op.MESSAGE) — 서버가 매긴 msg_id
+    pub async fn send_message(&self, room: &str, content: &str) -> Result<String, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Cmd::Message(room.to_string(), content.to_string(), tx))?;
+        rx.await.map_err(|_| Error::closed("CLOSED"))?
+    }
+
+    /// 지금 값
+    pub async fn snapshot(&self) -> Result<Snapshot, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Cmd::Snapshot(tx))?;
+        rx.await.map_err(|_| Error::closed("CLOSED"))
     }
 
     /// 이 트랙을 받는 단위 — 다음 패킷부터

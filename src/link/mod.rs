@@ -6,5 +6,6 @@ pub(crate) mod depack;
 #[cfg(test)]
 mod media_fixture_test;
 pub(crate) mod recv;
+pub(crate) mod send;
 pub(crate) mod stun;
 pub(crate) mod transport;

@@ -43,3 +43,7 @@ path = "examples/recorder/main.rs"
 [lints.rust]
 unsafe_code = "forbid"
 unused_must_use = "deny"
+
+[[example]]
+name = "agent"
+path = "examples/agent/main.rs"

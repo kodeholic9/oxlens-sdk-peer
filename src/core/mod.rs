@@ -5,7 +5,10 @@
 //! 바깥 입력은 넷 — 앱 명령 · 소켓 사건 · 연결 사실 · 재동기 응답. 걸음 뒤 요청의 끝(응답 · 버림)과 미룬 일(협상)을 차례대로 비운다.
 
 mod link;
+mod pubs;
 mod room;
+
+pub(crate) use pubs::FRAME_QUEUE;
 mod ses;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -17,7 +20,9 @@ use dtls::crypto::Certificate;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::api::{Config, Event, Layer, Stats};
+use crate::api::{Config, Event, Layer, Snapshot, Stats, TrackSpec};
+use crate::link::send::OutFrame;
+use crate::link::transport::PubOut;
 use crate::error::Error;
 use crate::generated::{floor_client as flr, session_client as sc};
 use crate::http;
@@ -37,6 +42,18 @@ pub(crate) enum Cmd {
     Stats(oneshot::Sender<Stats>),
     SetUnit(String, Unit),
     SetLayer(String, Layer, oneshot::Sender<Result<(), Error>>),
+    /// 말하는 쪽(20261107c)
+    JoinSpeaking(String, oneshot::Sender<Result<(), Error>>),
+    SetSpeakingRoom(String, oneshot::Sender<Result<(), Error>>),
+    Publish(String, TrackSpec, mpsc::Receiver<OutFrame>, oneshot::Sender<Result<(u64, String), Error>>),
+    Unpublish(u64),
+    SetDuplex(u64, bool, oneshot::Sender<Result<(), Error>>),
+    /// 송신 시계 — 게이트가 열린 뒤 첫 패킷이 나갔다
+    RtpTx(u64),
+    PttPress(String, u8, oneshot::Sender<Result<(), Error>>),
+    PttRelease(String, oneshot::Sender<Result<(), Error>>),
+    Message(String, String, oneshot::Sender<Result<String, Error>>),
+    Snapshot(oneshot::Sender<Snapshot>),
 }
 
 /// 재동기 응답(HTTP — 루프 밖 태스크가 받아 넘긴다)
@@ -187,6 +204,19 @@ pub(crate) struct Core {
     pub(crate) link_gen: u64,
     pub(crate) finished: bool,
     trace: bool,
+    /// 말하는 쪽 — 발행 트랙 · 서버마다 발행 mid 차례 · 내보내는 손잡이 자리 · 루프 자신의 명령 통(송신 시계가 쓴다)
+    pub(crate) pubs: BTreeMap<u64, pubs::PubTrack>,
+    pub(crate) pub_seq: u64,
+    pub(crate) pub_mids: HashMap<String, u32>,
+    pub(crate) pub_outs: Arc<std::sync::RwLock<HashMap<String, Arc<std::sync::OnceLock<PubOut>>>>>,
+    pub(crate) cmd_tx: mpsc::UnboundedSender<Cmd>,
+    /// 세션의 소속(발언 방 — 위 AFF 상태기) · 기다리는 앱
+    pub(crate) aff: crate::generated::aff_client::St,
+    pub(crate) aff_waiters: Vec<oneshot::Sender<Result<(), Error>>>,
+    pub(crate) msg_waiters: HashMap<u64, oneshot::Sender<Result<String, Error>>>,
+    pub(crate) msg_seq: u64,
+    /// 다음 입장의 모양 — (방, select:true 로) · 아니면 (방, 들어간 뒤 소속 전환)
+    pub(crate) join_mode: Option<(String, bool)>,
 }
 
 pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::Sender<MediaPacket>, frames: mpsc::Sender<MediaFrame>) -> Result<mpsc::UnboundedSender<Cmd>, Error> {
@@ -205,6 +235,9 @@ pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::
         counters: Arc::default(),
         qa_drop_every: std::env::var("OXPEER_QA_DROP_VIDEO_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         qa_dropped: Arc::new(AtomicU64::new(0)),
+        senders: Arc::default(),
+        remb: Arc::new(AtomicU64::new(0)),
+        rtx_sent: Arc::new(AtomicU64::new(0)),
         unrouted: Arc::new(AtomicU64::new(0)),
         decrypt_fail: Arc::new(AtomicU64::new(0)),
     };
@@ -247,6 +280,16 @@ pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::
         link_gen: 0,
         finished: false,
         trace: std::env::var_os("OXPEER_TRACE").is_some(),
+        pubs: BTreeMap::new(),
+        pub_seq: 0,
+        pub_mids: HashMap::new(),
+        pub_outs: Arc::default(),
+        cmd_tx: cmd_tx.clone(),
+        aff: crate::generated::aff_client::initial(),
+        aff_waiters: Vec::new(),
+        msg_waiters: HashMap::new(),
+        msg_seq: 0,
+        join_mode: None,
     };
     tokio::spawn(run(core, cmd_rx, sock_rx, fact_rx, http_rx));
     Ok(cmd_tx)
@@ -367,6 +410,11 @@ impl Core {
                     frames_broken: n(&c.frames_broken),
                     frames_skipped: n(&c.frames_skipped),
                     qa_dropped: n(&self.sink.qa_dropped),
+                    rtx_sent: n(&self.sink.rtx_sent),
+                    remb_bps: n(&self.sink.remb),
+                    frames_sent: self.pubs.values().map(|t| t.io.sent.load(Ordering::Relaxed)).sum(),
+                    frames_gated: self.pubs.values().map(|t| t.io.gated.load(Ordering::Relaxed)).sum(),
+                    qa_send_dropped: self.pubs.values().map(|t| t.io.qa_dropped.load(Ordering::Relaxed)).sum(),
                 });
             }
             Cmd::SetUnit(track, unit) => {
@@ -374,6 +422,22 @@ impl Core {
                 self.rebuild_routes();
             }
             Cmd::SetLayer(track, layer, tx) => self.set_layer(track, layer, tx),
+            Cmd::JoinSpeaking(room, tx) => self.join_speaking(room, tx),
+            Cmd::SetSpeakingRoom(room, tx) => self.set_speaking_room(room, tx),
+            Cmd::Publish(room, spec, frames, tx) => self.publish(room, spec, frames, tx),
+            Cmd::Unpublish(id) => self.unpublish(id),
+            Cmd::SetDuplex(id, half, tx) => self.set_duplex(id, half, tx),
+            Cmd::RtpTx(id) => self.rtp_tx(id),
+            Cmd::PttPress(room, p, tx) => {
+                let _ = tx.send(self.ptt_press(&room, p));
+            }
+            Cmd::PttRelease(room, tx) => {
+                let _ = tx.send(self.ptt_release(&room));
+            }
+            Cmd::Message(room, content, tx) => self.send_message(room, content, tx),
+            Cmd::Snapshot(tx) => {
+                let _ = tx.send(self.snapshot());
+            }
         }
     }
 
@@ -419,6 +483,7 @@ impl Core {
                 let ufrag = body.get("ufrag").and_then(Value::as_str).unwrap_or("").to_string();
                 self.link_event(&server, &ufrag);
             }
+            Op::Message => self.message_in(body),
             _ => self.record("SES", "notify", "-", "-", op_name(op), "모르는 통지 — ACK 만 했다"),
         }
     }
@@ -466,6 +531,11 @@ impl Core {
             Purpose::Ready { room, epoch } => self.ready_reply(&room, epoch, o),
             Purpose::Layer { room, epoch, id } => self.layer_reply(&room, epoch, id, o),
             Purpose::IceRestart { server, req } => self.restart_reply(&server, req, o),
+            Purpose::Publish { track, pid } => self.publish_reply(track, pid, o),
+            Purpose::Unpublish => {}
+            Purpose::TrackSet { track } => self.track_set_reply(track, o),
+            Purpose::Affiliation { server } => self.affiliation_reply(server, o),
+            Purpose::Message { id } => self.message_reply(id, o),
         }
     }
 

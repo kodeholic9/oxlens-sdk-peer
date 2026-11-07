@@ -312,8 +312,12 @@ impl Core {
             sc::SeamFx::media_repair => servers.iter().for_each(|s| self.link_repair(s)),
             sc::SeamFx::rooms_rejoin => self.rejoin_all(rooms),
             sc::SeamFx::rooms_snapshot => self.resume_snapshots(),
-            // 발행은 첫 단계에 없다(20261106c A3 — 녹음은 받기만) — 다시 올릴 발행이 없다
-            sc::SeamFx::pub_reregister_all | sc::SeamFx::pub_resume_check => {}
+            // 발행(20261107c) — 새 세션이면 다시 발행 · 이어받기면 응답의 발행 목록과 맞댄다
+            sc::SeamFx::pub_reregister_all => self.pub_reregister_all(),
+            sc::SeamFx::pub_resume_check => {
+                let body = self.resume_body.clone().unwrap_or(Value::Null);
+                self.pub_resume_check(&body);
+            }
         }
     }
 

@@ -68,6 +68,8 @@ macro_rules! axis {
 }
 
 axis!(session_rust_eq_ts, "session", session_client);
+axis!(publish_rust_eq_ts, "publish", publish_client);
+axis!(aff_rust_eq_ts, "aff", aff_client);
 axis!(room_rust_eq_ts, "room", room_client);
 axis!(link_rust_eq_ts, "link", link_client);
 axis!(sub_rust_eq_ts, "sub", sub_client);

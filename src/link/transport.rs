@@ -27,6 +27,7 @@ use webrtc_srtp::protection_profile::ProtectionProfile;
 use webrtc_util::conn::Conn;
 
 use super::recv::{self, Counters, MediaFrame, Out, Recv, Rtp, Unit};
+use super::send::{self, SendTrack};
 use super::stun;
 use crate::wire::dc::CHANNEL_LABEL;
 
@@ -77,6 +78,8 @@ pub(crate) enum Fact {
     DcData(Vec<u8>),
     /// 이 ssrc 의 첫 복호 RTP 패킷(SDK:RULE-PLAT-SERVER `receiving`)
     FirstRtp(u32),
+    /// 서버가 내 발행 ssrc 에 키프레임을 청했다(PLI · FIR) — 앱 몫(SDK 는 인코딩하지 않는다)
+    Pli(u32),
 }
 
 /// 사실 하나 — 어느 서버 · 몇째 전송 묶음 · 어느 연결
@@ -148,6 +151,11 @@ pub(crate) struct MediaSink {
     /// ★QA 스위치(`OXPEER_QA_DROP_VIDEO_EVERY`) — 받은 영상 원본 패킷 N 개마다 하나를 정리층 앞에서 버린다(망 손실 흉내 · RTX 는 안 버린다). 0 = 끔 · 2층 손실 시나리오의 시험 수단
     pub qa_drop_every: u64,
     pub qa_dropped: Arc<AtomicU64>,
+    /// 보내는 트랙(발행 ssrc → RTP 상태) — 송신 시계가 쥐고 발행 연결의 NACK 이 빌린다
+    pub senders: Arc<RwLock<HashMap<u32, Arc<Mutex<SendTrack>>>>>,
+    /// 서버가 준 대역 상한(REMB · bps) · RTX 로 다시 보낸 패킷 수
+    pub remb: Arc<AtomicU64>,
+    pub rtx_sent: Arc<AtomicU64>,
     /// 경로표에 없는 ssrc 로 온 패킷 수
     pub unrouted: Arc<AtomicU64>,
     pub decrypt_fail: Arc<AtomicU64>,
@@ -167,6 +175,28 @@ enum SctpCtl {
 pub(crate) struct Transport {
     ctl: mpsc::UnboundedSender<Ctl>,
     tasks: Arc<Mutex<Vec<AbortHandle>>>,
+    out: Arc<OnceLock<PubOut>>,
+}
+
+/// 내보내는 손잡이 — 소켓 · 서버 주소 · 송신 SRTP 문맥(DTLS 가 서면 찬다). 송신 시계가 복제해 쥔다
+#[derive(Clone)]
+pub(crate) struct PubOut {
+    sock: Arc<UdpSocket>,
+    server: SocketAddr,
+    tx: Arc<OnceLock<Mutex<Context>>>,
+}
+
+impl PubOut {
+    /// 평문 RTP 하나 — 싸서 보낸다(아직 DTLS 전이면 false)
+    pub(crate) fn rtp(&self, plain: &[u8]) -> bool {
+        let Some(enc) = self.tx.get().and_then(|c| c.lock().ok().and_then(|mut c| c.encrypt_rtp(plain).ok())) else { return false };
+        self.sock.try_send_to(&enc, self.server).is_ok()
+    }
+
+    pub(crate) fn rtcp(&self, plain: &[u8]) -> bool {
+        let Some(enc) = self.tx.get().and_then(|c| c.lock().ok().and_then(|mut c| c.encrypt_rtcp(plain).ok())) else { return false };
+        self.sock.try_send_to(&enc, self.server).is_ok()
+    }
 }
 
 impl Transport {
@@ -175,10 +205,11 @@ impl Transport {
         let (name, sgen) = tag;
         let (ctl, ctl_rx) = mpsc::unbounded_channel();
         let tasks: Arc<Mutex<Vec<AbortHandle>>> = Arc::default();
-        let t2 = tasks.clone();
+        let out: Arc<OnceLock<PubOut>> = Arc::default();
+        let (t2, o2) = (tasks.clone(), out.clone());
         let main = tokio::spawn(async move {
             let say = Say { facts, server: name, sgen, role };
-            if let Err(why) = run(server, creds, cert, role, say.clone(), sink, ctl_rx, t2).await {
+            if let Err(why) = run(server, creds, cert, role, say.clone(), sink, ctl_rx, t2, o2).await {
                 say.send(Fact::Dtls(false));
                 let _ = why;
             }
@@ -186,7 +217,12 @@ impl Transport {
         if let Ok(mut g) = tasks.lock() {
             g.push(main.abort_handle());
         }
-        Transport { ctl, tasks }
+        Transport { ctl, tasks, out }
+    }
+
+    /// 내보내는 손잡이 자리(소켓이 서면 찬다)
+    pub(crate) fn out_slot(&self) -> Arc<OnceLock<PubOut>> {
+        self.out.clone()
     }
 
     /// ICE 재시작 — 새 자격으로 검사한다(DTLS · SRTP 는 그대로 — 지문 · setup 이 같다)
@@ -243,12 +279,14 @@ enum Inner {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run(server: SocketAddr, mut creds: Creds, cert: Certificate, role: Role, say: Say, sink: MediaSink, mut ctl: mpsc::UnboundedReceiver<Ctl>, tasks: Arc<Mutex<Vec<AbortHandle>>>) -> Result<(), String> {
+async fn run(server: SocketAddr, mut creds: Creds, cert: Certificate, role: Role, say: Say, sink: MediaSink, mut ctl: mpsc::UnboundedReceiver<Ctl>, tasks: Arc<Mutex<Vec<AbortHandle>>>, out: Arc<OnceLock<PubOut>>) -> Result<(), String> {
     let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await.map_err(|e| format!("UDP bind: {e}"))?);
     let (inner_tx, mut inner_rx) = mpsc::unbounded_channel::<Inner>();
     let (dtls_tx, dtls_rx) = mpsc::channel::<Vec<u8>>(256);
     let rx_ctx: Arc<OnceLock<Mutex<Context>>> = Arc::default();
     let tx_ctx: Arc<OnceLock<Mutex<Context>>> = Arc::default();
+    let _ = out.set(PubOut { sock: sock.clone(), server, tx: tx_ctx.clone() });
+    let po = out.get().cloned();
 
     let (s2, i2, rx2, tx2, say2, sink2) = (sock.clone(), inner_tx.clone(), rx_ctx.clone(), tx_ctx.clone(), say.clone(), sink.clone());
     let demux = tokio::spawn(async move {
@@ -276,7 +314,7 @@ async fn run(server: SocketAddr, mut creds: Creds, cert: Certificate, role: Role
                         let _ = dtls_tx.try_send(buf[..n].to_vec());
                     } else if (128..=191).contains(&b0) && n >= 2 {
                         if (192..=223).contains(&buf[1]) {
-                            on_rtcp(&buf[..n], &rx2, &mut rv);
+                            on_rtcp(&buf[..n], &rx2, &mut rv, &sink2, po.as_ref(), &say2);
                         } else {
                             on_rtp(&buf[..n], &rx2, &sink2, &mut seen, &say2, &mut rv, &mut qa_n);
                         }
@@ -441,12 +479,32 @@ fn on_rtp(pkt: &[u8], rx: &Arc<OnceLock<Mutex<Context>>>, sink: &MediaSink, seen
     deliver(outs, sink);
 }
 
-fn on_rtcp(pkt: &[u8], rx: &Arc<OnceLock<Mutex<Context>>>, rv: &mut Recv) {
+fn on_rtcp(pkt: &[u8], rx: &Arc<OnceLock<Mutex<Context>>>, rv: &mut Recv, sink: &MediaSink, out: Option<&PubOut>, say: &Say) {
     let Some(ctx) = rx.get() else { return };
     let Some(p) = ctx.lock().ok().and_then(|mut c| c.decrypt_rtcp(pkt).ok()) else { return };
     let now = Instant::now();
     for (ssrc, ntp, rtp) in recv::sender_reports(&p) {
         rv.on_sr(ssrc, ntp, rtp, now);
+    }
+    // 발행자 몫 — 서버가 내 발행에 묻는 것(정:IMPL-RTCP-TERMINATE): NACK → RTX · PLI → 앱 · REMB → 계수
+    let fb = send::feedback(&p);
+    for (ssrc, seqs) in fb.nacks {
+        let st = sink.senders.read().ok().and_then(|g| g.get(&ssrc).cloned());
+        let (Some(st), Some(o)) = (st, out) else { continue };
+        let pkts = st.lock().map(|mut t| t.retransmit(&seqs)).unwrap_or_default();
+        for x in pkts {
+            if o.rtp(&x) {
+                sink.rtx_sent.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    for ssrc in fb.plis {
+        if sink.senders.read().is_ok_and(|g| g.contains_key(&ssrc)) {
+            say.send(Fact::Pli(ssrc));
+        }
+    }
+    if let Some(b) = fb.remb {
+        sink.remb.store(b, Ordering::Relaxed);
     }
 }
 

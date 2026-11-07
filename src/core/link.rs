@@ -50,6 +50,11 @@ pub(crate) struct Link {
 }
 
 impl Link {
+    /// 발행 연결의 내보내는 손잡이 자리(DTLS 가 서면 찬다)
+    pub(crate) fn out_slot(&self) -> Option<std::sync::Arc<std::sync::OnceLock<crate::link::transport::PubOut>>> {
+        self.pubt.as_ref().map(Transport::out_slot)
+    }
+
     /// 앱 투영(SDK:IMPL-LINK-PROJECTION 위 상태 → 앱 값)
     pub(crate) fn state(&self) -> LinkState {
         match self.st.ls {
@@ -137,6 +142,7 @@ impl Core {
             if stale {
                 l.replaced = Some(ug);
             }
+            self.sync_outs();
             self.link_surface(&server);
             return;
         }
@@ -175,6 +181,7 @@ impl Core {
         };
         self.links.insert(server.clone(), link);
         self.record("LINK", &server, "-", "OK", "SDK.link_new", "join");
+        self.sync_outs();
         self.link_surface(&server);
     }
 
@@ -187,6 +194,7 @@ impl Core {
         }
         let server = f.server.clone();
         match f.fact {
+            Fact::Pli(ssrc) => self.pli_in(ssrc),
             Fact::Ice(s) => {
                 match f.role {
                     Role::Publish => l.ice_pub = Some(s),
@@ -465,6 +473,7 @@ impl Core {
                         l.ice_pub = None;
                         l.ice_sub = None;
                     }
+                    self.sync_outs();
                 }
                 lb::LinkAction::DcReopen => self.schedule_reopen(server, prev.ls != lc::LinkSt::REOPEN),
                 lb::LinkAction::SdpRestart => self.load_creds(server),
@@ -518,7 +527,10 @@ impl Core {
             lc::SeamFx::sub_table_changed => rooms.iter().for_each(|r| self.sub_enter(r, "tableChanged", |s| Some(uc::table_changed(s)), "table")),
             lc::SeamFx::sub_table_rebound => rooms.iter().for_each(|r| self.sub_enter(r, "tableRebound", |s| Some(uc::table_rebound(s)), "table")),
             // 발행은 첫 단계에 없다
-            lc::SeamFx::pub_drop_server | lc::SeamFx::pub_nego_ok | lc::SeamFx::pub_nego_fail | lc::SeamFx::pub_reregister_server => {}
+            // 발행(20261107c) — 그 서버 연결이 닫혔다 · 다시 섰다(재구축의 다시 발행). 협상 결과는 발행이 SDP 없이 곧바로 받는다
+            lc::SeamFx::pub_drop_server => self.pub_server(server, false),
+            lc::SeamFx::pub_reregister_server => self.pub_server(server, true),
+            lc::SeamFx::pub_nego_ok | lc::SeamFx::pub_nego_fail => {}
         }
     }
 

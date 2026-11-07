@@ -23,14 +23,27 @@ client.join("ch-1").await?;                 // 듣기(select:false)로 들어간
 // media.next()  — MediaPacket{room, track_id, kind, codec, sequence, timestamp, payload …}(단위 Packet 인 트랙)
 // frames.next() — MediaFrame{room, track_id, kind, codec, timestamp, keyframe, data, wallclock, synced …}(단위 Frame 인 트랙)
 client.set_layer("t…", oxpeer::Layer { spatial: Some(0), ..Default::default() }).await?;   // 층 상한(실제 선택은 서버)
+
+// 말하기(에이전트 — 20261107c) — 발언 방으로 들어가 발행 · 무전이면 누르고 허가 사이에 넣는다
+client.join_speaking("ch-1").await?;                                                         // select:true 입장(발언 방)
+let mic = client.publish("ch-1", oxpeer::TrackSpec { kind: oxpeer::Kind::Audio, duplex: oxpeer::Duplex::Half }).await?;
+client.ptt_press("ch-1", 0).await?;                                                          // 허가는 사건 Ptt{event:"granted"}
+mic.write(oxpeer::OutFrame { data: opus, duration: std::time::Duration::from_millis(20), keyframe: true, audio_level: Some(25) }).await?;
+mic.drain().await;                                                                           // 송신 시계가 다 낸 뒤
+client.ptt_release("ch-1").await?;
+client.send_message("ch-1", "안녕하세요").await?;                                             // 방 문자(받기는 사건 Message)
 client.close().await;
 ```
 
-예제 — 녹음(발언 한 건마다 Ogg Opus 파일 하나 · 화자 사건 `Speaker` 가 경계)과 녹화(`--video` — 트랙마다 Matroska 하나 · 무전 슬롯은 발언마다):
+보내는 쪽 — ★SDK 는 인코딩하지 않는다(앱이 Opus · VP8 · H264 프레임을 넣는다). 송신 시계가 프레임 길이대로 고르게 낸다(앱이 TTS 를 실시간보다 빨리 넣어도 몰아 보내지 않고 통이 차면 `write` 가 기다린다).
+오디오엔 `ssrc-audio-level` 을 싣는다(서버가 줄 상한을 넘는 방에서 음량으로 고른다 · 안 주면 말소리 30 dBov). SR 1초 · 영상 NACK 엔 RTX · 서버의 키프레임 요청은 사건 `KeyframeRequested`(앱이 인코더에 시킨다).
+
+예제 — 녹음(발언 한 건마다 Ogg Opus 파일 하나 · 화자 사건 `Speaker` 가 경계)과 녹화(`--video` — 트랙마다 Matroska 하나 · 무전 슬롯은 발언마다) · 에이전트(`agent` — `echo` 무전 되울림 · `beacon` 전이중 표지 발행 시험판):
 
 ```sh
 cargo run --example recorder -- --base http://127.0.0.1:1974/media --room ch-1 --out ./rec --secs 30 --hidden
 cargo run --example recorder -- --base http://127.0.0.1:1974/media --room conf-1 --out ./rec --video [--spatial 0] [--layer-plan 4:0,8:1]
+cargo run --example agent -- --base http://127.0.0.1:1974/media --room ch-1 --mode echo
 ```
 
 녹화 파일은 트랙마다 따로다 — 사람 · 트랙 합치기(음성 + 영상)는 예제 밖이다(ffmpeg 등). 블록 시각은 RTP 시각 차 · 파일 시작 벽시계(`DateUTC`)는 첫 SR 동기 프레임에서 거꾸로 셈한다 — 트랙끼리 그 값으로 맞춘다.
@@ -45,6 +58,8 @@ cargo run --example recorder -- --base http://127.0.0.1:1974/media --room conf-1
 | `src/sig.rs` · `src/wire/` | WS 소켓 · 대기표 · 프레임 머리(WS · DC) |
 | `tests/vectors/` | 규격 짓기의 재생 시험이 TS 판 상태기에 넣은 호출과 결과 — Rust 판이 같은 결과를 내는지 1층이 맞댄다 |
 | `examples/recorder/` | 예제 녹음 · 녹화기(Ogg Opus · `--video` Matroska) |
+| `examples/agent/` | 예제 에이전트(무전 되울림 · 전이중 표지 발행) |
+| `src/core/pubs.rs` · `src/link/send.rs` | 말하는 쪽 — 발행 · 소속 · 누름 · 메시지 결합 / 패킷화 · 확장 · 보낸 기록 · RTX · SR |
 
 ## 게이트
 
@@ -80,6 +95,15 @@ DC 만 닫히는 경우(같은 연관 위 DC 다시 열기)는 바깥에서 걸 
 | `peer_record_loss` | ★QA 스위치 `OXPEER_QA_DROP_VIDEO_EVERY=N`(받은 영상 원본 N 개마다 하나를 정리층 앞에서 버림 · RTX 는 안 버림 · 시험 수단)로 흉내 낸 손실을 NACK → RTX 로 다 메운다 |
 | `peer_record_ptt_video` | 무전 슬롯 — 종류마다 발언 한 건 = 파일 하나 · 화자 차례 = 허가 차례 |
 
+에이전트(context 202611/20261107c):
+
+| 시나리오 | 보는 것 |
+|---|---|
+| `peer_agent_echo` | 무전 되울림 — botA 의 발언을 받아 그가 놓으면 눌러 허가 사이에 그대로 말한다 · 청취 봇이 같은 표지를 원래 뒤에 한 번 더 받고(연속 · 보낸 수 그대로) 화자 통지가 에이전트 |
+| `peer_agent_publish` | 전이중 표지 발행(오디오 · VP8) — 받은 봇마다 번호가 빠짐 없이 · 영상 첫 도착은 키프레임 · 늦게 든 봇 → 서버 PLI → 사건 `KeyframeRequested` |
+| `peer_agent_loss` | ★보내는 쪽 QA 스위치 `OXPEER_QA_DROP_SEND_EVERY=N`(영상 N 개마다 하나를 안 보냄 · 보낸 기록엔 남김)로 흉내 낸 업링크 손실 → 서버 NACK → RTX 로 다 메움 |
+
 ## 범위
 
-세션 · 연결 · 방 · 받는 트랙 · 구독 + 발언권 듣기(첫 단계) · 수신 정리층 · 프레임 단위 수신 · 층 고르기(녹화 단계). **아직 없는 것** — 발행 · 발언 요청(에이전트 단계) · `https`/`wss` · 같은 `Client` 로 다시 `connect`(닫으면 새로 만든다).
+세션 · 연결 · 방 · 받는 트랙 · 구독 + 발언권 듣기(첫 단계) · 수신 정리층 · 프레임 단위 수신 · 층 고르기(녹화 단계) · 발행 · 발언 방 · 발언 누름 · 메시지 · 지금 값(에이전트 단계).
+**아직 없는 것** — 혼잡 제어(TWCC · 대역 추정 — REMB 는 읽기만) · 발행 시뮬캐스트 · `https`/`wss` · 같은 `Client` 로 다시 `connect`(닫으면 새로 만든다) · 받는 쪽 발행 신원(조사 중 — context 20261107b).

@@ -99,6 +99,11 @@ pub(crate) enum Purpose {
     Ready { room: String, epoch: u64 },
     Layer { room: String, epoch: u64, id: u64 },
     IceRestart { server: String, req: i64 },
+    Publish { track: u64, pid: i64 },
+    Unpublish,
+    TrackSet { track: u64 },
+    Affiliation { server: Option<String> },
+    Message { id: u64 },
 }
 
 /// 요청의 끝 — 응답(성공 · 실패) · 소켓이 끝나 버림(소켓 op) · 세션이 끝나 버림 · 기한 초과

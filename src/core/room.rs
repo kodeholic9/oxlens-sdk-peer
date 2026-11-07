@@ -48,9 +48,15 @@ pub(crate) struct Room {
     carried: Option<Carried>,
     notice: Option<(Op, Value)>,
     join_table: Option<Value>,
+    /// 그 방의 미디어 코덱(입장 응답 — 발행은 이것으로 · 연:RULE-ROOM-MEDIA-CODECS) · 이 방에서 말하려고 들어간다(select:true) · 입장 응답의 발행 방
+    pub(crate) media: Option<crate::generated::ws_wire::MediaCodecs>,
+    pub(crate) select: bool,
+    /// 들어간 뒤 소속 전환으로 발언 방을 옮긴다(이미 발행 방이 있었다)
+    pub(crate) select_after: bool,
+    aff_pub: Option<Option<String>>,
     pub(crate) rebuilding: bool,
     forced_cause: String,
-    closed: bool,
+    pub(crate) closed: bool,
     /// 앱이 고른 층(트랙마다 · 합친 것) — 다시 들어가면 다시 보낸다(서버는 새 입장에서 모른다)
     layers: BTreeMap<String, SubscribeLayerReqTargets>,
     /// 다음 SUBSCRIBE_LAYER 가 답할 앱 요청 · 보낸 요청마다 기다리는 앱
@@ -84,6 +90,10 @@ impl Room {
             carried: None,
             notice: None,
             join_table: None,
+            media: None,
+            select: false,
+            select_after: false,
+            aff_pub: None,
             rebuilding: false,
             forced_cause: "kick".into(),
             closed: false,
@@ -131,6 +141,14 @@ impl Core {
         }
         let mut r = Room::new(&room);
         r.join_waiters.push(tx);
+        if let Some((m, sel)) = self.join_mode.take().filter(|(m, _)| *m == room) {
+            let _ = m;
+            if sel {
+                r.select = true;
+            } else {
+                r.select_after = true;
+            }
+        }
         self.rooms.insert(room.clone(), r);
         let s = rc::join(&self.rooms[&room].st);
         self.room_step(&room, "join", s, "app");
@@ -250,7 +268,7 @@ impl Core {
 
     /// 입장 — 듣기(`select:false`) · jid = 갈아 끼울 입장의 join_id(재구축 · 0 = 새 입장 — 연:RULE-ROOM-JOIN-REPLACE)
     fn send_join(&mut self, id: &str, jid: i64) {
-        let mut body = json!({ "room_id": id, "select": false });
+        let mut body = json!({ "room_id": id, "select": self.rooms.get(id).is_some_and(|r| r.select) });
         if let Some(j) = self.jids.str(jid) {
             body["join_id"] = Value::String(j.to_string());
         }
@@ -332,6 +350,8 @@ impl Core {
                 if let Some(r) = self.rooms.get_mut(id) {
                     r.carried = Some(Carried { participants: res.participants.clone(), me: Some(res.me.clone()), tracks: Some(res.tracks.clone()), sub_rooms: Some(res.affiliation.sub_rooms.clone()) });
                     r.join_table = serde_json::to_value(&res.mline_table).ok();
+                    r.media = Some(res.media_codecs.clone());
+                    r.aff_pub = Some(res.affiliation.pub_room.clone());
                 }
                 let s = rc::join_res(&self.rooms[id].st, &m, pcm);
                 self.room_step(id, "joinRes", s, "ROOM_JOIN.res");
@@ -606,10 +626,26 @@ impl Core {
                     }
                 }
             }
-            // 소속(발언 방)은 첫 단계에 짓지 않았다 — 듣기로만 들어가 발언 방이 없다
-            rc::SeamFx::aff_down | rc::SeamFx::aff_implicit | rc::SeamFx::aff_join_failed | rc::SeamFx::aff_leave => {}
-            // 발행은 첫 단계에 없다
-            rc::SeamFx::pub_room_gone | rc::SeamFx::pub_room_left => {}
+            // 소속(발언 방 — 20261107c) — 입장이 곁들여 바꾼 발행 방 · 떠남 · 재구축 · 입장 실패
+            rc::SeamFx::aff_implicit => {
+                let (sel, p) = self.rooms.get_mut(id).map(|r| (r.select, r.aff_pub.take().flatten())).unwrap_or((false, None));
+                self.aff_implicit(id, sel, p);
+            }
+            rc::SeamFx::aff_leave => {
+                let r = id.to_string();
+                self.aff_enter("left", |s| Some(crate::generated::aff_client::left(s, &r)), label);
+            }
+            rc::SeamFx::aff_down => {
+                let r = id.to_string();
+                self.aff_enter("down", |s| Some(crate::generated::aff_client::down(s, &r)), label);
+            }
+            rc::SeamFx::aff_join_failed => {
+                let r = id.to_string();
+                self.aff_enter("joinFailed", |s| Some(crate::generated::aff_client::join_failed(s, &r)), label);
+            }
+            // 발행 — 방을 잃었다(서버가 먼저 정리) · 앱이 떠나기 시작했다
+            rc::SeamFx::pub_room_gone => self.pub_room_gone(id, false),
+            rc::SeamFx::pub_room_left => self.pub_room_gone(id, true),
         }
     }
 
@@ -624,9 +660,14 @@ impl Core {
                     r.join_pending = true;
                 }
                 self.emit(Event::Joined { room: id.to_string() });
+                if self.rooms.get_mut(id).is_some_and(|r| std::mem::take(&mut r.select_after)) {
+                    let (tx, _rx) = oneshot::channel();
+                    self.set_speaking_room(id.to_string(), tx);
+                }
                 if self.rooms.get(id).is_some_and(|r| !r.layers.is_empty()) {
                     self.sub_enter(id, "layer", |s| Some(uc::layer(s)), "joined");
                 }
+
             }
             Some(rb::RoomEvent::JoinFailed) => {
                 let Some(r) = self.rooms.get_mut(id) else { return };
@@ -658,6 +699,7 @@ impl Core {
     /// 명단 통지를 보관본에 — 들고남 · 권한(투명 참가자는 오지 않는다)
     fn apply_members(&mut self, id: &str) {
         let me = self.user_id.clone();
+        let mut mine: Option<Option<crate::generated::ws_wire::Permission>> = None;
         let Some(r) = self.rooms.get_mut(id) else { return };
         if let Some((op, b)) = r.notice.clone() {
             let uid = b.get("user_id").and_then(Value::as_str).unwrap_or("").to_string();
@@ -674,10 +716,11 @@ impl Core {
                     }
                 }
                 Op::ParticipantState => {
-                    let perm = b.get("permission").cloned().and_then(|p| serde_json::from_value(p).ok());
+                    let perm: Option<crate::generated::ws_wire::Permission> = b.get("permission").cloned().and_then(|p| serde_json::from_value(p).ok());
                     if Some(&uid) == me.as_ref()
                         && let Some(m) = r.me.as_mut() {
                             m.permission = perm.clone();
+                            mine = Some(perm.clone());
                         }
                     for p in r.participants.iter_mut().filter(|p| p.user_id == uid) {
                         p.permission = perm.clone();
@@ -688,6 +731,10 @@ impl Core {
         }
         let p = r.participants.clone();
         self.emit(Event::Participants { room: id.to_string(), participants: p });
+        // 내 권한이 바뀌었다(SDK:IMPL-ROOM-API 권한 통지 — 투명 참가자도 본인에겐 온다)
+        if let Some(permission) = mine {
+            self.emit(Event::Permission { room: id.to_string(), permission });
+        }
     }
 
     /// 첫 협상이 끝난 입장 — 기다리던 join() 을 끝낸다(SDK:IMPL-ROOM-API app.joined)
@@ -718,7 +765,12 @@ impl Core {
         let plan = tb::plan(step);
         r.trk = plan.state;
         self.record("TRK", id, "-", "-", plan.label, cause);
-        // 이음매 pub.revoked — 내 발행이 없다(첫 단계)
+        // 이음매 pub.revoked — 내 발행이 트랙 목록에서 빠졌다(20261107c)
+        if plan.seams.iter().any(|s| s.fx == tc::SeamFx::pub_revoked)
+            && let Some((key, _)) = &item
+        {
+            self.pub_revoked(std::slice::from_ref(key));
+        }
         for e in &plan.events {
             match e {
                 tb::TrkEvent::Track => {
@@ -984,7 +1036,28 @@ impl Core {
                 self.timers.start(tk, Duration::from_millis(fc::timer_ms(*t) as u64));
             }
         }
-        // 효과 표 — 화자 · 믿음(듣기 몫) · 그 밖(누름 쪽 — 누르지 않으므로 오지 않는다) · 재생은 서버사이드 대상 아님(SDK:RULE-PLAT-SERVER)
+        // 위 이음매 — mic.open · mic.close 는 그 방의 반이중 발행 게이트로(발행 floorOpen · floorClose)
+        for f in &plan.routed {
+            match f {
+                fc::Fx::mic_open => self.floor_to_pub(id, true),
+                fc::Fx::mic_close => self.floor_to_pub(id, false),
+                _ => {}
+            }
+        }
+        // 누름 쪽 사건(20261107c) — 허가 · 거절 · 대기 · 회수 · 상태(시한 · 믿음)
+        let cs = self.rooms.get(id).map(|r| r.flr.cs.as_str().to_string()).unwrap_or_default();
+        for e in &plan.events {
+            let what = match e {
+                pb::PttEvent::Granted => "granted",
+                pb::PttEvent::Denied => "denied",
+                pb::PttEvent::Queued => "queued",
+                pb::PttEvent::Revoked => "revoked",
+                pb::PttEvent::State => "state",
+                _ => continue,
+            };
+            self.emit(Event::Ptt { room: id.to_string(), event: what.to_string(), state: cs.clone() });
+        }
+        // 효과 표 — 화자 · 믿음(듣기 몫) · 재생은 서버사이드 대상 아님(SDK:RULE-PLAT-SERVER)
         for f in fx {
             match f {
                 fc::Fx::app_speaker => self.emit(Event::Speaker { room: id.to_string(), user_id: shown.clone() }),

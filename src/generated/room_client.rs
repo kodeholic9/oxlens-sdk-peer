@@ -1,5 +1,5 @@
 // ★생성 파일 — gen/axis_client.mts 가 원천(context/spec/protocol · areas/room/behavior)에서 짓는다. 손으로 고치지 않는다.
-// IR sha256 8ede3bb190c1f4ab · 영역 ROOM 클라 상태기 Rust 판 — 같은 생성기의 TS 판과 한 뿌리(같은 입구 · 같은 경우 · 같은 라벨).
+// IR sha256 2483d3bca9e87f67 · 영역 ROOM 클라 상태기 Rust 판 — 같은 생성기의 TS 판과 한 뿌리(같은 입구 · 같은 경우 · 같은 라벨).
 // 집행은 부르는 쪽 몫이다 — out(보낼 것) · fx(이 영역의 효과) · seams(다른 영역 입구로 — 받는 곳은 위가 정했다) · start(새로 걸 타이머). armed() 밖의 타이머는 멈춘다.
 // 모형 자리(트랙 · 배정표 사본의 열쇠)는 문자열이다 — 실제 값을 넣는 법은 결합이 정한다(SDK:RULE-MOD-BINDING-VALUES).
 #![allow(dead_code, unused_variables, unused_mut, unused_parens, non_camel_case_types, clippy::all)]
@@ -425,9 +425,9 @@ pub fn leave_res(s: &St, m: &LeaveResMsg) -> Step {
         return done(s, s.clone(), "ROOM.C.any.leave_res_stale", vec![], vec![], vec![], vec![]);
     }
     if m.part == Part::res {
-        return done(s, St { rs: RoomSt::NONE, cseq: 0, cepoch: 0, rsync: false, jid: 0, jsure: false, ..s.clone() }, "ROOM.C.LEAVING.leave_ok", vec![], vec![Fx::app_left], vec![Seam { fx: SeamFx::sdp_rebuild, to: "LINK", at: "sameServer" }, Seam { fx: SeamFx::store_drop, to: "TRK", at: "self" }, Seam { fx: SeamFx::link_room_left, to: "LINK", at: "sameServer" }], vec![]);
+        return done(s, St { rs: RoomSt::NONE, cseq: 0, cepoch: 0, rsync: false, jid: 0, jsure: false, ..s.clone() }, "ROOM.C.LEAVING.leave_ok", vec![], vec![Fx::app_left], vec![Seam { fx: SeamFx::store_drop, to: "TRK", at: "self" }, Seam { fx: SeamFx::link_room_left, to: "LINK", at: "sameServer" }], vec![]);
     }
-    done(s, St { rs: RoomSt::NONE, cseq: 0, cepoch: 0, rsync: false, jid: 0, jsure: false, ..s.clone() }, "ROOM.C.LEAVING.leave_fail", vec![], vec![Fx::app_left], vec![Seam { fx: SeamFx::sdp_rebuild, to: "LINK", at: "sameServer" }, Seam { fx: SeamFx::store_drop, to: "TRK", at: "self" }, Seam { fx: SeamFx::link_room_left, to: "LINK", at: "sameServer" }], vec![])
+    done(s, St { rs: RoomSt::NONE, cseq: 0, cepoch: 0, rsync: false, jid: 0, jsure: false, ..s.clone() }, "ROOM.C.LEAVING.leave_fail", vec![], vec![Fx::app_left], vec![Seam { fx: SeamFx::store_drop, to: "TRK", at: "self" }, Seam { fx: SeamFx::link_room_left, to: "LINK", at: "sameServer" }], vec![])
 }
 
 /// version 을 실은 통지를 받았다 — ACK · 판정(§[RULE-ROOM-VERSION-CLIENT-RULES] 규칙 3~5) · 반영(§[RULE-ROOM-NOTE-ORDER]) (받음: PARTICIPANT_EVENT · PARTICIPANT_STATE · TRACK_EVENT · TRACK_STATE)
@@ -462,7 +462,7 @@ pub fn room_event(s: &St, m: &RoomEventMsg) -> Step {
         return done(s, s.clone(), "ROOM.C.any.room_event_not_joined", vec![], vec![], vec![], vec![]);
     }
     if m.r#type == RoomEv::affiliation {
-        return done(s, St { rs: RoomSt::NONE, cseq: 0, cepoch: 0, rsync: false, ahead: 0, jid: 0, jsure: false, ..s.clone() }, "ROOM.C.JOINED.kicked", vec![], vec![Fx::http_abandon, Fx::app_room_gone], vec![Seam { fx: SeamFx::sdp_rebuild, to: "LINK", at: "sameServer" }, Seam { fx: SeamFx::store_drop, to: "TRK", at: "self" }, Seam { fx: SeamFx::floor_leave, to: "FLR", at: "self" }, Seam { fx: SeamFx::aff_leave, to: "AFF", at: "self" }, Seam { fx: SeamFx::sub_drop, to: "SUB", at: "self" }, Seam { fx: SeamFx::link_room_left, to: "LINK", at: "sameServer" }, Seam { fx: SeamFx::pub_room_gone, to: "PUB", at: "sameRoom" }], vec![]);
+        return done(s, St { rs: RoomSt::NONE, cseq: 0, cepoch: 0, rsync: false, ahead: 0, jid: 0, jsure: false, ..s.clone() }, "ROOM.C.JOINED.kicked", vec![], vec![Fx::http_abandon, Fx::app_room_gone], vec![Seam { fx: SeamFx::store_drop, to: "TRK", at: "self" }, Seam { fx: SeamFx::floor_leave, to: "FLR", at: "self" }, Seam { fx: SeamFx::aff_leave, to: "AFF", at: "self" }, Seam { fx: SeamFx::sub_drop, to: "SUB", at: "self" }, Seam { fx: SeamFx::link_room_left, to: "LINK", at: "sameServer" }, Seam { fx: SeamFx::pub_room_gone, to: "PUB", at: "sameRoom" }], vec![]);
     }
     if s.rsync {
         return done(s, s.clone(), "ROOM.C.JOINED.sync_required_inflight", vec![], vec![], vec![], vec![]);
@@ -517,7 +517,7 @@ pub fn req_expired(s: &St) -> Option<Step> {
     if s.rs == RoomSt::JOINING {
         return Some(done(s, St { rs: RoomSt::NONE, jid: 0, jsure: false, ..s.clone() }, "ROOM.C.JOINING.expired", vec![Tx::RoomLeave { join_id: 0 }], vec![Fx::ws_abandon, Fx::app_join_failed], vec![Seam { fx: SeamFx::aff_join_failed, to: "AFF", at: "self" }, Seam { fx: SeamFx::link_room_left, to: "LINK", at: "sameServer" }], vec![]));
     }
-    Some(done(s, St { rs: RoomSt::NONE, cseq: 0, cepoch: 0, rsync: false, jid: 0, jsure: false, ..s.clone() }, "ROOM.C.LEAVING.expired", vec![Tx::RoomLeave { join_id: if s.jsure { s.jid } else { 0 } }], vec![Fx::ws_abandon, Fx::app_left], vec![Seam { fx: SeamFx::sdp_rebuild, to: "LINK", at: "sameServer" }, Seam { fx: SeamFx::store_drop, to: "TRK", at: "self" }, Seam { fx: SeamFx::link_room_left, to: "LINK", at: "sameServer" }], vec![]))
+    Some(done(s, St { rs: RoomSt::NONE, cseq: 0, cepoch: 0, rsync: false, jid: 0, jsure: false, ..s.clone() }, "ROOM.C.LEAVING.expired", vec![Tx::RoomLeave { join_id: if s.jsure { s.jid } else { 0 } }], vec![Fx::ws_abandon, Fx::app_left], vec![Seam { fx: SeamFx::store_drop, to: "TRK", at: "self" }, Seam { fx: SeamFx::link_room_left, to: "LINK", at: "sameServer" }], vec![]))
 }
 
 /// 세션이 끝났다 — 방을 전부 내리고 다시 들어갈 방 표시를 지운다(DEV-SES-FRESH-REJOIN · 앱이 다시 들어간다)

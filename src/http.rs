@@ -1,16 +1,41 @@
 // author: kodeholic (powered by Claude)
 //! 작은 HTTP/1.1 클라 — 토큰 발급(연:SES.http.TOKEN)과 방 재동기(연:ROOM.http.GET_ROOM)만 쓴다.
-//! 요청마다 연결 하나(`Connection: close`) · `http://` 만(서버사이드 확장은 같은 망 안의 hub 에 붙는다 — TLS 는 첫 단계 밖).
+//! 요청마다 연결 하나(`Connection: close`) · `http://` 또는 `https://`(context 202611/20261108d E2 — TLS 는 `tls` 모듈).
+
+use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio_rustls::rustls::ClientConfig;
 
 use crate::error::Error;
 
-/// `base`(앱이 준다 — 연:RULE-TRN-BASE-GIVEN) = `http://host:port/경로` → (host:port, 경로)
-pub(crate) fn split_base(base: &str) -> Result<(String, String), Error> {
-    let rest = base.strip_prefix("http://").ok_or_else(|| Error::transport(format!("base 는 http:// 로 시작한다(첫 단계): {base}")))?;
+/// 앱이 준 `base`(연:RULE-TRN-BASE-GIVEN)를 가른 것
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Base {
+    pub secure: bool,
+    /// host:port
+    pub auth: String,
+    /// 경로 앞머리(끝 `/` 없음)
+    pub prefix: String,
+}
+
+impl Base {
+    /// WS 주소 — `ws://` · `wss://` + 경로 + `/ws`
+    pub(crate) fn ws_url(&self) -> String {
+        format!("{}://{}{}/ws", if self.secure { "wss" } else { "ws" }, self.auth, self.prefix)
+    }
+}
+
+/// `http://host:port/경로` · `https://host:port/경로` — 포트가 없으면 80 · 443
+pub(crate) fn split_base(base: &str) -> Result<Base, Error> {
+    let (secure, rest) = if let Some(r) = base.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = base.strip_prefix("http://") {
+        (false, r)
+    } else {
+        return Err(Error::transport(format!("base 는 http:// 또는 https:// 로 시작한다: {base}")));
+    };
     let (auth, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, ""),
@@ -18,8 +43,9 @@ pub(crate) fn split_base(base: &str) -> Result<(String, String), Error> {
     if auth.is_empty() {
         return Err(Error::transport(format!("base 에 host 가 없다: {base}")));
     }
-    let auth = if auth.contains(':') { auth.to_string() } else { format!("{auth}:80") };
-    Ok((auth, path.trim_end_matches('/').to_string()))
+    let has_port = auth.rsplit_once(':').is_some_and(|(_, p)| p.chars().all(|c| c.is_ascii_digit())) && !auth.ends_with(']');
+    let auth = if has_port { auth.to_string() } else { format!("{auth}:{}", if secure { 443 } else { 80 }) };
+    Ok(Base { secure, auth, prefix: path.trim_end_matches('/').to_string() })
 }
 
 pub(crate) struct Reply {
@@ -27,10 +53,21 @@ pub(crate) struct Reply {
     pub body: Value,
 }
 
-pub(crate) async fn call(base: &str, method: &str, path: &str, headers: &[(&str, &str)], body: Option<&Value>) -> Result<Reply, Error> {
-    let (auth, prefix) = split_base(base)?;
+/// 요청 하나 — `tls` 는 `https://` 일 때 쓸 설정(없으면 webpki 뿌리로 짓는다)
+pub(crate) async fn call(base: &str, tls: Option<&Arc<ClientConfig>>, method: &str, path: &str, headers: &[(&str, &str)], body: Option<&Value>) -> Result<Reply, Error> {
+    let b = split_base(base)?;
+    let (auth, prefix) = (b.auth.clone(), b.prefix.clone());
     let full = format!("{prefix}{path}");
-    let mut s = TcpStream::connect(&auth).await.map_err(|e| Error::transport(format!("{method} {full}: 연결 {e}")))?;
+    let own;
+    let tls = match (b.secure, tls) {
+        (false, _) => None,
+        (true, Some(t)) => Some(t),
+        (true, None) => {
+            own = crate::tls::client_config(None)?;
+            Some(&own)
+        }
+    };
+    let mut s = crate::tls::dial(&auth, tls).await?;
     let payload = body.map(|b| serde_json::to_vec(b).unwrap_or_default()).unwrap_or_default();
     let mut req = format!("{method} {full} HTTP/1.1\r\nHost: {auth}\r\nConnection: close\r\nContent-Length: {}\r\n", payload.len());
     if body.is_some() {
@@ -74,9 +111,13 @@ mod tests {
 
     #[test]
     fn base_split() {
-        assert_eq!(split_base("http://127.0.0.1:19745/media").unwrap(), ("127.0.0.1:19745".into(), "/media".into()));
-        assert_eq!(split_base("http://hub/").unwrap(), ("hub:80".into(), "".into()));
-        assert!(split_base("https://hub").is_err());
+        let b = split_base("http://127.0.0.1:19745/media").unwrap();
+        assert_eq!((b.secure, b.auth.as_str(), b.prefix.as_str()), (false, "127.0.0.1:19745", "/media"));
+        assert_eq!(b.ws_url(), "ws://127.0.0.1:19745/media/ws");
+        let b = split_base("https://hub/").unwrap();
+        assert_eq!((b.secure, b.auth.as_str(), b.prefix.as_str()), (true, "hub:443", ""));
+        assert_eq!(b.ws_url(), "wss://hub:443/ws");
+        assert!(split_base("ftp://hub").is_err());
     }
 
     #[test]

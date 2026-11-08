@@ -33,6 +33,9 @@ use crate::sig::{Outcome, Purpose, Sig, SockIn};
 pub(crate) use link::Link;
 pub(crate) use room::Room;
 
+/// 발행 응답 — (발행 번호, track_id, 코덱)
+pub(crate) type PublishReply = oneshot::Sender<Result<(u64, String, String), Error>>;
+
 pub(crate) enum Cmd {
     Connect(oneshot::Sender<Result<(), Error>>),
     SetToken(String),
@@ -45,7 +48,7 @@ pub(crate) enum Cmd {
     /// 말하는 쪽(20261107c)
     JoinSpeaking(String, oneshot::Sender<Result<(), Error>>),
     SetSpeakingRoom(String, oneshot::Sender<Result<(), Error>>),
-    Publish(String, TrackSpec, mpsc::Receiver<OutFrame>, oneshot::Sender<Result<(u64, String), Error>>),
+    Publish(String, TrackSpec, Vec<mpsc::Receiver<OutFrame>>, PublishReply),
     Unpublish(u64),
     SetDuplex(u64, bool, oneshot::Sender<Result<(), Error>>),
     /// 송신 시계 — 게이트가 열린 뒤 첫 패킷이 나갔다
@@ -164,6 +167,8 @@ pub(crate) enum Job {
 
 pub(crate) struct Core {
     pub(crate) base: String,
+    /// `https://` 면 TLS 설정(재동기 HTTP 가 같이 쓴다)
+    pub(crate) tls: Option<Arc<tokio_rustls::rustls::ClientConfig>>,
     pub(crate) token: String,
     pub(crate) ses: sc::St,
     pub(crate) user_id: Option<String>,
@@ -204,13 +209,13 @@ pub(crate) struct Core {
     pub(crate) jobs: VecDeque<Job>,
     pub(crate) ended: Vec<(Purpose, Outcome)>,
     pub(crate) link_gen: u64,
-    pub(crate) finished: bool,
     trace: bool,
     /// 말하는 쪽 — 발행 트랙 · 서버마다 발행 mid 차례 · 내보내는 손잡이 자리 · 루프 자신의 명령 통(송신 시계가 쓴다)
     pub(crate) pubs: BTreeMap<u64, pubs::PubTrack>,
     pub(crate) pub_seq: u64,
     pub(crate) pub_mids: HashMap<String, u32>,
     pub(crate) pub_outs: Arc<std::sync::RwLock<HashMap<String, Arc<std::sync::OnceLock<PubOut>>>>>,
+    /// 루프 자신의 명령 통(송신 시계가 쓴다) — 앱 통과 따로라 앱이 `Client` 를 다 놓으면 앱 통이 닫혀 루프가 끝난다
     pub(crate) cmd_tx: mpsc::UnboundedSender<Cmd>,
     /// 세션의 소속(발언 방 — 위 AFF 상태기) · 기다리는 앱
     pub(crate) aff: crate::generated::aff_client::St,
@@ -222,9 +227,11 @@ pub(crate) struct Core {
 }
 
 pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::Sender<MediaPacket>, frames: mpsc::Sender<MediaFrame>) -> Result<mpsc::UnboundedSender<Cmd>, Error> {
-    let (auth, prefix) = http::split_base(&cfg.base)?;
+    let b = http::split_base(&cfg.base)?;
+    let tls = if b.secure { Some(crate::tls::client_config(cfg.tls_root_pem.as_deref())?) } else { None };
     let cert = Certificate::generate_self_signed(vec!["oxpeer".to_string()]).map_err(|e| Error::transport(format!("인증서: {e}")))?;
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (int_tx, int_rx) = mpsc::unbounded_channel();
     let (sock_tx, sock_rx) = mpsc::unbounded_channel();
     let (fact_tx, fact_rx) = mpsc::unbounded_channel();
     let (http_tx, http_rx) = mpsc::unbounded_channel();
@@ -257,7 +264,8 @@ pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::
         resume_body: None,
         dropped_at: None,
         last_info: None,
-        sig: Sig::new(format!("ws://{auth}{prefix}/ws"), req),
+        sig: Sig::new(b.ws_url(), b.auth.clone(), tls.clone(), req),
+        tls,
         rooms: BTreeMap::new(),
         links: BTreeMap::new(),
         sids: Interner::default(),
@@ -281,24 +289,23 @@ pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::
         jobs: VecDeque::new(),
         ended: Vec::new(),
         link_gen: 0,
-        finished: false,
         trace: std::env::var_os("OXPEER_TRACE").is_some(),
         pubs: BTreeMap::new(),
         pub_seq: 0,
         pub_mids: HashMap::new(),
         pub_outs: Arc::default(),
-        cmd_tx: cmd_tx.clone(),
+        cmd_tx: int_tx,
         aff: crate::generated::aff_client::initial(),
         aff_waiters: Vec::new(),
         msg_waiters: HashMap::new(),
         msg_seq: 0,
         join_mode: None,
     };
-    tokio::spawn(run(core, cmd_rx, sock_rx, fact_rx, http_rx));
+    tokio::spawn(run(core, cmd_rx, int_rx, sock_rx, fact_rx, http_rx));
     Ok(cmd_tx)
 }
 
-async fn run(mut core: Core, mut cmd: mpsc::UnboundedReceiver<Cmd>, mut sock: mpsc::UnboundedReceiver<SockIn>, mut facts: mpsc::UnboundedReceiver<LinkFact>, mut http: mpsc::UnboundedReceiver<HttpDone>) {
+async fn run(mut core: Core, mut cmd: mpsc::UnboundedReceiver<Cmd>, mut int: mpsc::UnboundedReceiver<Cmd>, mut sock: mpsc::UnboundedReceiver<SockIn>, mut facts: mpsc::UnboundedReceiver<LinkFact>, mut http: mpsc::UnboundedReceiver<HttpDone>) {
     loop {
         let deadline = core.timers.next();
         let sleep = async {
@@ -316,6 +323,7 @@ async fn run(mut core: Core, mut cmd: mpsc::UnboundedReceiver<Cmd>, mut sock: mp
                     break;
                 }
             },
+            Some(c) = int.recv() => core.command(c),
             Some(s) = sock.recv() => core.socket(s),
             Some(f) = facts.recv() => core.link_fact(f),
             Some(h) = http.recv() => core.resync_done(h.room, h.epoch, h.result),
@@ -327,9 +335,6 @@ async fn run(mut core: Core, mut cmd: mpsc::UnboundedReceiver<Cmd>, mut sock: mp
             }
         }
         core.drain();
-        if core.finished {
-            break;
-        }
     }
 }
 
@@ -415,6 +420,8 @@ impl Core {
                     qa_dropped: n(&self.sink.qa_dropped),
                     rtx_sent: n(&self.sink.rtx_sent),
                     remb_bps: n(&self.sink.remb),
+                    target_bps: self.bwe_view().0,
+                    send_loss_permille: (self.bwe_view().1 * 1000.0).round() as u64,
                     frames_sent: self.pubs.values().map(|t| t.io.sent.load(Ordering::Relaxed)).sum(),
                     frames_gated: self.pubs.values().map(|t| t.io.gated.load(Ordering::Relaxed)).sum(),
                     qa_send_dropped: self.pubs.values().map(|t| t.io.qa_dropped.load(Ordering::Relaxed)).sum(),
@@ -542,19 +549,30 @@ impl Core {
         }
     }
 
+    /// 발행 연결들의 대역 추정 — (가장 큰 목표, 그 연결의 손실률) · 발행 연결이 없으면 (0, 0)
+    fn bwe_view(&self) -> (u64, f64) {
+        let outs: Vec<PubOut> = self.pub_outs.read().map(|g| g.values().filter_map(|o| o.get().cloned()).collect()).unwrap_or_default();
+        outs.iter().map(|o| o.bwe_now()).max_by_key(|x| x.0).unwrap_or((0, 0.0))
+    }
+
     /// 재동기 — HTTP(세션 헤더 · 연:RULE-TRN-HTTP-AUTH-TWO) · 응답은 루프로 돌아온다
     pub(crate) fn spawn_resync(&self, room: &str, epoch: u64) {
-        let (base, sid, token, tx, r) = (self.base.clone(), self.session_id.clone(), self.token.clone(), self.http_tx.clone(), room.to_string());
+        let (base, tls, sid, token, tx, r) = (self.base.clone(), self.tls.clone(), self.session_id.clone(), self.token.clone(), self.http_tx.clone(), room.to_string());
         tokio::spawn(async move {
             let path = format!("/rooms/{}?tracks=1", url_escape(&r));
             let header = match &sid {
                 Some(s) => ("X-OxLens-Session", s.clone()),
                 None => ("Authorization", format!("Bearer {token}")),
             };
-            let result = http::call(&base, "GET", &path, &[(header.0, header.1.as_str())], None).await;
+            let result = http::call(&base, tls.as_ref(), "GET", &path, &[(header.0, header.1.as_str())], None).await;
             let _ = tx.send(HttpDone { room: r, epoch, result });
         });
     }
+}
+
+/// 요청 본문 — ★생성 wire 의 요청 형(연동규격서가 정한 칸)에서만 짓는다(손으로 json 을 짓지 않는다 — 빠진 칸을 형이 막는다 · 20261108d)
+pub(crate) fn to_body<T: serde::Serialize>(req: &T) -> Value {
+    serde_json::to_value(req).unwrap_or(Value::Null)
 }
 
 pub(crate) fn op_name(op: crate::generated::ws_wire::Op) -> &'static str {

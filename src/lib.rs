@@ -7,7 +7,7 @@
 //! # async fn f() -> Result<(), oxpeer::Error> {
 //! let req = oxpeer::TokenReq { api_key: "k".into(), api_secret: "s".into(), user_id: "rec-1".into(), participant_type: Some(1), hidden: Some(true), metadata: None, permission: None };
 //! let token = oxpeer::issue_token("http://127.0.0.1:19745/media", &req).await?;
-//! let (client, mut events, mut media, _frames) = oxpeer::Client::connect(oxpeer::Config::new("http://127.0.0.1:19745/media", token)).await?;
+//! let (client, mut events, mut media, _frames) = oxpeer::Client::open(oxpeer::Config::new("http://127.0.0.1:19745/media", token)).await?;
 //! client.join("ch-1").await?;
 //! while let Some(p) = media.next().await { let _ = (p.track_id, p.payload); }
 //! # let _ = events.next().await; Ok(()) }
@@ -22,6 +22,7 @@ mod generated;
 mod http;
 mod link;
 mod sig;
+mod tls;
 mod token;
 mod wire;
 
@@ -30,4 +31,4 @@ mod vectors_test;
 
 pub use api::{Client, Config, Duplex, Event, Events, Frames, Health, Kind, Layer, LinkInfo, LinkState, LocalTrack, Media, MediaFrame, MediaPacket, MemberInfo, OutFrame, Permission, PttInfo, RoomView, SessionInfo, SessionState, Snapshot, Source, Stats, TokenReq, TrackEntry, TrackEntryType, TrackSpec, Unit};
 pub use error::{Category, Error};
-pub use token::issue_token;
+pub use token::{issue_token, issue_token_with_root};

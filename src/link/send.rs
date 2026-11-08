@@ -23,6 +23,11 @@ const NTP_UNIX: u64 = 2_208_988_800;
 pub(crate) struct ExtIds {
     pub mid: u8,
     pub audio_level: u8,
+    /// 시뮬캐스트 층 이름(rtp-stream-id) · RTX 의 원 층 이름(repaired-rtp-stream-id) — 서버가 이것으로 업링크 층을 배운다(연:RULE-PUB-RID-TO-SPATIAL)
+    pub rid: u8,
+    pub rrid: u8,
+    /// transport-cc — 패킷마다 전송 차례 번호(보내는 순간 `bwe` 가 채운다 · context 202611/20261108d E4)
+    pub twcc: u8,
 }
 
 /// 앱이 넣는 프레임 하나 — 코덱 꼴(H264 Annex-B · VP8 프레임 · Opus 패킷)
@@ -131,6 +136,8 @@ pub(crate) struct SendTrack {
     pub clock: u32,
     pub mid: String,
     pub ext: ExtIds,
+    /// 시뮬캐스트 층 이름(`l` · `h`) — 아니면 None
+    pub rid: Option<String>,
     seq: u16,
     rtx_seq: u16,
     ts_base: u32,
@@ -154,6 +161,7 @@ impl SendTrack {
             clock: codec.clock(video),
             mid,
             ext,
+            rid: None,
             seq: u16::from_be_bytes([r[0], r[1]]),
             rtx_seq: u16::from_be_bytes([r[2], r[3]]),
             ts_base: u32::from(u16::from_be_bytes([r[4], r[5]])) << 8,
@@ -165,18 +173,33 @@ impl SendTrack {
         }
     }
 
+    /// 다른 서버(발행 연결)로 옮겼다 — 그 연결의 mid 로 바꾸고 첫 패킷들에 다시 싣는다(SDK:pub.md `LocalTrack.server`)
+    pub(crate) fn rebind(&mut self, mid: String) {
+        self.mid = mid;
+        self.sent_n = 0;
+    }
+
     /// 송신 시계가 정한 때 `media` 의 RTP 시각
     pub(crate) fn ts_at(&self, media: std::time::Duration) -> u32 {
         self.ts_base.wrapping_add((media.as_secs_f64() * f64::from(self.clock)).round() as u32)
     }
 
+    /// 머리 — 확장 차례: ★transport-cc 가 맨 앞(보내는 순간 번호를 채우는 자리가 정해져 있다 — `bwe::stamp`) · mid · 층 이름 · 음량
     #[allow(clippy::too_many_arguments)]
-    fn header(&self, seq: u16, ts: u32, marker: bool, pt: u8, ssrc: u32, level: Option<u8>, with_mid: bool) -> Vec<u8> {
+    fn header(&self, seq: u16, ts: u32, marker: bool, pt: u8, ssrc: u32, level: Option<u8>, with_mid: bool, repair: bool) -> Vec<u8> {
         let mut ext: Vec<u8> = Vec::new();
+        if self.ext.twcc != 0 {
+            ext.extend([(self.ext.twcc << 4) | 1, 0, 0]);
+        }
         if with_mid && self.ext.mid != 0 && !self.mid.is_empty() {
             let m = self.mid.as_bytes();
             ext.push((self.ext.mid << 4) | (m.len() as u8 - 1));
             ext.extend_from_slice(m);
+        }
+        let rid_id = if repair { self.ext.rrid } else { self.ext.rid };
+        if let Some(r) = self.rid.as_ref().filter(|r| !r.is_empty() && rid_id != 0) {
+            ext.push((rid_id << 4) | (r.len() as u8 - 1));
+            ext.extend_from_slice(r.as_bytes());
         }
         if let Some(l) = level
             && self.ext.audio_level != 0
@@ -211,7 +234,7 @@ impl SendTrack {
         for (i, p) in parts.into_iter().enumerate() {
             let marker = if video { i == n - 1 } else { spurt && i == 0 };
             let level = if video { None } else { Some(f.audio_level.unwrap_or(VOICE_LEVEL)) };
-            let mut pkt = self.header(self.seq, ts, marker, self.pt, self.ssrc, level, self.sent_n < MID_PACKETS);
+            let mut pkt = self.header(self.seq, ts, marker, self.pt, self.ssrc, level, self.sent_n < MID_PACKETS, false);
             pkt.extend_from_slice(&p);
             self.packets = self.packets.wrapping_add(1);
             self.octets = self.octets.wrapping_add(p.len() as u32);
@@ -236,7 +259,7 @@ impl SendTrack {
         for s in seqs {
             let Some(p) = self.history.iter().find(|x| x.seq == *s) else { continue };
             let (ts, marker, osn, body) = (p.ts, p.marker, p.seq, p.payload.clone());
-            let mut pkt = self.header(self.rtx_seq, ts, marker, rpt, rssrc, None, false);
+            let mut pkt = self.header(self.rtx_seq, ts, marker, rpt, rssrc, None, false, true);
             pkt.extend(osn.to_be_bytes());
             pkt.extend(body);
             self.rtx_seq = self.rtx_seq.wrapping_add(1);
@@ -267,6 +290,8 @@ pub(crate) struct Feedback {
     pub nacks: Vec<(u32, Vec<u16>)>,
     pub plis: Vec<u32>,
     pub remb: Option<u64>,
+    /// TWCC — 전송 번호마다 받은 시각(µs · None 못 받음)
+    pub twcc: Vec<Vec<(u16, Option<i64>)>>,
 }
 
 pub(crate) fn feedback(b: &[u8]) -> Feedback {
@@ -278,6 +303,11 @@ pub(crate) fn feedback(b: &[u8]) -> Feedback {
         let (fmt, pt) = (p[0] & 0x1f, p[1]);
         let media = p.get(8..12).map(|x| u32::from_be_bytes([x[0], x[1], x[2], x[3]]));
         match (pt, fmt) {
+            (205, 15) => {
+                if let Some(r) = super::bwe::parse_twcc(p) {
+                    f.twcc.push(r);
+                }
+            }
             (205, 1) => {
                 let mut seqs = Vec::new();
                 let mut k = 12;
@@ -327,7 +357,7 @@ mod tests {
 
     #[test]
     fn opus_packet_has_mid_then_level_only() {
-        let mut t = SendTrack::new(0xA1, 111, None, Codec::Opus, false, "0".into(), ExtIds { mid: 1, audio_level: 4 });
+        let mut t = SendTrack::new(0xA1, 111, None, Codec::Opus, false, "0".into(), ExtIds { mid: 1, audio_level: 4, ..Default::default() });
         let now = Instant::now();
         let mut first = Vec::new();
         for i in 0..7 {
@@ -349,7 +379,7 @@ mod tests {
 
     #[test]
     fn video_round_trips_through_depack_and_rtx() {
-        let mut t = SendTrack::new(0xB1, 96, Some((0xB2, 97)), Codec::Vp8, true, "1".into(), ExtIds { mid: 1, audio_level: 4 });
+        let mut t = SendTrack::new(0xB1, 96, Some((0xB2, 97)), Codec::Vp8, true, "1".into(), ExtIds { mid: 1, audio_level: 4, ..Default::default() });
         let big: Vec<u8> = (0..3000u32).map(|x| x as u8).collect();
         let mut f = vec![0x10];
         f.extend(&big);

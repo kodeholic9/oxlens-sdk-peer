@@ -17,7 +17,8 @@ let req = oxpeer::TokenReq { api_key: "…".into(), api_secret: "…".into(), us
 let token = oxpeer::issue_token("http://127.0.0.1:1974/media", &req).await?;
 let mut cfg = oxpeer::Config::new("http://127.0.0.1:1974/media", token);
 cfg.unit = oxpeer::Unit::Frame;              // 받는 단위 기본(트랙마다는 client.set_unit)
-let (client, mut events, mut media, mut frames) = oxpeer::Client::connect(cfg).await?;
+// cfg.tls_root_pem = Some(std::fs::read("ca.pem")?);   // base 가 https:// 면 wss — 같은 망 hub 의 사설 CA(기본은 공용 뿌리)
+let (client, mut events, mut media, mut frames) = oxpeer::Client::open(cfg).await?;   // = Client::create(cfg) + client.connect()
 client.join("ch-1").await?;                 // 듣기(select:false)로 들어간다
 // events.next() — Session · Joined · Tracks · Speaker{user_id} · Link · Closed …(SDK 정의서 효과 표의 이름)
 // media.next()  — MediaPacket{room, track_id, kind, codec, sequence, timestamp, payload …}(단위 Packet 인 트랙)
@@ -26,19 +27,25 @@ client.set_layer("t…", oxpeer::Layer { spatial: Some(0), ..Default::default() 
 
 // 말하기(에이전트 — 20261107c) — 발언 방으로 들어가 발행 · 무전이면 누르고 허가 사이에 넣는다
 client.join_speaking("ch-1").await?;                                                         // select:true 입장(발언 방)
-let mic = client.publish("ch-1", oxpeer::TrackSpec { kind: oxpeer::Kind::Audio, duplex: oxpeer::Duplex::Half }).await?;
+let mic = client.publish("ch-1", oxpeer::TrackSpec { kind: oxpeer::Kind::Audio, duplex: oxpeer::Duplex::Half, simulcast: false }).await?;   // mic.codec = 그 방 미디어 코덱
 client.ptt_press("ch-1", 0).await?;                                                          // 허가는 사건 Ptt{event:"granted"}
 mic.write(oxpeer::OutFrame { data: opus, duration: std::time::Duration::from_millis(20), keyframe: true, audio_level: Some(25) }).await?;
 mic.drain().await;                                                                           // 송신 시계가 다 낸 뒤
 client.ptt_release("ch-1").await?;
 client.send_message("ch-1", "안녕하세요").await?;                                             // 방 문자(받기는 사건 Message)
+mic.set_duplex(oxpeer::Duplex::Full).await?;                                                 // 반이중 ↔ 전이중(TRACK_SET)
+client.set_speaking_room("ch-2").await?;                                                     // 발언 방 바꾸기(서버를 건너면 옛 서버 내림 · 새 서버 발행)
+let cam = client.publish("ch-1", oxpeer::TrackSpec { kind: oxpeer::Kind::Video, duplex: oxpeer::Duplex::Full, simulcast: true }).await?;
+cam.write_layer(0, low).await?; cam.write_layer(1, high).await?;                             // 시뮬캐스트 — 층마다 앱이 인코딩한 프레임(l = 0 · h = 1)
 client.close().await;
+client.connect().await?;                                                                     // ★같은 객체로 다시 — 새 세션(방은 앱이 다시 join)
 ```
 
 보내는 쪽 — ★SDK 는 인코딩하지 않는다(앱이 Opus · VP8 · H264 프레임을 넣는다). 송신 시계가 프레임 길이대로 고르게 낸다(앱이 TTS 를 실시간보다 빨리 넣어도 몰아 보내지 않고 통이 차면 `write` 가 기다린다).
-오디오엔 `ssrc-audio-level` 을 싣는다(서버가 줄 상한을 넘는 방에서 음량으로 고른다 · 안 주면 말소리 30 dBov). SR 1초 · 영상 NACK 엔 RTX · 서버의 키프레임 요청은 사건 `KeyframeRequested`(앱이 인코더에 시킨다).
+오디오엔 `ssrc-audio-level` 을 싣는다(서버가 줄 상한을 넘는 방에서 음량으로 고른다 · 안 주면 말소리 30 dBov). SR 1초 · 영상 NACK 엔 RTX · 서버의 키프레임 요청은 사건 `KeyframeRequested{layer}`(앱이 인코더에 시킨다).
+★대역 추정 — 패킷마다 transport-cc 를 싣고 서버 TWCC 로 목표 비트레이트를 셈한다(손실 · 지연 기울기 · REMB 의 최솟값) → 사건 `TargetBitrate{bps}` · `Stats::target_bps`. 인코더를 맞추는 것은 앱 몫이다(SDK 는 버리거나 늦추지 않는다).
 
-예제 — 녹음(발언 한 건마다 Ogg Opus 파일 하나 · 화자 사건 `Speaker` 가 경계)과 녹화(`--video` — 트랙마다 Matroska 하나 · 무전 슬롯은 발언마다) · 에이전트(`agent` — `echo` 무전 되울림 · `beacon` 전이중 표지 발행 시험판):
+예제 — 녹음(발언 한 건마다 Ogg Opus 파일 하나 · 패킷 출처가 경계)과 녹화(`--video` — 트랙마다 Matroska 하나 · 무전 슬롯은 발언마다) · 에이전트(`agent` — `echo` 무전 되울림 · `beacon` 전이중 표지 발행 시험판(`--video [--simulcast]`) · `duplex` · `move --room2` · `reconnect --reconnect-at N` 걸음표 · `file --opus a.ogg --h264 v.h264` 진짜 표본) · 둘 다 `--tls-root ca.pem`:
 
 ```sh
 cargo run --example recorder -- --base http://127.0.0.1:1974/media --room ch-1 --out ./rec --secs 30 --hidden
@@ -101,9 +108,18 @@ DC 만 닫히는 경우(같은 연관 위 DC 다시 열기)는 바깥에서 걸 
 |---|---|
 | `peer_agent_echo` | 무전 되울림 — botA 의 발언을 받아 그가 놓으면 눌러 허가 사이에 그대로 말한다 · 청취 봇이 같은 표지를 원래 뒤에 한 번 더 받고(연속 · 보낸 수 그대로) 화자 통지가 에이전트 |
 | `peer_agent_publish` | 전이중 표지 발행(오디오 · VP8) — 받은 봇마다 번호가 빠짐 없이 · 영상 첫 도착은 키프레임 · 늦게 든 봇 → 서버 PLI → 사건 `KeyframeRequested` |
-| `peer_agent_loss` | ★보내는 쪽 QA 스위치 `OXPEER_QA_DROP_SEND_EVERY=N`(영상 N 개마다 하나를 안 보냄 · 보낸 기록엔 남김)로 흉내 낸 업링크 손실 → 서버 NACK → RTX 로 다 메움 |
+| `peer_agent_loss` | ★보내는 쪽 QA 스위치 `OXPEER_QA_DROP_SEND_EVERY=N`(영상 델타 프레임 패킷 N 개마다 하나를 안 보냄 · transport-cc 번호는 매김 · 보낸 기록엔 남김)로 흉내 낸 업링크 손실 → 서버 NACK → RTX 로 다 메움 |
+| `peer_agent_bwe_loss` | 같은 스위치로 손실 약 16% → TWCC 손실 기반 제어가 목표를 300k 아래로 내린다 |
+| `peer_agent_simulcast` | 발행 시뮬캐스트 — 녹화기가 층 상한을 바꾸면 그 층 표지가 온다 · 깨끗한 판에서 목표가 오른다 |
+| `peer_agent_duplex` · `peer_agent_move` · `peer_agent_reconnect` | 걸음표 — 전이중↔반이중 · 서버를 건너는 발언 방 전환(옛 서버 내림 · 새 서버 발행) · 닫고 같은 객체로 다시 connect |
+| `peer_agent_ws_cut` · `peer_agent_session_cut` | WS 만 끊음 = 발행 그대로(번호 끊김 없음) · 운영 절단 = 재구축 뒤 방이 다시 선 다음 다시 발행(새 track_id) |
+| `peer_agent_wss` | 하네스 TLS 종단 중계(그 판의 사설 CA)만 지나 https · wss 로 붙는다 |
+| `peer_record_reassign` | 영상 발행 26 > 줄 상한 25 · 하나가 내리면 줄 밖 트랙이 그 줄을 받는다 — 녹화기는 출처로 파일을 가른다 |
+
+3층(`oxlens-sdk-web/qa/live` `peer_mixed`) — 브라우저 실 인코더 → oxpeer 녹화 파일이 ffmpeg 로 끝까지 디코드 · oxpeer 에이전트의 진짜 Opus · H264 를 브라우저가 디코드(프레임 · 샘플 차분 · 폭) · 갈래B = 표지 본문이면 패킷은 와도 디코드 0.
 
 ## 범위
 
-세션 · 연결 · 방 · 받는 트랙 · 구독 + 발언권 듣기(첫 단계) · 수신 정리층 · 프레임 단위 수신 · 층 고르기(녹화 단계) · 발행 · 발언 방 · 발언 누름 · 메시지 · 지금 값(에이전트 단계).
-**아직 없는 것** — 혼잡 제어(TWCC · 대역 추정 — REMB 는 읽기만) · 발행 시뮬캐스트 · `https`/`wss` · 같은 `Client` 로 다시 `connect`(닫으면 새로 만든다) · 받는 쪽 발행 신원(조사 중 — context 20261107b).
+세션 · 연결 · 방 · 받는 트랙 · 구독 + 발언권 듣기(첫 단계) · 수신 정리층 · 프레임 단위 수신 · 층 고르기(녹화 단계) · 발행 · 발언 방 · 발언 누름 · 메시지 · 지금 값(에이전트 단계) ·
+발행 신원 = 출처 표지(CSRC — context 20261107b) · https/wss · 같은 객체로 다시 connect · 발행 시뮬캐스트 · 송신 대역 추정(context 20261108d).
+**없는 것** — 인코딩 · 디코딩(앱 몫) · 대역 추정에 따른 송신 조절(목표만 알린다 — 인코더는 앱이 맞춘다) · TCP 후보(UDP 만).

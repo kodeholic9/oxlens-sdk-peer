@@ -28,6 +28,8 @@ struct Args {
     hidden: bool,
     user: String,
     api_key: String,
+    /// `https://` hub 의 사설 CA 뿌리(PEM 파일 — context 202611/20261108d E2)
+    tls_root: Option<PathBuf>,
     api_secret: String,
     video: bool,
     spatial: Option<u8>,
@@ -35,7 +37,7 @@ struct Args {
 }
 
 fn args() -> Args {
-    let mut a = Args { base: String::new(), room: String::new(), out: PathBuf::from("."), secs: None, hidden: false, user: "oxpeer-recorder".into(), api_key: "ox_k_demo".into(), api_secret: "ox_s_demo".into(), video: false, spatial: None, layer_plan: Vec::new() };
+    let mut a = Args { base: String::new(), room: String::new(), out: PathBuf::from("."), secs: None, hidden: false, user: "oxpeer-recorder".into(), api_key: "ox_k_demo".into(), api_secret: "ox_s_demo".into(), tls_root: None, video: false, spatial: None, layer_plan: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         let mut v = || it.next().unwrap_or_default();
@@ -46,6 +48,7 @@ fn args() -> Args {
             "--secs" => a.secs = v().parse().ok(),
             "--hidden" => a.hidden = true,
             "--user" => a.user = v(),
+            "--tls-root" => a.tls_root = Some(PathBuf::from(v())),
             "--api-key" => a.api_key = v(),
             "--api-secret" => a.api_secret = v(),
             "--video" => a.video = true,
@@ -85,7 +88,8 @@ async fn main() {
     let a = args();
     std::fs::create_dir_all(&a.out).expect("출력 폴더");
     let req = TokenReq { api_key: a.api_key.clone(), api_secret: a.api_secret.clone(), user_id: a.user.clone(), participant_type: Some(1), hidden: Some(a.hidden), metadata: None, permission: None };
-    let token = match oxpeer::issue_token(&a.base, &req).await {
+    let root = a.tls_root.as_ref().map(|p| std::fs::read(p).expect("tls 뿌리 PEM"));
+    let token = match oxpeer::issue_token_with_root(&a.base, &req, root.as_deref()).await {
         Ok(t) => t,
         Err(e) => {
             eprintln!("토큰 발급 실패: {e}");
@@ -93,10 +97,11 @@ async fn main() {
         }
     };
     let mut cfg = Config::new(&a.base, token);
+    cfg.tls_root_pem = root;
     if a.video {
         cfg.unit = Unit::Frame;
     }
-    let (client, mut events, mut media, frames) = match Client::connect(cfg).await {
+    let (client, mut events, mut media, frames) = match Client::open(cfg).await {
         Ok(x) => x,
         Err(e) => {
             eprintln!("접속 실패: {e}");

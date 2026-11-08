@@ -19,6 +19,10 @@ serde = []
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
 tokio-tungstenite = "0.24"
+# https · wss(20261108d E2) — hub 와 같은 rustls(ring · tls12) 계열 · 기본 뿌리는 webpki · 사설 CA 는 Config.tls_root_pem
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "1"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,6 +39,8 @@ getrandom = { version = "0.3", features = ["std"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+# 1층 https · wss 시험의 자가 서명 인증서(context 202611/20261108d E2)
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [[example]]
 name = "recorder"

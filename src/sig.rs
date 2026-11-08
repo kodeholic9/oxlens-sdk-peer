@@ -5,12 +5,14 @@
 //! ★대기표는 세션에 묶인다 — 끊겨도 기한 전이면 들고 있다가 같은 세션이 이어지면 처음 차례 · 처음 pid 로 다시 보내고, 새 세션이면 버린다.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
+use tokio_rustls::rustls::ClientConfig;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::generated::ws_wire::{Lane, Op};
@@ -45,15 +47,18 @@ impl Drop for Socket {
     }
 }
 
-fn spawn_socket(url: String, sgen: u64, tx: mpsc::UnboundedSender<SockIn>) -> Socket {
+/// WS 하나 — `ws://` 는 TCP · `wss://` 는 TLS 위(context 202611/20261108d E2)
+async fn open_ws(url: &str, auth: &str, tls: Option<&Arc<ClientConfig>>) -> Option<tokio_tungstenite::WebSocketStream<crate::tls::Stream>> {
+    let s = crate::tls::dial(auth, tls).await.ok()?;
+    tokio_tungstenite::client_async(url, s).await.ok().map(|(ws, _)| ws)
+}
+
+fn spawn_socket(url: String, auth: String, tls: Option<Arc<ClientConfig>>, sgen: u64, tx: mpsc::UnboundedSender<SockIn>) -> Socket {
     let (out, mut out_rx) = mpsc::unbounded_channel::<Message>();
     let h = tokio::spawn(async move {
-        let ws = match tokio_tungstenite::connect_async(url.as_str()).await {
-            Ok((ws, _)) => ws,
-            Err(_) => {
-                let _ = tx.send(SockIn::Closed(sgen));
-                return;
-            }
+        let Some(ws) = open_ws(&url, &auth, tls.as_ref()).await else {
+            let _ = tx.send(SockIn::Closed(sgen));
+            return;
         };
         let _ = tx.send(SockIn::Open(sgen));
         let (mut sink, mut stream) = ws.split();
@@ -140,6 +145,8 @@ fn lane_rank(l: Lane) -> u8 {
 
 pub(crate) struct Sig {
     url: String,
+    auth: String,
+    tls: Option<Arc<ClientConfig>>,
     sock: Option<Socket>,
     sgen: u64,
     pid: u32,
@@ -156,8 +163,8 @@ pub(crate) struct Sig {
 }
 
 impl Sig {
-    pub(crate) fn new(url: String, req_timeout: Duration) -> Sig {
-        Sig { url, sock: None, sgen: 0, pid: 0, window: 1, req_timeout, waiting: VecDeque::new(), inflight: HashMap::new(), held: Vec::new(), up: false, ended: false, open: false, leave: None, last_rx: None }
+    pub(crate) fn new(url: String, auth: String, tls: Option<Arc<ClientConfig>>, req_timeout: Duration) -> Sig {
+        Sig { url, auth, tls, sock: None, sgen: 0, pid: 0, window: 1, req_timeout, waiting: VecDeque::new(), inflight: HashMap::new(), held: Vec::new(), up: false, ended: false, open: false, leave: None, last_rx: None }
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -177,7 +184,7 @@ impl Sig {
         self.sgen += 1;
         self.ended = false;
         self.leave = None;
-        self.sock = Some(spawn_socket(self.url.clone(), self.sgen, tx.clone()));
+        self.sock = Some(spawn_socket(self.url.clone(), self.auth.clone(), self.tls.clone(), self.sgen, tx.clone()));
     }
 
     /// LEAVE 없이 소켓을 닫는다(사유 없는 끊김)

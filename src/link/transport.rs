@@ -26,6 +26,7 @@ use webrtc_srtp::context::Context;
 use webrtc_srtp::protection_profile::ProtectionProfile;
 use webrtc_util::conn::Conn;
 
+use super::bwe::Bwe;
 use super::recv::{self, Counters, MediaFrame, Out, Recv, Rtp, Unit};
 use super::send::{self, SendTrack};
 use super::stun;
@@ -80,6 +81,8 @@ pub(crate) enum Fact {
     FirstRtp(u32),
     /// 서버가 내 발행 ssrc 에 키프레임을 청했다(PLI · FIR) — 앱 몫(SDK 는 인코딩하지 않는다)
     Pli(u32),
+    /// 대역 추정 목표가 바뀌었다(bps — `bwe`)
+    Bwe(u64),
 }
 
 /// 사실 하나 — 어느 서버 · 몇째 전송 묶음 · 어느 연결
@@ -198,13 +201,40 @@ pub(crate) struct PubOut {
     sock: Arc<UdpSocket>,
     server: SocketAddr,
     tx: Arc<OnceLock<Mutex<Context>>>,
+    /// 이 연결의 대역 추정(transport-cc 번호 공간은 연결의 것)
+    bwe: Arc<Mutex<Bwe>>,
 }
 
 impl PubOut {
-    /// 평문 RTP 하나 — 싸서 보낸다(아직 DTLS 전이면 false)
+    /// 평문 RTP 하나 — transport-cc 번호를 채워 싸서 보낸다(아직 DTLS 전이면 false)
     pub(crate) fn rtp(&self, plain: &[u8]) -> bool {
-        let Some(enc) = self.tx.get().and_then(|c| c.lock().ok().and_then(|mut c| c.encrypt_rtp(plain).ok())) else { return false };
+        let Some(ctx) = self.tx.get() else { return false };
+        let mut p = plain.to_vec();
+        if let Ok(mut b) = self.bwe.lock() {
+            b.stamp(&mut p, Instant::now());
+        }
+        let Some(enc) = ctx.lock().ok().and_then(|mut c| c.encrypt_rtp(&p).ok()) else { return false };
         self.sock.try_send_to(&enc, self.server).is_ok()
+    }
+
+    /// ★QA 손실 — 번호는 채워 보낸 것으로 적되 내보내지 않는다(망에서 잃은 것과 같다 — 서버 TWCC 가 「못 받음」으로 알리고 NACK 이 RTX 를 부른다)
+    pub(crate) fn rtp_lost(&self, plain: &[u8]) {
+        let mut p = plain.to_vec();
+        if let Ok(mut b) = self.bwe.lock() {
+            b.stamp(&mut p, Instant::now());
+        }
+    }
+
+    /// transport-cc 확장 번호(서버 선언) — 발행이 처음 쓸 때 알린다
+    pub(crate) fn set_twcc(&self, ext: u8) {
+        if let Ok(mut b) = self.bwe.lock() {
+            b.ext = ext;
+        }
+    }
+
+    /// (목표 bps, 손실률)
+    pub(crate) fn bwe_now(&self) -> (u64, f64) {
+        self.bwe.lock().map(|b| (b.target(), b.loss)).unwrap_or((0, 0.0))
     }
 
     pub(crate) fn rtcp(&self, plain: &[u8]) -> bool {
@@ -299,7 +329,7 @@ async fn run(server: SocketAddr, mut creds: Creds, cert: Certificate, role: Role
     let (dtls_tx, dtls_rx) = mpsc::channel::<Vec<u8>>(256);
     let rx_ctx: Arc<OnceLock<Mutex<Context>>> = Arc::default();
     let tx_ctx: Arc<OnceLock<Mutex<Context>>> = Arc::default();
-    let _ = out.set(PubOut { sock: sock.clone(), server, tx: tx_ctx.clone() });
+    let _ = out.set(PubOut { sock: sock.clone(), server, tx: tx_ctx.clone(), bwe: Arc::default() });
     let po = out.get().cloned();
 
     let (s2, i2, rx2, tx2, say2, sink2) = (sock.clone(), inner_tx.clone(), rx_ctx.clone(), tx_ctx.clone(), say.clone(), sink.clone());
@@ -522,6 +552,16 @@ fn on_rtcp(pkt: &[u8], rx: &Arc<OnceLock<Mutex<Context>>>, rv: &mut Recv, sink: 
     }
     if let Some(b) = fb.remb {
         sink.remb.store(b, Ordering::Relaxed);
+        if let Some(t) = out.and_then(|o| o.bwe.lock().ok().and_then(|mut x| x.on_remb(b))) {
+            say.send(Fact::Bwe(t));
+        }
+    }
+    if let Some(o) = out {
+        for r in fb.twcc {
+            if let Some(t) = o.bwe.lock().ok().and_then(|mut x| x.on_feedback(&r, now)) {
+                say.send(Fact::Bwe(t));
+            }
+        }
     }
 }
 

@@ -14,10 +14,10 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
-use super::{Cmd, Core};
+use super::{Cmd, Core, PublishReply};
 use crate::api::{Event, PttInfo, RoomView, Snapshot, TrackSpec};
 use crate::error::{Category, Error};
-use crate::generated::ws_wire::{AffiliationReq, AffiliationRes, Duplex, Kind, MessageBody, MessageReq, Op, PublishTrack, PublishTracksReq, PublishTracksReqAddAction, PublishTracksReqRemoveAction, Source};
+use crate::generated::ws_wire::{AffiliationReq, AffiliationRes, Duplex, Kind, MessageBody, MessageReq, Op, PublishTrack, PublishTracksReq, PublishTracksReqAddAction, PublishTracksReqRemoveAction, Source, TrackSetReq};
 use crate::generated::{aff_binding as ab, aff_client as ac, floor_client as fc, pub_binding as pbd, publish_client as pc};
 use crate::link::depack::Codec;
 use crate::link::send::{ExtIds, OutFrame, SendTrack};
@@ -27,6 +27,11 @@ use crate::sig::{Outcome, Purpose};
 /// 서버 선언 확장의 이름(연:LINK.type.ServerConfig) — 번호는 그 선언에서 찾는다
 const URI_MID: &str = "urn:ietf:params:rtp-hdrext:sdes:mid";
 const URI_AUDIO_LEVEL: &str = "urn:ietf:params:rtp-hdrext:ssrc-audio-level";
+const URI_RID: &str = "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id";
+const URI_REPAIR_RID: &str = "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id";
+const URI_TWCC: &str = "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01";
+/// 시뮬캐스트 업링크 층 이름 — 낮은 화질부터(연:RULE-PUB-RID-TO-SPATIAL · l=0 · h=1)
+const SIM_RIDS: [&str; 2] = ["l", "h"];
 /// 송신 통 — 앱이 실시간보다 빨리 넣으면 이만큼 앞서 쌓이고 그 뒤 `write` 가 기다린다(역압)
 pub(crate) const FRAME_QUEUE: usize = 25;
 const SR_EVERY: Duration = Duration::from_secs(1);
@@ -51,20 +56,28 @@ pub(crate) struct PubTrack {
     pub(crate) fmtp: Option<String>,
     pub(crate) pt: u8,
     pub(crate) rtx: Option<(u32, u8)>,
+    /// 시뮬캐스트면 0(wire 꼴 — 서버가 rid 확장으로 배운다) · 층마다 진짜 ssrc 는 `ssrcs`
     pub(crate) ssrc: u32,
+    pub(crate) ssrcs: Vec<u32>,
+    pub(crate) simulcast: bool,
     pub(crate) mid: String,
     pub(crate) track_id: Option<String>,
     pub(crate) io: Arc<TrackIo>,
-    waiters: Vec<oneshot::Sender<Result<(u64, String), Error>>>,
+    waiters: Vec<PublishReply>,
     /// 마지막 거절 응답(앱에 실패 사유로 준다)
     fault: Option<Value>,
     dup_waiters: Vec<oneshot::Sender<Result<(), Error>>>,
-    pacer: AbortHandle,
+    /// 층마다 송신 시계
+    pacers: Vec<AbortHandle>,
+    /// 협상 이음매를 그 방이 다시 설 때까지 미뤘다(재구축 — 새 세션은 방보다 먼저 선다 · 20261108d)
+    nego_wait: bool,
 }
 
 impl Drop for PubTrack {
     fn drop(&mut self) {
-        self.pacer.abort();
+        for p in &self.pacers {
+            p.abort();
+        }
     }
 }
 
@@ -110,11 +123,15 @@ async fn pacer(id: u64, mut rx: mpsc::Receiver<OutFrame>, st: Arc<Mutex<SendTrac
                     Err(_) => continue,
                 };
                 for p in &pkts {
-                    // ★QA 스위치(OXPEER_QA_DROP_SEND_EVERY) — 영상 패킷 N 개마다 하나를 보내지 않는다(보낸 기록엔 남는다 → 서버 NACK 에 RTX 로 답한다) · 시험 수단
-                    if qa_every > 0 && video {
+                    // ★QA 스위치(OXPEER_QA_DROP_SEND_EVERY) — 영상 패킷 N 개마다 하나를 보내지 않는다(보낸 기록엔 남는다 → 서버 NACK 에 RTX 로 답한다) · 시험 수단.
+                    //   transport-cc 번호는 매긴다 — 망에서 잃은 것과 같아야 대역 추정이 손실로 본다(번호를 안 매기면 서버 TWCC 에 빈자리가 없다 · 20261108d)
+                    //   ★키프레임은 버리지 않는다 — 출발 키프레임이 RTX 로 늦게 오면 그 사이 먼저 온 뒤 번호를 서버 출발 게이트가 버린다(정:IMPL-SUB-READY-GATE 가 허용한 구멍) ·
+                    //   그 구멍은 받는 쪽 판정이 망 손실과 못 가른다 — 이 스위치의 몫(업링크 손실 → NACK · RTX · 대역 추정)을 흐린다(20261108d 실측)
+                    if qa_every > 0 && video && !f.keyframe {
                         qa_n += 1;
                         if qa_n.is_multiple_of(qa_every) {
                             io.qa_dropped.fetch_add(1, Ordering::Relaxed);
+                            o.rtp_lost(p);
                             continue;
                         }
                     }
@@ -158,7 +175,7 @@ impl Core {
     // ── 발행(PUB) ──────────────────────────────────────────────────────
 
     /// 발행 — 그 방의 미디어 코덱으로(연:RULE-PUB-PUBLISH-PROC — 보내기 전에 맞춘다) · 응답의 `track_id` 와 함께 돌아온다
-    pub(super) fn publish(&mut self, room: String, spec: TrackSpec, frames: mpsc::Receiver<OutFrame>, tx: oneshot::Sender<Result<(u64, String), Error>>) {
+    pub(super) fn publish(&mut self, room: String, spec: TrackSpec, frames: Vec<mpsc::Receiver<OutFrame>>, tx: PublishReply) {
         let Some(r) = self.rooms.get(&room).filter(|r| r.st.rs == crate::generated::room_client::RoomSt::JOINED) else {
             let _ = tx.send(Err(Error::sdk("NOT_JOINED", Category::State)));
             return;
@@ -168,6 +185,11 @@ impl Core {
             return;
         };
         let video = spec.kind == Kind::Video;
+        if spec.simulcast && !video {
+            // 오디오에 시뮬캐스트는 없다(PublishTrack.simulcast — 1002)
+            let _ = tx.send(Err(Error::sdk("SIMULCAST_AUDIO", Category::State)));
+            return;
+        }
         let codec = if video { r.media.as_ref().and_then(|m| m.video.clone()).unwrap_or_else(|| "H264".into()) } else { r.media.as_ref().and_then(|m| m.audio.clone()).unwrap_or_else(|| "opus".into()) };
         let c = Codec::of(&codec);
         let (pt, rtx_pt, fmtp) = match c {
@@ -181,22 +203,50 @@ impl Core {
         };
         let ext = self.links.get(&server).map(|l| {
             let id = |u: &str| l.sc.extmap.iter().find(|e| e.uri == u).map(|e| e.id).unwrap_or(0);
-            ExtIds { mid: id(URI_MID), audio_level: if video { 0 } else { id(URI_AUDIO_LEVEL) } }
+            ExtIds {
+                mid: id(URI_MID),
+                audio_level: if video { 0 } else { id(URI_AUDIO_LEVEL) },
+                rid: if spec.simulcast { id(URI_RID) } else { 0 },
+                rrid: if spec.simulcast { id(URI_REPAIR_RID) } else { 0 },
+                twcc: id(URI_TWCC),
+            }
         });
         let ext = ext.unwrap_or_default();
+        if spec.simulcast && (ext.rid == 0 || ext.rrid == 0) {
+            let _ = tx.send(Err(Error::sdk("SIMULCAST_UNSUPPORTED", Category::Negotiation)));
+            return;
+        }
+        // 대역 추정기에 transport-cc 번호를 알린다(서버마다 연결 하나 — 번호 공간은 연결의 것)
+        if ext.twcc != 0
+            && let Some(o) = self.pub_outs.read().ok().and_then(|g| g.get(&server).and_then(|s| s.get().cloned()))
+        {
+            o.set_twcc(ext.twcc);
+        }
         let n = self.pub_mids.entry(server.clone()).or_insert(0);
         let mid = n.to_string();
         *n += 1;
         self.pub_seq += 1;
         let id = self.pub_seq;
-        let ssrc = rand_u32();
-        let rtx = rtx_pt.map(|p| (rand_u32(), p));
-        let st = Arc::new(Mutex::new(SendTrack::new(ssrc, pt, rtx, c, video, mid.clone(), ext)));
-        if let Ok(mut g) = self.sink.senders.write() {
-            g.insert(ssrc, st.clone());
-        }
         let io = Arc::new(TrackIo { gate: AtomicBool::new(false), fresh: AtomicBool::new(false), gated: AtomicU64::new(0), sent: AtomicU64::new(0), qa_dropped: AtomicU64::new(0), server: Mutex::new(server) });
-        let pacer = tokio::spawn(pacer(id, frames, st, io.clone(), self.pub_outs.clone(), self.cmd_tx.clone())).abort_handle();
+        let mut ssrcs = Vec::new();
+        let mut pacers = Vec::new();
+        let mut rtx = None;
+        for (k, rx) in frames.into_iter().enumerate() {
+            let ssrc = rand_u32();
+            let r = rtx_pt.map(|p| (rand_u32(), p));
+            rtx = rtx.or(r);
+            let mut t = SendTrack::new(ssrc, pt, r, c, video, mid.clone(), ext);
+            if spec.simulcast {
+                t.rid = SIM_RIDS.get(k).map(|x| x.to_string());
+            }
+            let st = Arc::new(Mutex::new(t));
+            if let Ok(mut g) = self.sink.senders.write() {
+                g.insert(ssrc, st.clone());
+            }
+            ssrcs.push(ssrc);
+            pacers.push(tokio::spawn(pacer(id, rx, st, io.clone(), self.pub_outs.clone(), self.cmd_tx.clone())).abort_handle());
+        }
+        let ssrc = if spec.simulcast { 0 } else { ssrcs.first().copied().unwrap_or(0) };
         let half = spec.duplex == Duplex::Half;
         let t = PubTrack {
             id,
@@ -209,13 +259,16 @@ impl Core {
             pt,
             rtx,
             ssrc,
+            ssrcs,
+            simulcast: spec.simulcast,
             mid,
             track_id: None,
             io,
             waiters: vec![tx],
             fault: None,
             dup_waiters: Vec::new(),
-            pacer,
+            pacers,
+            nego_wait: false,
         };
         self.pubs.insert(id, t);
         self.pub_enter(id, "on", pc::on, "publish");
@@ -231,7 +284,9 @@ impl Core {
         if let Some(t) = self.pubs.remove(&id)
             && let Ok(mut g) = self.sink.senders.write()
         {
-            g.remove(&t.ssrc);
+            for s in &t.ssrcs {
+                g.remove(s);
+            }
         }
     }
 
@@ -278,8 +333,9 @@ impl Core {
             match e {
                 pbd::PubEvent::Published => {
                     let tid = track_id.clone().unwrap_or_default();
+                    let codec = t.codec.clone();
                     for w in t.waiters.drain(..) {
-                        let _ = w.send(Ok((id, tid.clone())));
+                        let _ = w.send(Ok((id, tid.clone(), codec.clone())));
                     }
                     self.emit(Event::Published { room, track_id: tid });
                 }
@@ -303,9 +359,17 @@ impl Core {
                 }
             }
         }
-        // 협상 이음매 — SDP 가 없으니 곧바로 성공(발행 m-line 은 PUBLISH_TRACKS 의 줄)
+        // 협상 이음매 — SDP 가 없으니 성공으로 돌아온다(발행 m-line 은 PUBLISH_TRACKS 의 줄). ★단 그 방이 JOINED 일 때만 —
+        //   웹은 협상이 연결 · 방이 선 뒤에 끝나지만 서버사이드는 곧바로라 재구축(새 세션이 방보다 먼저 선다)에서 방 밖 PUBLISH_TRACKS 가 나가 거절됐다(20261108d 실측).
+        //   방이 아직이면 미뤘다가 그 방이 다시 서면(`pub_room_joined`) 그 방이 지금 붙은 서버를 다시 읽고(SDK:pub.md `LocalTrack.server`) 이음매를 끝낸다
         if plan.seams.iter().any(|s| s.fx == pc::SeamFx::sdp_rebuild) {
-            self.pub_enter(id, "nego", |s| pc::nego(s, true), "no-sdp");
+            let joined = self.pubs.get(&id).and_then(|t| self.rooms.get(&t.room)).is_some_and(|r| !r.closed && r.st.rs == crate::generated::room_client::RoomSt::JOINED);
+            if joined {
+                self.pub_rebind(id);
+                self.pub_enter(id, "nego", |s| pc::nego(s, true), "no-sdp");
+            } else if let Some(t) = self.pubs.get_mut(&id) {
+                t.nego_wait = true;
+            }
         }
         // 등록됐다 — 송신 시계는 이미 섰다(트랙을 트랜시버에 붙인 것과 같다)
         if prev != pc::PubSt::REGISTERED && plan.state.ps == pc::PubSt::REGISTERED {
@@ -326,10 +390,11 @@ impl Core {
         let Some(t) = self.pubs.get(&id) else { return };
         let Some(join_id) = self.rooms.get(&t.room).and_then(|r| self.jids.str(r.st.jid)).map(str::to_string) else { return };
         let video = t.kind == Kind::Video;
-        let (mid_ext, level_ext) = t.io.server.lock().ok().and_then(|s| self.links.get(&*s).map(|l| {
+        let (mid_ext, level_ext, rid_ext, rrid_ext, twcc_ext) = t.io.server.lock().ok().and_then(|s| self.links.get(&*s).map(|l| {
             let id = |u: &str| l.sc.extmap.iter().find(|e| e.uri == u).map(|e| e.id);
-            (id(URI_MID), if video { None } else { id(URI_AUDIO_LEVEL) })
-        })).unwrap_or((None, None));
+            let sim = |u: &str| if t.simulcast { id(u) } else { None };
+            (id(URI_MID), if video { None } else { id(URI_AUDIO_LEVEL) }, sim(URI_RID), sim(URI_REPAIR_RID), id(URI_TWCC))
+        })).unwrap_or((None, None, None, None, None));
         let track = PublishTrack {
             kind: t.kind,
             ssrc: t.ssrc,
@@ -338,20 +403,21 @@ impl Core {
             fmtp: t.fmtp.clone(),
             pt: t.pt,
             rtx_pt: t.rtx.map(|r| r.1),
-            rtx_ssrc: t.rtx.map(|r| r.0),
+            // 시뮬캐스트의 RTX 는 서버가 repaired-rid 로 배운다(rtx_ssrc 는 시뮬캐스트가 아닐 때만)
+            rtx_ssrc: if t.simulcast { None } else { t.rtx.map(|r| r.0) },
             // 오디오 항목에 source 를 실으면 거절이다(연:RULE-PUB-PUBLISH-FAIL 1002)
             source: if video { Some(Source::Camera) } else { None },
             duplex: Some(if t.half { Duplex::Half } else { Duplex::Full }),
-            simulcast: if video { Some(false) } else { None },
+            simulcast: if video { Some(t.simulcast) } else { None },
         };
         let body = PublishTracksReq::Add {
             action: Some(PublishTracksReqAddAction::Add),
             join_id,
             room_id: t.room.clone(),
             tracks: vec![track],
-            twcc_extmap_id: None,
-            rid_extmap_id: None,
-            repair_rid_extmap_id: None,
+            twcc_extmap_id: twcc_ext,
+            rid_extmap_id: rid_ext,
+            repair_rid_extmap_id: rrid_ext,
             mid_extmap_id: mid_ext,
             audio_level_extmap_id: level_ext,
         };
@@ -373,8 +439,9 @@ impl Core {
     fn send_track_set(&mut self, id: u64, d: pc::Duplex) {
         let Some(t) = self.pubs.get(&id) else { return };
         let Some(tid) = t.track_id.clone() else { return };
-        let body = serde_json::json!({ "room_id": t.room, "track_id": tid, "duplex": d.as_str() });
-        self.request(Op::TrackSet, body, Purpose::TrackSet { track: id });
+        let Some(join_id) = self.rooms.get(&t.room).and_then(|r| self.jids.str(r.st.jid)).map(str::to_string) else { return };
+        let req = TrackSetReq { room_id: t.room.clone(), join_id, track_id: Some(tid), ssrc: None, muted: None, duplex: Some(if d == pc::Duplex::half { Duplex::Half } else { Duplex::Full }) };
+        self.request(Op::TrackSet, super::to_body(&req), Purpose::TrackSet { track: id });
     }
 
     pub(super) fn publish_reply(&mut self, id: u64, pid: i64, o: Outcome) {
@@ -459,12 +526,55 @@ impl Core {
         }
     }
 
-    /// 새 세션 — 발행을 전부 다시 한다(위 이음매 pub.reregister_all)
+    /// 새 세션 — 발행을 전부 다시 한다(위 이음매 pub.reregister_all) · 서버를 다시 읽는 것은 협상 이음매가 끝날 때(방이 다시 선 뒤)
     pub(super) fn pub_reregister_all(&mut self) {
         let ids: Vec<u64> = self.pubs.keys().copied().collect();
         for id in ids {
             self.pub_enter(id, "reregister", |s| Some(pc::reregister(s)), "rebuild");
         }
+    }
+
+    /// 그 방이 (다시) 섰다 — 미뤄 둔 협상 이음매를 끝낸다
+    pub(super) fn pub_room_joined(&mut self, room: &str) {
+        let ids: Vec<u64> = self.pubs.values().filter(|t| t.room == room && t.nego_wait).map(|t| t.id).collect();
+        for id in ids {
+            if let Some(t) = self.pubs.get_mut(&id) {
+                t.nego_wait = false;
+            }
+            self.pub_rebind(id);
+            self.pub_enter(id, "nego", |s| pc::nego(s, true), "room_joined");
+        }
+    }
+
+    /// 트랙의 서버를 그 발행 방이 지금 붙은 서버로 — 바뀌었으면 그 연결의 mid 를 새로 받고 송신 상태에 알린다(SDK:pub.md `LocalTrack.server` — `moveIn` 전 · 재구축의 다시 발행 전)
+    fn pub_rebind(&mut self, id: u64) {
+        let Some(t) = self.pubs.get(&id) else { return };
+        let Some(server) = self.rooms.get(&t.room).and_then(|r| r.sfu.clone()) else { return };
+        let old = t.io.server.lock().map(|s| s.clone()).unwrap_or_default();
+        if old == server {
+            return;
+        }
+        let n = self.pub_mids.entry(server.clone()).or_insert(0);
+        let mid = n.to_string();
+        *n += 1;
+        let twcc = self.links.get(&server).and_then(|l| l.sc.extmap.iter().find(|e| e.uri == URI_TWCC).map(|e| e.id)).unwrap_or(0);
+        if twcc != 0
+            && let Some(o) = self.pub_outs.read().ok().and_then(|g| g.get(&server).and_then(|s| s.get().cloned()))
+        {
+            o.set_twcc(twcc);
+        }
+        let Some(t) = self.pubs.get_mut(&id) else { return };
+        if let Ok(mut g) = t.io.server.lock() {
+            *g = server.clone();
+        }
+        t.mid = mid.clone();
+        let senders = self.sink.senders.read().map(|g| t.ssrcs.iter().filter_map(|x| g.get(x).cloned()).collect::<Vec<_>>()).unwrap_or_default();
+        for st in senders {
+            if let Ok(mut st) = st.lock() {
+                st.rebind(mid.clone());
+            }
+        }
+        self.record("PUB", &id.to_string(), &old, &server, "rebind", "server");
     }
 
     /// 그 서버 연결이 닫혔다(drop) · 재구축으로 다시 섰다(reregister) — 위 이음매 pub.drop_server · pub.reregister_server
@@ -505,8 +615,9 @@ impl Core {
 
     /// 서버가 내 발행에 키프레임을 청했다 — 앱 몫(SDK 는 인코딩하지 않는다)
     pub(super) fn pli_in(&mut self, ssrc: u32) {
-        if let Some(t) = self.pubs.values().find(|t| t.ssrc == ssrc) {
-            self.emit(Event::KeyframeRequested { room: t.room.clone(), track_id: t.track_id.clone().unwrap_or_default() });
+        if let Some(t) = self.pubs.values().find(|t| t.ssrcs.contains(&ssrc)) {
+            let layer = if t.simulcast { t.ssrcs.iter().position(|x| *x == ssrc).map(|k| k as u8) } else { None };
+            self.emit(Event::KeyframeRequested { room: t.room.clone(), track_id: t.track_id.clone().unwrap_or_default(), layer });
         }
     }
 
@@ -564,8 +675,16 @@ impl Core {
                     }
                 }
                 ac::SeamFx::pub_move_in => {
-                    let ids: Vec<u64> = self.pubs.keys().copied().collect();
+                    // ★넣기 전에 트랙의 방 · 서버를 그 발행 방의 것으로(SDK:pub.md `moveIn` · `LocalTrack.server`)
+                    let to = self.aff.r#pub.clone();
+                    let ids: Vec<u64> = self.pubs.values().filter(|t| t.st.mv).map(|t| t.id).collect();
                     for id in ids {
+                        if self.rooms.contains_key(&to)
+                            && let Some(t) = self.pubs.get_mut(&id)
+                        {
+                            t.room = to.clone();
+                        }
+                        self.pub_rebind(id);
                         self.pub_enter(id, "moveIn", |s| Some(pc::move_in(s)), "affiliation");
                     }
                 }

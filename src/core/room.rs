@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 use super::{Core, Tk};
 use crate::api::{Event, Layer};
 use crate::error::{Category, Error};
-use crate::generated::ws_wire::{MemberInfo, Op, SubscribeLayerReqTargets, TrackEntry, TrackEntryType};
+use crate::generated::ws_wire::{MemberInfo, Op, ReadyReq, RoomJoinReq, RoomLeaveReq, SubscribeLayerReq, SubscribeLayerReqTargets, TrackEntry, TrackEntryType};
 use crate::generated::{floor_client as fc, ptt_binding as pb, room_binding as rb, room_client as rc, session_client as sc, sub_binding as ub, sub_client as uc, trk_binding as tb, trk_client as tc};
 use crate::sig::{Outcome, Purpose};
 use crate::wire::dc;
@@ -218,6 +218,9 @@ impl Core {
         for f in &fx {
             self.room_effect(id, *f);
         }
+        if prev.rs != rc::RoomSt::JOINED && self.rooms.get(id).is_some_and(|r| r.st.rs == rc::RoomSt::JOINED) {
+            self.pub_room_joined(id);
+        }
         if let Some(r) = self.rooms.get_mut(id) {
             if r.st.retry && !prev.retry {
                 let ms = r.retry_after_ms;
@@ -255,12 +258,9 @@ impl Core {
         match tx {
             rc::Tx::RoomJoin { join_id } => self.send_join(id, *join_id),
             rc::Tx::RoomLeave { join_id } => {
-                let mut body = json!({ "room_id": id });
-                if let Some(j) = self.jids.str(*join_id) {
-                    body["join_id"] = Value::String(j.to_string());
-                }
+                let req = RoomLeaveReq { room_id: id.to_string(), join_id: self.jids.str(*join_id).map(str::to_string) };
                 let epoch = self.rooms[id].req_epoch;
-                self.request(Op::RoomLeave, body, Purpose::RoomLeave { room: id.to_string(), epoch });
+                self.request(Op::RoomLeave, super::to_body(&req), Purpose::RoomLeave { room: id.to_string(), epoch });
             }
             rc::Tx::GetRoom { .. } => self.resync(id),
         }
@@ -268,12 +268,9 @@ impl Core {
 
     /// 입장 — 듣기(`select:false`) · jid = 갈아 끼울 입장의 join_id(재구축 · 0 = 새 입장 — 연:RULE-ROOM-JOIN-REPLACE)
     fn send_join(&mut self, id: &str, jid: i64) {
-        let mut body = json!({ "room_id": id, "select": self.rooms.get(id).is_some_and(|r| r.select) });
-        if let Some(j) = self.jids.str(jid) {
-            body["join_id"] = Value::String(j.to_string());
-        }
+        let req = RoomJoinReq { room_id: id.to_string(), role: None, select: Some(self.rooms.get(id).is_some_and(|r| r.select)), extmap: None, codecs: None, join_id: self.jids.str(jid).map(str::to_string) };
         let epoch = self.rooms[id].req_epoch;
-        self.request(Op::RoomJoin, body, Purpose::RoomJoin { room: id.to_string(), epoch, jid });
+        self.request(Op::RoomJoin, super::to_body(&req), Purpose::RoomJoin { room: id.to_string(), epoch, jid });
     }
 
     pub(super) fn room_resend(&mut self, id: &str) {
@@ -895,12 +892,10 @@ impl Core {
     pub(super) fn send_ready(&mut self, id: &str) {
         let Some(r) = self.rooms.get(id) else { return };
         let arev = r.sfu.as_ref().and_then(|s| self.links.get(s)).map(|l| l.sdp_arev).unwrap_or(0);
-        let mut body = json!({ "room_id": id, "arev": arev });
-        if let Some(j) = self.jids.str(r.st.jid) {
-            body["join_id"] = Value::String(j.to_string());
-        }
+        let Some(join_id) = self.jids.str(r.st.jid).map(str::to_string) else { return };
+        let req = ReadyReq { room_id: id.to_string(), join_id, arev };
         let epoch = r.req_epoch;
-        self.request(Op::Ready, body, Purpose::Ready { room: id.to_string(), epoch });
+        self.request(Op::Ready, super::to_body(&req), Purpose::Ready { room: id.to_string(), epoch });
     }
 
     /// 앱의 층 고르기(SDK:IMPL-TRK-RECEIVE `RemoteTrack.setLayer`) — 값은 상한 · `scalability` 밖은 그 축의 끝으로 자른다(연:RULE-SUB-LAYER-PROC)
@@ -946,12 +941,11 @@ impl Core {
         if let Some(tx) = tx {
             r.layer_waiters.insert(wid, tx);
         }
-        let mut body = json!({ "room_id": id, "targets": r.layers.values().collect::<Vec<_>>() });
-        if let Some(j) = self.jids.str(r.st.jid) {
-            body["join_id"] = Value::String(j.to_string());
-        }
+        let targets: Vec<SubscribeLayerReqTargets> = r.layers.values().cloned().collect();
         let epoch = r.req_epoch;
-        self.request(Op::SubscribeLayer, body, Purpose::Layer { room: id.to_string(), epoch, id: wid });
+        let Some(join_id) = self.jids.str(r.st.jid).map(str::to_string) else { return };
+        let req = SubscribeLayerReq { room_id: id.to_string(), join_id, targets };
+        self.request(Op::SubscribeLayer, super::to_body(&req), Purpose::Layer { room: id.to_string(), epoch, id: wid });
     }
 
     pub(super) fn layer_reply(&mut self, id: &str, epoch: u64, wid: u64, o: Outcome) {

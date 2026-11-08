@@ -4,13 +4,13 @@
 
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::oneshot;
 
 use super::{Core, Tk};
 use crate::api::{Event, Health, LinkState, SessionInfo, SessionState};
 use crate::error::{Category, Error};
-use crate::generated::ws_wire::Op;
+use crate::generated::ws_wire::{BindReq, Op, PcMode, ResumeReq};
 use crate::generated::{room_client as rc, session_binding as sb, session_client as sc};
 use crate::sig::{Outcome, Purpose};
 
@@ -67,7 +67,18 @@ impl Core {
         }
         self.links.clear();
         self.timers = super::Timers::default();
-        self.finished = true;
+        // 같은 객체로 다시 connect 하면 새 세션이다(SDK:ses.md `close()`) — 방 · 발행 · 소속 · 출처 대응은 이 세션의 것이라 비운다(방은 앱이 다시 join)
+        self.rooms.clear();
+        self.pubs.clear();
+        self.pub_mids.clear();
+        self.talk_sources.clear();
+        self.aff = crate::generated::aff_client::initial();
+        for tx in self.aff_waiters.drain(..) {
+            let _ = tx.send(Err(Error::closed("CLOSED")));
+        }
+        self.join_mode = None;
+        self.sync_outs();
+        self.rebuild_routes();
     }
 
     // ── 한 걸음 ────────────────────────────────────────────────────────
@@ -142,13 +153,16 @@ impl Core {
         match tx {
             sc::Tx::Bind { pc_mode, session_id, .. } => {
                 // 출처 표지는 늘 켠다 — 패킷마다 발행 신원(SDK:RULE-PLAT-SERVER 「출처 표지」 · 연:RULE-SES-SOURCE-TAG-SESSION)
-                let mut body = json!({ "token": self.token, "pc_mode": pc_mode.as_str(), "source_tag": true });
-                if let Some(s) = session_id.and_then(|id| self.sids.str(id).map(str::to_string)) {
-                    body["session_id"] = Value::String(s);
-                }
-                self.request(Op::Bind, body, Purpose::Bind);
+                let req = BindReq {
+                    token: Some(self.token.clone()),
+                    session_id: session_id.and_then(|id| self.sids.str(id).map(str::to_string)),
+                    client_ver: None,
+                    pc_mode: Some(if *pc_mode == sc::PcMode::V1pc { PcMode::V1pc } else { PcMode::V2pc }),
+                    source_tag: Some(true),
+                };
+                self.request(Op::Bind, super::to_body(&req), Purpose::Bind);
             }
-            sc::Tx::Resume => self.request(Op::Resume, json!({}), Purpose::Resume),
+            sc::Tx::Resume => self.request(Op::Resume, super::to_body(&ResumeReq {}), Purpose::Resume),
             sc::Tx::Heartbeat => self.request(Op::Heartbeat, Value::Null, Purpose::Heartbeat),
             sc::Tx::Leave => {
                 let mut ended = std::mem::take(&mut self.ended);

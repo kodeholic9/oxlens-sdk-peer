@@ -16,8 +16,10 @@ pub use crate::link::transport::{MediaPacket, Source};
 /// 접속 설정 — `base` 는 앱이 준다(연:RULE-TRN-BASE-GIVEN) · `token` 은 앱이 발급받은 것(연:SES.http.TOKEN)
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// `http://host:port/경로` — WS 는 `ws://host:port/경로/ws`
+    /// `http://host:port/경로` — WS 는 `ws://host:port/경로/ws` · `https://` 면 `wss://`(context 202611/20261108d E2)
     pub base: String,
+    /// `https://` hub 의 사설 CA 뿌리(PEM) — 주면 이것만 믿는다 · 없으면 webpki 뿌리
+    pub tls_root_pem: Option<Vec<u8>>,
     pub token: String,
     /// 미디어 통 크기(패킷) — 앱이 늦게 꺼내 가득 차면 버리고 센다(`Stats::media_dropped`)
     pub media_capacity: usize,
@@ -29,7 +31,7 @@ pub struct Config {
 
 impl Config {
     pub fn new(base: impl Into<String>, token: impl Into<String>) -> Config {
-        Config { base: base.into(), token: token.into(), media_capacity: 4_096, frames_capacity: 1_024, unit: Unit::Packet }
+        Config { base: base.into(), tls_root_pem: None, token: token.into(), media_capacity: 4_096, frames_capacity: 1_024, unit: Unit::Packet }
     }
 }
 
@@ -131,7 +133,10 @@ pub enum Event {
     PublishFailed { room: String },
     TrackEnded { room: String, track_id: String },
     /// 서버가 내 발행에 키프레임을 청했다(PLI) — 앱이 인코더에 키프레임을 시킨다(SDK 는 인코딩하지 않는다)
-    KeyframeRequested { room: String, track_id: String },
+    KeyframeRequested { room: String, track_id: String, layer: Option<u8> },
+    /// 그 발행 연결의 목표 비트레이트가 바뀌었다(TWCC 손실 · 지연 기울기 · REMB 의 최솟값 — 앞서 알린 값과 5% 넘게 다를 때 · context 202611/20261108d E4).
+    /// ★SDK 는 인코딩하지 않는다 — 인코더를 맞추는 것은 앱 몫이고 SDK 는 버리거나 늦추지 않는다
+    TargetBitrate { server: String, bps: u64 },
     /// 발언권 누름 쪽(SDK:IMPL-FLR-EXPOSE) — event = granted · denied · queued · revoked · state · state = 위 클라 상태
     Ptt { room: String, event: String, state: String },
     /// 발언 방이 바뀌었다(소속 응답 — None = 없다)
@@ -148,6 +153,8 @@ pub struct TrackSpec {
     pub kind: Kind,
     /// `Full` = 전이중(늘 보낸다) · `Half` = 반이중(발언권 허가 사이에만 — 무전)
     pub duplex: Duplex,
+    /// 영상 시뮬캐스트 — 업링크 둘(`l` = 0 · `h` = 1 · 연:RULE-PUB-RID-TO-SPATIAL) · 층마다 앱이 인코딩한 프레임을 `LocalTrack::write_layer` 로 넣는다(context 202611/20261108d E3)
+    pub simulcast: bool,
 }
 
 /// 지금 값(SDK:IMPL-SES-API 상태 읽기 — 사건을 놓친 앱이 다시 맞춘다)
@@ -201,6 +208,9 @@ pub struct Stats {
     /// 보내는 쪽 — RTX 로 다시 보낸 패킷 · 서버가 준 대역 상한(REMB) · 보낸 프레임 · 게이트가 닫혀 버린 프레임
     pub rtx_sent: u64,
     pub remb_bps: u64,
+    /// 대역 추정 목표(bps · 발행 연결 중 가장 큰 것) · 마지막 1초 창 손실률(TWCC — 천분율)
+    pub target_bps: u64,
+    pub send_loss_permille: u64,
     pub frames_sent: u64,
     pub frames_gated: u64,
     /// QA 스위치가 보내지 않은 영상 패킷(`OXPEER_QA_DROP_SEND_EVERY` — 시험 수단 · 평소 0)
@@ -212,19 +222,36 @@ pub struct LocalTrack {
     id: u64,
     pub room: String,
     pub track_id: String,
-    frames: mpsc::Sender<OutFrame>,
+    /// 발행 코덱 — 그 방의 미디어 코덱(연:RULE-PUB-PUBLISH-PROC — 앱은 이 꼴로 인코딩해 넣는다 · `opus` · `VP8` · `H264`)
+    pub codec: String,
+    /// 층마다 송신 통(시뮬캐스트가 아니면 하나)
+    frames: Vec<mpsc::Sender<OutFrame>>,
     cmd: mpsc::UnboundedSender<Cmd>,
 }
 
 impl LocalTrack {
-    /// 프레임 하나 — 통이 차면 기다린다(역압)
+    /// 프레임 하나 — 통이 차면 기다린다(역압) · 시뮬캐스트 트랙은 `write_layer` 로 넣는다
     pub async fn write(&self, f: OutFrame) -> Result<(), Error> {
-        self.frames.send(f).await.map_err(|_| Error::closed("CLOSED"))
+        if self.frames.len() != 1 {
+            return Err(Error::sdk("LAYER_REQUIRED", crate::error::Category::State));
+        }
+        self.frames[0].send(f).await.map_err(|_| Error::closed("CLOSED"))
+    }
+
+    /// 시뮬캐스트 층 하나(0 = `l` · 1 = `h`)에 프레임 하나 — 층마다 송신 시계가 따로다
+    pub async fn write_layer(&self, layer: u8, f: OutFrame) -> Result<(), Error> {
+        let tx = self.frames.get(usize::from(layer)).ok_or_else(|| Error::sdk("NO_SUCH_LAYER", crate::error::Category::State))?;
+        tx.send(f).await.map_err(|_| Error::closed("CLOSED"))
+    }
+
+    /// 층 수(시뮬캐스트면 2)
+    pub fn layers(&self) -> usize {
+        self.frames.len()
     }
 
     /// 넣은 프레임을 송신 시계가 다 내보낼 때까지 기다린다 — 발언을 놓기 전에 부른다(놓으면 게이트가 닫혀 통에 남은 것은 버려진다)
     pub async fn drain(&self) {
-        while self.frames.capacity() < self.frames.max_capacity() {
+        while self.frames.iter().any(|f| f.capacity() < f.max_capacity()) {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         // 통에서 꺼낸 마지막 프레임이 제 때를 기다리고 있을 수 있다 — 한 프레임 길이(넉넉히)
@@ -284,17 +311,28 @@ impl Frames {
 }
 
 impl Client {
-    /// 접속 — 세션이 ACTIVE 에 닿으면 돌아온다(SDK:IMPL-SES-API `connect`). 최초 접속의 토큰 요구 · 거절은 `Err`(auth)
-    pub async fn connect(cfg: Config) -> Result<(Client, Events, Media, Frames), Error> {
+    /// 만들기 — 유일한 생성 경로(SDK:api.md `createClient`) · 아직 붙지 않는다. SDK 루프는 앱이 `Client` 를 놓을 때 끝난다
+    pub fn create(cfg: Config) -> Result<(Client, Events, Media, Frames), Error> {
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let (media_tx, media_rx) = mpsc::channel(cfg.media_capacity.max(16));
         let (frames_tx, frames_rx) = mpsc::channel(cfg.frames_capacity.max(16));
         let cmd = core::spawn(cfg, ev_tx, media_tx, frames_tx)?;
-        let c = Client { cmd };
+        Ok((Client { cmd }, Events { rx: ev_rx }, Media { rx: media_rx }, Frames { rx: frames_rx }))
+    }
+
+    /// 접속 — 세션이 ACTIVE 에 닿으면 돌아온다(SDK:IMPL-SES-API `connect`). 최초 접속의 토큰 요구 · 거절은 `Err`(auth).
+    /// ★`close()` 뒤 · `Closed` 사건 뒤에 같은 객체로 다시 부를 수 있다 — 새 세션이다(방은 앱이 다시 `join` · SDK:ses.md `close()`)
+    pub async fn connect(&self) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
-        c.send(Cmd::Connect(tx))?;
-        rx.await.map_err(|_| Error::closed("CLOSED"))??;
-        Ok((c, Events { rx: ev_rx }, Media { rx: media_rx }, Frames { rx: frames_rx }))
+        self.send(Cmd::Connect(tx))?;
+        rx.await.map_err(|_| Error::closed("CLOSED"))?
+    }
+
+    /// 만들고 붙기(지름길) — `create` 다음 `connect`
+    pub async fn open(cfg: Config) -> Result<(Client, Events, Media, Frames), Error> {
+        let (c, e, m, f) = Client::create(cfg)?;
+        c.connect().await?;
+        Ok((c, e, m, f))
     }
 
     fn send(&self, c: Cmd) -> Result<(), Error> {
@@ -320,7 +358,7 @@ impl Client {
         self.send(Cmd::SetToken(token.into()))
     }
 
-    /// 끊기 — 위 입구 disconnect(방마다 따로 나가지 않는다) · 기다리지 않는다
+    /// 끊기 — 위 입구 disconnect(방마다 따로 나가지 않는다) · 기다리지 않는다 · 이 뒤 같은 객체로 `connect` 를 다시 부를 수 있다
     pub async fn close(&self) {
         let (tx, rx) = oneshot::channel();
         if self.send(Cmd::Close(tx)).is_ok() {
@@ -344,11 +382,12 @@ impl Client {
 
     /// 발행 — 서버가 받으면(`published`) 돌아온다. 전이중은 곧 보내고 · 반이중은 발언권 허가 사이에만 보낸다
     pub async fn publish(&self, room: &str, spec: TrackSpec) -> Result<LocalTrack, Error> {
-        let (ftx, frx) = mpsc::channel(crate::core::FRAME_QUEUE);
+        let n = if spec.simulcast { 2 } else { 1 };
+        let (ftx, frx): (Vec<_>, Vec<_>) = (0..n).map(|_| mpsc::channel(crate::core::FRAME_QUEUE)).unzip();
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Publish(room.to_string(), spec, frx, tx))?;
-        let (id, track_id) = rx.await.map_err(|_| Error::closed("CLOSED"))??;
-        Ok(LocalTrack { id, room: room.to_string(), track_id, frames: ftx, cmd: self.cmd.clone() })
+        let (id, track_id, codec) = rx.await.map_err(|_| Error::closed("CLOSED"))??;
+        Ok(LocalTrack { id, room: room.to_string(), track_id, codec, frames: ftx, cmd: self.cmd.clone() })
     }
 
     /// 발언 누름(SDK:IMPL-FLR-BUTTON `ptt.press`) — 위 입구에 닿으면 돌아온다 · 허가는 사건 `Ptt{granted}` 로

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use super::{Core, Job, Tk};
 use crate::api::{Event, LinkInfo, LinkState};
-use crate::generated::ws_wire::{IceRestartRes, MlineTable, Op, ServerConfig, TrackEntryType};
+use crate::generated::ws_wire::{IceRestartReq, IceRestartRes, MlineTable, Op, ServerConfig, TrackEntryType};
 use crate::generated::{link_binding as lb, link_client as lc, room_client as rc, sdk_defaults as dflt, session_client as sc, sub_client as uc};
 use crate::link::transport::{Creds, Fact, IceState, LinkFact, Role, Route, Routes, Source, Transport};
 use crate::sig::{Outcome, Purpose};
@@ -195,6 +195,7 @@ impl Core {
         let server = f.server.clone();
         match f.fact {
             Fact::Pli(ssrc) => self.pli_in(ssrc),
+            Fact::Bwe(bps) => self.emit(Event::TargetBitrate { server: server.clone(), bps }),
             Fact::Ice(s) => {
                 match f.role {
                     Role::Publish => l.ice_pub = Some(s),
@@ -489,7 +490,7 @@ impl Core {
                 lc::Tx::Heartbeat => self.ws_check(server),
                 lc::Tx::IceRestart => {
                     let req = self.links[server].st.req;
-                    self.request(Op::IceRestart, json!({ "sfu_id": server }), Purpose::IceRestart { server: server.to_string(), req });
+                    self.request(Op::IceRestart, super::to_body(&IceRestartReq { sfu_id: server.to_string() }), Purpose::IceRestart { server: server.to_string(), req });
                 }
             }
         }

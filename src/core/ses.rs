@@ -65,8 +65,14 @@ impl Core {
         for tx in self.connect_waiters.drain(..) {
             let _ = tx.send(Err(Error::closed("CLOSED")));
         }
+        let gone: Vec<(String, String)> = self.links.iter().map(|(k, l)| (k.clone(), l.st.ls.as_str().to_string())).collect();
+        for (server, ls) in gone {
+            self.record("LINK", &server, &ls, "-", "SDK.link_drop", "close");
+        }
         self.links.clear();
         self.timers = super::Timers::default();
+        // 프로세스 계수(운영 로그 `stat`)는 Client 가 사는 동안 계속 낸다 — 닫은 뒤에도 「아직 도는 것」을 줄로 가르게(context 202611/20261109e)
+        self.timers.start(super::Tk::LogStat, self.log.config().stat_interval);
         // 같은 객체로 다시 connect 하면 새 세션이다(SDK:ses.md `close()`) — 방 · 발행 · 소속 · 출처 대응은 이 세션의 것이라 비운다(방은 앱이 다시 join)
         self.rooms.clear();
         self.pubs.clear();
@@ -225,6 +231,7 @@ impl Core {
         if ok {
             self.user_id = body.get("user_id").and_then(Value::as_str).map(str::to_string);
             self.session_id = Some(sid);
+            self.log.bind(self.session_id.as_deref(), self.user_id.as_deref());
         } else {
             self.failure = Some(Error::from_failure(&body));
             self.reason = Some((0, "BIND_FAILED".into()));

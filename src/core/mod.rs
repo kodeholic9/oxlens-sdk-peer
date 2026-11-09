@@ -93,6 +93,8 @@ pub(crate) enum Tk {
     LinkStable(String),
     LinkCheck(String),
     LinkProbe(String),
+    /// 운영 로그 프로세스 계수(`stat`) 주기
+    LogStat,
 }
 
 #[derive(Default)]
@@ -206,6 +208,8 @@ pub(crate) struct Core {
     pub(crate) layer_gen: HashMap<String, u64>,
     /// 화자 출처 번호 → 사용자 — `TAKEN` 이 준다(연:RULE-FLR-SLOT-SOURCES · 번호는 트랙이 사는 동안 같다)
     pub(crate) talk_sources: BTreeMap<u32, String>,
+    /// 운영 로그
+    pub(crate) log: Arc<crate::log::Logger>,
     pub(crate) cert: Certificate,
     pub(crate) connect_waiters: Vec<oneshot::Sender<Result<(), Error>>>,
     /// ACTIVE 를 기다리는 입장(SDK:RULE-API-ASYNC 연결 전 요청)
@@ -240,7 +244,11 @@ pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::
     let (sock_tx, sock_rx) = mpsc::unbounded_channel();
     let (fact_tx, fact_rx) = mpsc::unbounded_channel();
     let (http_tx, http_rx) = mpsc::unbounded_channel();
+    // 운영 로그(SDK:RULE-PLAT-SERVER 「운영 로그」) — 기동 줄 하나(hub · sfud 와 같은 `spec` · `build`)
+    let log = crate::log::Logger::start(cfg.log.clone());
+    log.emit(crate::log::Line::new(crate::log::Kind::Ev).spec("SV-STATE-UNIT-STATE").key("build", concat!("oxpeer-", env!("CARGO_PKG_VERSION"))).msg("oxpeer boot"));
     let sink = MediaSink {
+        log: log.clone(),
         routes: Arc::default(),
         tx: media,
         frames,
@@ -254,7 +262,7 @@ pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::
         rtx_sent: Arc::new(AtomicU64::new(0)),
         #[cfg(feature = "record")]
         recorder: match cfg.record.clone() {
-            Some(rc) => Some(crate::record::Recorder::start(rc, ev.clone()).map_err(|e| Error::transport(format!("녹음 원시 기록: {e}")))?),
+            Some(rc) => Some(crate::record::Recorder::start(rc, ev.clone(), log.clone()).map_err(|e| Error::transport(format!("녹음 원시 기록: {e}")))?),
             None => None,
         },
         unrouted: Arc::new(AtomicU64::new(0)),
@@ -300,6 +308,7 @@ pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::
         ended: Vec::new(),
         link_gen: 0,
         trace: std::env::var_os("OXPEER_TRACE").is_some(),
+        log: log.clone(),
         diag: std::sync::Mutex::new(Vec::new()),
         pubs: BTreeMap::new(),
         pub_seq: 0,
@@ -312,6 +321,9 @@ pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::
         msg_seq: 0,
         join_mode: None,
     };
+    let mut core = core;
+    let every = core.log.config().stat_interval;
+    core.timers.start(Tk::LogStat, every);
     tokio::spawn(run(core, cmd_rx, int_rx, sock_rx, fact_rx, http_rx));
     Ok(cmd_tx)
 }
@@ -359,7 +371,57 @@ impl Core {
         if self.trace {
             eprintln!("[oxpeer] {layer} {key} {from}→{to} {label} ({cause})");
         }
+        self.log_transition(layer, key, from, Some(to), Some(label), cause);
         self.diag_send(layer, key, from, Some(to), Some(label), cause);
+    }
+
+    /// 전이 줄(운영:RULE-LOG-TRANSITION 꼴 — SDK:RULE-PLAT-SERVER 「운영 로그」) — 걸음마다 한 줄 · 받지 않는 사건은 `spec` · `to` 없이 `impossible=1`.
+    /// 방 단위 상태기(방 · 구독 · 트랙 · 발언권 — 열쇠가 방)는 `room` 을 싣는다(방으로 물을 때 사슬이 이어진다)
+    fn log_transition(&self, area: &str, key: &str, from: &str, to: Option<&str>, label: Option<&str>, cause: &str) {
+        let mut l = crate::log::Line::new(crate::log::Kind::Ev);
+        if let Some(sp) = label {
+            l = l.spec(sp);
+        }
+        if matches!(area, "ROOM" | "SUB" | "TRK" | "FLR") {
+            l = l.corr("room", key);
+        }
+        l = l.key("area", area).key("key", key).key("from", from);
+        if let Some(t) = to {
+            l = l.key("to", t);
+        }
+        l = l.key("cause", cause);
+        if to.is_none() {
+            l = l.key("impossible", 1);
+        }
+        self.log.emit(l);
+    }
+
+    /// 프로세스 계수(운영 `stat` — `proc=peer` 프로세스 줄) — 「닫았는데 아직 도는 것」을 줄 하나로 가른다(links · dtls_open · cpu_time_ms)
+    pub(crate) fn log_stat(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (cpu, rss) = crate::log::rusage().unwrap_or((0, 0));
+        let s = &self.sink;
+        #[cfg_attr(not(feature = "record"), allow(unused_mut))]
+        let mut l = crate::log::Line::new(crate::log::Kind::Stat)
+            .key("cpu_time_ms", cpu)
+            .key("max_rss_bytes", rss)
+            .key("links", crate::link::transport::LINKS_ALIVE.load(Relaxed))
+            .key("dtls_open", crate::link::transport::DTLS_OPEN.load(Relaxed))
+            .key("media_dropped", s.dropped.load(Relaxed))
+            .key("frames_dropped", s.frames_dropped.load(Relaxed))
+            .key("decrypt_fail", s.decrypt_fail.load(Relaxed))
+            .key("media_unrouted", s.unrouted.load(Relaxed));
+        #[cfg(feature = "record")]
+        if let Some(r) = &s.recorder {
+            let st = r.stat();
+            l = l.key("record_parts", st.parts).key("record_subscribers", st.subscribers).key("record_degraded", st.degraded).key("record_stopped", u8::from(st.stopped));
+            if let Some(f) = st.disk_free {
+                l = l.key("disk_free_bytes", f);
+            }
+        }
+        self.log.emit(l);
+        let every = self.log.config().stat_interval;
+        self.timers.start(Tk::LogStat, every);
     }
 
     /// 받지 않는 사건 — 조용히 무시하지 않는다(SDK:IMPL-LINK-PROJECTION 받지 않는 사건) · 전이 통에도 `impossible` 로 낸다
@@ -367,6 +429,7 @@ impl Core {
         if self.trace {
             eprintln!("[oxpeer] {layer} {key} {from} — 입구 {entry} 를 받지 않는다");
         }
+        self.log_transition(layer, key, from, None, None, entry);
         self.diag_send(layer, key, from, None, None, entry);
     }
 
@@ -547,7 +610,7 @@ impl Core {
                 self.link_event(&server, &ufrag);
             }
             Op::Message => self.message_in(body),
-            _ => self.record("SES", "notify", "-", "-", op_name(op), "모르는 통지 — ACK 만 했다"),
+            _ => self.record("SES", "notify", "-", "-", "SDK.notify_ack", op_name(op)),
         }
     }
 
@@ -580,6 +643,7 @@ impl Core {
             Tk::LinkStable(s) => self.link_stable(&s),
             Tk::LinkCheck(s) => self.link_check_send(&s),
             Tk::LinkProbe(s) => self.link_probe_due(&s),
+            Tk::LogStat => self.log_stat(),
         }
     }
 

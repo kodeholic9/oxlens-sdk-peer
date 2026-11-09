@@ -436,6 +436,16 @@ impl Stream {
     }
 }
 
+/// 줄 하나의 수신 계수
+pub(crate) struct RowStat {
+    pub ssrc: u32,
+    pub room: String,
+    pub track_id: String,
+    pub received: u64,
+    pub lost: i64,
+    pub jitter_s: f64,
+}
+
 /// 전송 하나의 정리층
 pub(crate) struct Recv {
     me: u32,
@@ -526,6 +536,20 @@ impl Recv {
         if let Some(s) = self.streams.get_mut(&ssrc) {
             s.sr = Some(Sr { ntp, rtp, at: now });
         }
+    }
+
+    /// 받는 줄마다 수신 계수(운영 로그 `stat` 수신 줄 — W3C `packetsReceived` · `packetsLost` · `jitter`(초)) — 줄 번호 차례
+    pub(crate) fn stats(&self) -> Vec<RowStat> {
+        let mut v: Vec<RowStat> = self
+            .streams
+            .iter()
+            .map(|(k, s)| {
+                let expected = s.highest.saturating_sub(s.first) + 1;
+                RowStat { ssrc: *k, room: s.route.room.clone(), track_id: s.route.track_id.clone(), received: s.received, lost: expected as i64 - s.received as i64, jitter_s: s.jitter / f64::from(s.clock.max(1)) }
+            })
+            .collect();
+        v.sort_by_key(|x| x.ssrc);
+        v
     }
 
     /// 경로표에서 빠진 줄 · 다른 트랙이 실린 줄의 상태를 버린다

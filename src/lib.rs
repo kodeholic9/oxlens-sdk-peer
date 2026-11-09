@@ -21,6 +21,7 @@ mod error;
 mod generated;
 mod http;
 mod link;
+pub mod log;
 #[cfg(feature = "record")]
 pub mod record;
 mod sig;

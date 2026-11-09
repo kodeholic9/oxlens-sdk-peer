@@ -30,6 +30,8 @@ pub struct Config {
     /// 녹음 원시 기록(SDK:RULE-PLAT-REC-TAP) — 주면 받는 줄 전부의 정리층 출구 RTP 와 제어 사건을 MCAP 파트에 적는다
     #[cfg(feature = "record")]
     pub record: Option<crate::record::RecordConfig>,
+    /// 운영 로그(SDK:RULE-PLAT-SERVER 「운영 로그」) — 기본은 켬 · 표준 출력 · 같은 장비면 `socket` 에 hub 로거 소켓
+    pub log: crate::log::LogConfig,
 }
 
 impl Config {
@@ -43,6 +45,7 @@ impl Config {
             unit: Unit::Packet,
             #[cfg(feature = "record")]
             record: None,
+            log: crate::log::LogConfig::default(),
         }
     }
 }

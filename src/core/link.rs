@@ -599,6 +599,8 @@ impl Core {
             self.link_step(server, "applied", st, "nego");
         }
         if ls == lc::LinkSt::NONE && prev.ls != lc::LinkSt::NONE {
+            // 사슬의 끝 줄(운영:RULE-LOG-TRANSITION 「마지막 줄은 소멸 to=-」) — 같은 서버 연결을 다시 만들면 새 사슬이 `from=-` 로 선다
+            self.record("LINK", server, ls.as_str(), "-", "SDK.link_drop", "close");
             self.links.remove(server);
             self.timers.stop_where(|t| matches!(t, Tk::LinkGrace(x) | Tk::LinkApply(x) | Tk::LinkReopenTry(x) | Tk::LinkReopenJudge(x) | Tk::LinkStable(x) | Tk::LinkCheck(x) | Tk::LinkProbe(x) if *x == s));
             self.rebuild_routes();

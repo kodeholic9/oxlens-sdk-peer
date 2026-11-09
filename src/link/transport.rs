@@ -176,6 +176,8 @@ pub(crate) struct MediaSink {
     /// 녹음 원시 기록(SDK:RULE-PLAT-REC-TAP) — 정리층 출구 · SR 을 여기 직접 적는다
     #[cfg(feature = "record")]
     pub recorder: Option<Arc<crate::record::Recorder>>,
+    /// 운영 로그(SDK:RULE-PLAT-SERVER 「운영 로그」) — 전송로 수명 진단 · 받는 줄마다 수신 계수
+    pub log: Arc<crate::log::Logger>,
     /// 경로표에 없는 ssrc 로 온 패킷 수
     pub unrouted: Arc<AtomicU64>,
     pub decrypt_fail: Arc<AtomicU64>,
@@ -328,6 +330,8 @@ enum Inner {
 #[allow(clippy::too_many_arguments)]
 async fn run(server: SocketAddr, mut creds: Creds, cert: Certificate, role: Role, say: Say, sink: MediaSink, mut ctl: mpsc::UnboundedReceiver<Ctl>, tasks: Arc<Mutex<Vec<AbortHandle>>>, out: Arc<OnceLock<PubOut>>) -> Result<(), String> {
     let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await.map_err(|e| format!("UDP bind: {e}"))?);
+    LINKS_ALIVE.fetch_add(1, Ordering::Relaxed);
+    let _alive = LinkAlive { log: sink.log.clone(), server, role };
     let (inner_tx, mut inner_rx) = mpsc::unbounded_channel::<Inner>();
     let (dtls_tx, dtls_rx) = mpsc::channel::<Vec<u8>>(256);
     let rx_ctx: Arc<OnceLock<Mutex<Context>>> = Arc::default();
@@ -346,6 +350,7 @@ async fn run(server: SocketAddr, mut creds: Creds, cert: Certificate, role: Role
         rv.record = sink2.recording();
         let mut tick = tokio::time::interval(RECV_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut stat_at = Instant::now();
         loop {
             tokio::select! {
                 r = s2.recv_from(&mut buf) => {
@@ -369,6 +374,13 @@ async fn run(server: SocketAddr, mut creds: Creds, cert: Certificate, role: Role
                     }
                 }
                 _ = tick.tick() => {
+                    // 받는 줄마다 수신 계수(운영 `stat` — W3C 이름) · 주기는 운영 로그 `stat_interval`
+                    if stat_at.elapsed() >= sink2.log.config().stat_interval {
+                        stat_at = Instant::now();
+                        for x in rv.stats() {
+                            sink2.log.emit(crate::log::Line::new(crate::log::Kind::Stat).corr("room", &x.room).corr("track", &x.track_id).corr("ssrc", x.ssrc).key("packets_received", x.received).key("packets_lost", x.lost).key("jitter", format!("{:.6}", x.jitter_s)));
+                        }
+                    }
                     let live = sink2.routes.read().map(|g| g.media.iter().map(|(k, r)| (*k, r.track_id.clone())).collect::<HashMap<u32, String>>()).unwrap_or_default();
                     rv.retain(|k, t| live.get(&k).is_some_and(|x| x == t));
                     let (outs, rtcp) = rv.tick(Instant::now());
@@ -446,7 +458,9 @@ async fn run(server: SocketAddr, mut creds: Creds, cert: Certificate, role: Role
                     };
                     let _ = tx_ctx.set(Mutex::new(tx));
                     let _ = rx_ctx.set(Mutex::new(rx));
-                    _dtls_guard = Some(DtlsGuard(conn.clone()));
+                    DTLS_OPEN.fetch_add(1, Ordering::Relaxed);
+                    _dtls_guard = Some(DtlsGuard(conn.clone(), sink.log.clone()));
+                    sink.log.emit(crate::log::Line::new(crate::log::Kind::Diag).key("server", server).key("role", role_name(role)).msg("transport up"));
                     say.send(Fact::Dtls(true));
                     if role == Role::Publish {
                         let (stx, srx) = mpsc::unbounded_channel();
@@ -705,15 +719,39 @@ async fn handshake(sock: Arc<UdpSocket>, server: SocketAddr, rx: mpsc::Receiver<
     Ok((dtls, tx, rx))
 }
 
-/// 전송로 수명에 묶인 DTLS 닫기 — 놓일 때(전송로 끝 · abort) `close()` 를 띄운다(Drop 은 기다릴 수 없다)
-struct DtlsGuard(Arc<DTLSConn>);
+/// 프로세스의 살아 있는 전송로 · 닫히지 않은 DTLS 수 — 운영 로그 `stat` 의 `links` · `dtls_open`(같은 프로세스의 Client 를 다 합친다)
+pub(crate) static LINKS_ALIVE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DTLS_OPEN: AtomicU64 = AtomicU64::new(0);
+
+/// 전송로 하나가 산 동안 — 놓이면(돌아가든 abort 되든) 줄이고 진단 한 줄
+struct LinkAlive {
+    log: Arc<crate::log::Logger>,
+    server: SocketAddr,
+    role: Role,
+}
+
+impl Drop for LinkAlive {
+    fn drop(&mut self) {
+        LINKS_ALIVE.fetch_sub(1, Ordering::Relaxed);
+        self.log.emit(crate::log::Line::new(crate::log::Kind::Diag).key("server", self.server).key("role", role_name(self.role)).msg("transport down"));
+    }
+}
+
+fn role_name(r: Role) -> &'static str {
+    if r == Role::Publish { "publish" } else { "subscribe" }
+}
+
+/// 전송로 수명에 묶인 DTLS 닫기 — 놓일 때(전송로 끝 · abort) `close()` 를 띄운다(Drop 은 기다릴 수 없다) · 닫히면 `dtls_open` 을 줄인다
+struct DtlsGuard(Arc<DTLSConn>, Arc<crate::log::Logger>);
 
 impl Drop for DtlsGuard {
     fn drop(&mut self) {
-        let c = self.0.clone();
+        let (c, log) = (self.0.clone(), self.1.clone());
         if let Ok(h) = tokio::runtime::Handle::try_current() {
             h.spawn(async move {
-                let _ = c.close().await;
+                let r = c.close().await;
+                DTLS_OPEN.fetch_sub(1, Ordering::Relaxed);
+                log.emit(crate::log::Line::new(crate::log::Kind::Diag).key("result", if r.is_ok() { "ok" } else { "error" }).msg("dtls closed"));
             });
         }
     }

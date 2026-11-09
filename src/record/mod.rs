@@ -165,7 +165,10 @@ struct Inner {
     subs: Vec<Sub>,
     /// 꼬리 읽기로 갈아탄 통 — 기록기가 닫힐 때 알린다
     tailing: Vec<Arc<Shared>>,
+    /// 꼬리 읽기로 갈아탄 통 누계(운영 `stat` `record_degraded`)
+    degraded: u64,
     ev: mpsc::UnboundedSender<Event>,
+    log: Arc<crate::log::Logger>,
 }
 
 struct Part {
@@ -193,6 +196,16 @@ impl Snap {
     }
 }
 
+/// 녹음 계수(운영 로그 `stat`)
+#[derive(Default)]
+pub(crate) struct RecStat {
+    pub parts: u32,
+    pub subscribers: usize,
+    pub degraded: u64,
+    pub stopped: bool,
+    pub disk_free: Option<u64>,
+}
+
 /// 라이브 통 하나(지점 ① — SDK:RULE-PLAT-REC-API)
 struct Sub {
     tx: mpsc::Sender<Record>,
@@ -201,13 +214,13 @@ struct Sub {
 
 impl Recorder {
     /// 만들기 — 원시 기록을 켰으면 첫 파트는 첫 레코드에서 연다 · `tick` 태스크를 띄운다(기록기가 사라지면 끝난다)
-    pub(crate) fn start(cfg: RecordConfig, ev: mpsc::UnboundedSender<Event>) -> std::io::Result<Arc<Recorder>> {
+    pub(crate) fn start(cfg: RecordConfig, ev: mpsc::UnboundedSender<Event>, log: Arc<crate::log::Logger>) -> std::io::Result<Arc<Recorder>> {
         if let Some(d) = &cfg.dir {
             fs::create_dir_all(d)?;
         }
         let anchor_ns = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
         let tick = cfg.tick;
-        let r = Arc::new(Recorder { inner: Mutex::new(Inner { cfg, anchor_ns, mono0: Instant::now(), seq: 0, part_no: 0, prev_last: None, part: None, last_flush: anchor_ns, stopped: false, closed: false, snap: Snap::default(), subs: Vec::new(), tailing: Vec::new(), ev }) });
+        let r = Arc::new(Recorder { inner: Mutex::new(Inner { cfg, anchor_ns, mono0: Instant::now(), seq: 0, part_no: 0, prev_last: None, part: None, last_flush: anchor_ns, stopped: false, closed: false, snap: Snap::default(), subs: Vec::new(), tailing: Vec::new(), degraded: 0, ev, log }) });
         let weak: Weak<Recorder> = Arc::downgrade(&r);
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(tick);
@@ -251,6 +264,12 @@ impl Recorder {
             st.tick = g.cfg.tick;
         }
         g.subs.push(Sub { tx, shared });
+    }
+
+    /// 운영 로그 프로세스 줄의 녹음 계수
+    pub(crate) fn stat(&self) -> RecStat {
+        let Ok(g) = self.inner.lock() else { return RecStat::default() };
+        RecStat { parts: g.part_no, subscribers: g.subs.len() + g.tailing.len(), degraded: g.degraded, stopped: g.stopped, disk_free: g.cfg.dir.as_deref().and_then(free_bytes) }
     }
 
     pub(crate) fn close(&self) {
@@ -368,6 +387,7 @@ impl Inner {
         let tail_ok = self.cfg.dir.is_some() && !self.stopped && self.part.is_some();
         let part_now = self.part_no.saturating_sub(1);
         let ev = self.ev.clone();
+        let log = self.log.clone();
         let mut tailing = Vec::new();
         self.subs.retain(|s| match s.tx.try_send(r.clone()) {
             Ok(()) => true,
@@ -377,14 +397,17 @@ impl Inner {
                     if tail_ok {
                         st.degraded = Some((r.sequence, part_now));
                         tailing.push(s.shared.clone());
+                        log.emit(crate::log::Line::new(crate::log::Kind::Diag).spec("SD-RULE-PLAT-REC-API").key("in.from_sequence", r.sequence).key("in.part", part_now).msg("live record consumer overflowed - tail read from raw part"));
                     } else {
                         st.stopped = true;
                         let _ = ev.send(Event::RecordConsumerStopped { reason: "overflow".into() });
+                        log.emit(crate::log::Line::new(crate::log::Kind::Diag).spec("SD-RULE-PLAT-REC-API").key("in.from_sequence", r.sequence).msg("live record consumer overflowed without raw parts - stopped"));
                     }
                 }
                 false
             }
         });
+        self.degraded += tailing.len() as u64;
         self.tailing.extend(tailing);
     }
 
@@ -418,6 +441,7 @@ impl Inner {
             return false;
         }
         self.part = Some(Part { w, file, channels: HashMap::new(), start: t, bytes: 0, last_seq: None });
+        self.log.emit(crate::log::Line::new(crate::log::Kind::Diag).spec("SD-RULE-PLAT-REC-PART").key("in.part", self.part_no).key("in.prev_last_sequence", self.prev_last.map(|x| x.to_string()).unwrap_or_default()).msg("raw part opened"));
         self.part_no += 1;
         // 파트 머리 스냅숏(REC-PART) — 트랙 · 발언권 · 세션 · SR
         let head: Vec<(Channel, Vec<u8>)> = self.snap.all().into_iter().map(|r| (r.channel.clone(), r.data.clone())).collect();
@@ -441,6 +465,7 @@ impl Inner {
     fn stop(&mut self) {
         self.close_part("disk_low");
         self.stopped = true;
+        self.log.emit(crate::log::Line::new(crate::log::Kind::Diag).level(crate::log::Level::Warn).spec("SD-RULE-PLAT-REC-PART").key("in.min_free_bytes", self.cfg.min_free_bytes).msg("raw recording stopped - disk low or part not writable"));
         let _ = self.ev.send(Event::RecordStopped { reason: "disk_low".into() });
     }
 
@@ -457,6 +482,7 @@ impl Inner {
         let _ = bw.flush();
         let _ = bw.get_ref().sync_all();
         self.prev_last = p.last_seq.or(self.prev_last);
+        self.log.emit(crate::log::Line::new(crate::log::Kind::Diag).spec("SD-RULE-PLAT-REC-PART").key("in.reason", reason).key("in.last_sequence", p.last_seq.map(|x| x.to_string()).unwrap_or_default()).key("in.bytes", p.bytes).msg("raw part closed"));
     }
 }
 

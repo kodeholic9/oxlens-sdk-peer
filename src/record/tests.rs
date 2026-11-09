@@ -10,6 +10,10 @@ use std::sync::Arc;
 
 use super::*;
 
+fn quiet() -> Arc<crate::log::Logger> {
+    crate::log::Logger::start(crate::log::LogConfig { enabled: false, ..crate::log::LogConfig::default() })
+}
+
 fn tmp(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("oxpeer-rec-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -41,7 +45,7 @@ fn all(dir: &Path) -> (Vec<Record>, Vec<PartScan>) {
 async fn roundtrip_keeps_order_sequence_and_time() {
     let d = tmp("rt");
     let (ev, _rx) = mpsc::unbounded_channel();
-    let r = Recorder::start(cfg(&d), ev).unwrap();
+    let r = Recorder::start(cfg(&d), ev, quiet()).unwrap();
     r.track("room1", serde_json::json!({ "room": "room1", "tracks": [], "rows": {} }));
     for s in 0..50u16 {
         r.push(Channel::Rtp(1000 + (s % 2) as u32), rtp(s));
@@ -69,7 +73,7 @@ async fn roundtrip_keeps_order_sequence_and_time() {
 async fn same_track_list_is_written_once() {
     let d = tmp("tr");
     let (ev, _rx) = mpsc::unbounded_channel();
-    let r = Recorder::start(cfg(&d), ev).unwrap();
+    let r = Recorder::start(cfg(&d), ev, quiet()).unwrap();
     let b = serde_json::json!({ "room": "a", "tracks": [], "rows": { "5": "t1" } });
     r.track("a", b.clone());
     r.track("a", b);
@@ -85,7 +89,7 @@ async fn rotation_by_size_chains_parts_and_repeats_head_snapshot() {
     let (ev, _rx) = mpsc::unbounded_channel();
     let mut c = cfg(&d);
     c.part_bytes = 2_000;
-    let r = Recorder::start(c, ev).unwrap();
+    let r = Recorder::start(c, ev, quiet()).unwrap();
     r.track("room1", serde_json::json!({ "room": "room1", "tracks": [], "rows": {} }));
     r.push(Channel::Floor, br#"{"room":"room1","event":"taken","user_id":"u1","sources":[7],"seq":3}"#.to_vec());
     r.push(Channel::Sr, br#"{"ssrc":1000,"ntp":9,"rtp":8}"#.to_vec());
@@ -122,7 +126,7 @@ async fn rotation_by_time() {
     let (ev, _rx) = mpsc::unbounded_channel();
     let mut c = cfg(&d);
     c.part_time = Duration::from_millis(30);
-    let r = Recorder::start(c, ev).unwrap();
+    let r = Recorder::start(c, ev, quiet()).unwrap();
     for s in 0..4u16 {
         r.push(Channel::Rtp(1), rtp(s));
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -139,7 +143,7 @@ async fn unclosed_part_reads_up_to_last_flushed_chunk() {
     let (ev, _rx) = mpsc::unbounded_channel();
     let mut c = cfg(&d);
     c.flush = Duration::ZERO;
-    let r = Recorder::start(c, ev).unwrap();
+    let r = Recorder::start(c, ev, quiet()).unwrap();
     for s in 0..10u16 {
         r.push(Channel::Rtp(1), rtp(s));
     }
@@ -164,7 +168,7 @@ async fn disk_low_stops_with_event() {
     let (ev, mut rx) = mpsc::unbounded_channel();
     let mut c = cfg(&d);
     c.min_free_bytes = u64::MAX;
-    let r = Recorder::start(c, ev).unwrap();
+    let r = Recorder::start(c, ev, quiet()).unwrap();
     r.push(Channel::Rtp(1), rtp(0));
     r.push(Channel::Rtp(1), rtp(1));
     match rx.try_recv() {
@@ -324,7 +328,7 @@ async fn live_tap_equals_file_records() {
     let (ev, _rx) = mpsc::unbounded_channel();
     let mut c = cfg(&d);
     c.part_bytes = 300;
-    let r = Recorder::start(c, ev).unwrap();
+    let r = Recorder::start(c, ev, quiet()).unwrap();
     let (tx, rx) = mpsc::channel(10_000);
     let shared = Arc::new(Shared::default());
     r.subscribe(tx, shared.clone());
@@ -350,7 +354,7 @@ async fn overflow_downgrades_to_tail_read_without_loss_or_duplicates() {
     c.part_bytes = 3_000;
     c.flush = Duration::ZERO;
     c.tick = Duration::from_millis(20);
-    let r = Recorder::start(c, ev).unwrap();
+    let r = Recorder::start(c, ev, quiet()).unwrap();
     let (tx, rx) = mpsc::channel(16);
     let shared = Arc::new(Shared::default());
     r.subscribe(tx, shared.clone());
@@ -385,7 +389,7 @@ async fn overflow_without_raw_stops_with_event() {
     let (ev, mut evs) = mpsc::unbounded_channel();
     let mut c = RecordConfig::live("live");
     c.tick = Duration::from_secs(3_600);
-    let r = Recorder::start(c, ev).unwrap();
+    let r = Recorder::start(c, ev, quiet()).unwrap();
     let (tx, rx) = mpsc::channel(16);
     let shared = Arc::new(Shared::default());
     r.subscribe(tx, shared.clone());
@@ -407,7 +411,7 @@ async fn closed_recorder_takes_nothing_and_opens_no_new_part() {
     // 닫힌 뒤 tick 이 밀어 넣어도 새 파트를 열지 않는다(꼬리 읽기가 끝을 볼 수 있게 — 20261109d 에서 드러남)
     let d = tmp("closed");
     let (ev, _rx) = mpsc::unbounded_channel();
-    let r = Recorder::start(cfg(&d), ev).unwrap();
+    let r = Recorder::start(cfg(&d), ev, quiet()).unwrap();
     r.push(Channel::Rtp(1), rtp(0));
     r.close();
     r.push(Channel::Tick, b"{}".to_vec());
@@ -423,7 +427,7 @@ async fn late_subscriber_gets_current_state_first() {
     let (ev, _rx) = mpsc::unbounded_channel();
     let mut c = RecordConfig::live("late");
     c.tick = Duration::from_secs(3_600);
-    let r = Recorder::start(c, ev).unwrap();
+    let r = Recorder::start(c, ev, quiet()).unwrap();
     let recs = stream();
     for x in &recs[..2] {
         r.push(x.channel.clone(), x.data.clone());

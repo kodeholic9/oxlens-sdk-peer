@@ -574,7 +574,8 @@ impl Core {
                 st.rebind(mid.clone());
             }
         }
-        self.record("PUB", &id.to_string(), &old, &server, "rebind", "server");
+        // 발행을 다른 서버로 옮김 — 발행 상태가 바뀐 걸음이 아니라 판단이다(전이 줄에 서버 ID 를 상태로 적지 않는다 · context 202611/20261109e 판정기가 짚음)
+        self.log.emit(crate::log::Line::new(crate::log::Kind::Diag).spec("SD-IMPL-PUB-API").key("in.publish", id).key("in.from_server", &old).key("in.to_server", &server).msg("publish rebound to another server"));
     }
 
     /// 그 서버 연결이 닫혔다(drop) · 재구축으로 다시 섰다(reregister) — 위 이음매 pub.drop_server · pub.reregister_server

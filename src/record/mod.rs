@@ -1,13 +1,21 @@
 // author: kodeholic (powered by Claude)
 //! 녹음 원시 기록(SDK:RULE-PLAT-REC-TAP · REC-RAW · REC-CLOCK · REC-PART · context 202611/20261109c) — 정리층 출구의 RTP 원본과 그 시점의 제어 사건을
-//! 받은 차례대로 MCAP 파트에 적는다. 이 판(단계 1)은 기록기와 다시 읽기(`FileSource`)까지다 — 조립 · 분할 · Sink 는 다음 단계가 이 레코드 위에 짓는다.
+//! 받은 차례대로 MCAP 파트에 적고(켰으면) 라이브 통(지점 ①)에 나눈다. 그 위에 파이프라인(분기 · 조립 · 시간축 · 분할 — REC-PIPE · REC-SPLIT)이
+//! 프레임(지점 ②) · 세그먼트 사건(지점 ③)을 내고, 내장 결과물(`OggSink`)도 그 둘만 쓴다(REC-API).
 //!
 //! 채취는 직접 소유다 — 정리층이 `Out::Raw` · `Out::Gap` 을 내면 `deliver` 가 `MediaSink` 가 쥔 기록기를 부르고, core 는 사건을 낼 때 같은 기록기를 부른다.
 //! `sequence` · `log_time` 은 기록기 잠금 안 한 곳에서 매긴다(REC-CLOCK) — 그래서 파일 차례로 둘 다 오른다.
 
 mod file;
+mod live;
+mod ogg;
+mod pipeline;
 
 pub use file::{FileSource, PartScan, scan_part};
+pub(crate) use live::Shared;
+pub use live::Records;
+pub use ogg::{OggFile, OggSink, opus_samples};
+pub use pipeline::{Frame, Output, Pipeline, Policy, Segment, SegmentKind};
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
@@ -40,8 +48,8 @@ pub enum Compression {
 /// 녹음 설정(SDK:RULE-PLAT-REC-PART 손잡이)
 #[derive(Clone, Debug)]
 pub struct RecordConfig {
-    /// 파트를 둘 디렉터리
-    pub dir: PathBuf,
+    /// 파트를 둘 디렉터리 — 없으면 원시 기록 없이 라이브 통만(SDK:RULE-PLAT-REC-API 「원시 기록을 끈 구성」)
+    pub dir: Option<PathBuf>,
     /// 녹음 세션 ID — 파트 이름 `<recording_id>-<파트 4자리>.mcap`
     pub recording_id: String,
     /// 파트 크기 S · 시간 T — 먼저 닿는 쪽에서 회전
@@ -60,8 +68,13 @@ pub struct RecordConfig {
 
 impl RecordConfig {
     pub fn new(dir: impl Into<PathBuf>, recording_id: impl Into<String>) -> RecordConfig {
+        RecordConfig { dir: Some(dir.into()), ..RecordConfig::live(recording_id) }
+    }
+
+    /// 원시 파트 없이 라이브 통만
+    pub fn live(recording_id: impl Into<String>) -> RecordConfig {
         RecordConfig {
-            dir: dir.into(),
+            dir: None,
             recording_id: recording_id.into(),
             part_bytes: 1 << 30,
             part_time: Duration::from_secs(3_600),
@@ -144,8 +157,14 @@ struct Inner {
     prev_last: Option<u32>,
     part: Option<Part>,
     last_flush: u64,
+    /// 원시 기록이 멈췄다(디스크 하한) — 라이브 통은 계속 받는다
     stopped: bool,
+    /// 닫혔다 — 그 뒤 레코드는 받지 않는다(tick 이 새 파트를 열지 않게)
+    closed: bool,
     snap: Snap,
+    subs: Vec<Sub>,
+    /// 꼬리 읽기로 갈아탄 통 — 기록기가 닫힐 때 알린다
+    tailing: Vec<Arc<Shared>>,
     ev: mpsc::UnboundedSender<Event>,
 }
 
@@ -162,19 +181,33 @@ struct Part {
 /// 파트 머리 스냅숏 재료(REC-PART) — 방마다 마지막 트랙 목록 · 발언권 · 마지막 세션 · 연결 사건 · 줄마다 마지막 SR
 #[derive(Default)]
 struct Snap {
-    track: BTreeMap<String, Vec<u8>>,
-    floor: BTreeMap<String, Vec<u8>>,
-    session: BTreeMap<String, Vec<u8>>,
-    sr: BTreeMap<u32, Vec<u8>>,
+    track: BTreeMap<String, Record>,
+    floor: BTreeMap<String, Record>,
+    session: BTreeMap<String, Record>,
+    sr: BTreeMap<u32, Record>,
+}
+
+impl Snap {
+    fn all(&self) -> Vec<&Record> {
+        self.track.values().chain(self.floor.values()).chain(self.session.values()).chain(self.sr.values()).collect()
+    }
+}
+
+/// 라이브 통 하나(지점 ① — SDK:RULE-PLAT-REC-API)
+struct Sub {
+    tx: mpsc::Sender<Record>,
+    shared: Arc<Shared>,
 }
 
 impl Recorder {
-    /// 만들기 — 첫 파트는 첫 레코드에서 연다 · `tick` 태스크를 띄운다(기록기가 사라지면 끝난다)
+    /// 만들기 — 원시 기록을 켰으면 첫 파트는 첫 레코드에서 연다 · `tick` 태스크를 띄운다(기록기가 사라지면 끝난다)
     pub(crate) fn start(cfg: RecordConfig, ev: mpsc::UnboundedSender<Event>) -> std::io::Result<Arc<Recorder>> {
-        fs::create_dir_all(&cfg.dir)?;
+        if let Some(d) = &cfg.dir {
+            fs::create_dir_all(d)?;
+        }
         let anchor_ns = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
         let tick = cfg.tick;
-        let r = Arc::new(Recorder { inner: Mutex::new(Inner { cfg, anchor_ns, mono0: Instant::now(), seq: 0, part_no: 0, prev_last: None, part: None, last_flush: anchor_ns, stopped: false, snap: Snap::default(), ev }) });
+        let r = Arc::new(Recorder { inner: Mutex::new(Inner { cfg, anchor_ns, mono0: Instant::now(), seq: 0, part_no: 0, prev_last: None, part: None, last_flush: anchor_ns, stopped: false, closed: false, snap: Snap::default(), subs: Vec::new(), tailing: Vec::new(), ev }) });
         let weak: Weak<Recorder> = Arc::downgrade(&r);
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(tick);
@@ -188,7 +221,7 @@ impl Recorder {
         Ok(r)
     }
 
-    /// 레코드 하나를 적는다 — 순번 · 시각을 여기서 매긴다(REC-CLOCK)
+    /// 레코드 하나 — 순번 · 시각을 여기서 매긴다(REC-CLOCK)
     pub(crate) fn push(&self, ch: Channel, data: Vec<u8>) {
         let Ok(mut g) = self.inner.lock() else { return };
         g.push(ch, data);
@@ -198,15 +231,39 @@ impl Recorder {
     pub(crate) fn track(&self, room: &str, body: Value) {
         let Ok(mut g) = self.inner.lock() else { return };
         let data = body.to_string().into_bytes();
-        if g.snap.track.get(room) == Some(&data) {
+        if g.snap.track.get(room).is_some_and(|r| r.data == data) {
             return;
         }
         g.push(Channel::Track, data);
     }
 
+    /// 라이브 통을 붙인다 — ★지금 해석 상태(트랙 · 발언권 · 세션 · SR 의 마지막 레코드 — 원래 순번 · 시각 그대로)를 먼저 넣고 그 뒤 레코드 전량.
+    /// 늦게 연 통도 줄 → 트랙 · 출처를 안다(파트 머리 스냅숏과 같은 생각 · SDK:RULE-PLAT-REC-API)
+    pub(crate) fn subscribe(&self, tx: mpsc::Sender<Record>, shared: Arc<Shared>) {
+        let Ok(mut g) = self.inner.lock() else { return };
+        let mut head: Vec<Record> = g.snap.all().into_iter().cloned().collect();
+        head.sort_by_key(|r| r.sequence);
+        for r in head {
+            let _ = tx.try_send(r);
+        }
+        if let Ok(mut st) = shared.state.lock() {
+            st.raw = g.cfg.dir.clone().map(|d| (d, g.cfg.recording_id.clone()));
+            st.tick = g.cfg.tick;
+        }
+        g.subs.push(Sub { tx, shared });
+    }
+
     pub(crate) fn close(&self) {
         if let Ok(mut g) = self.inner.lock() {
+            g.closed = true;
             g.close_part("close");
+            let mut all: Vec<Arc<Shared>> = g.subs.drain(..).map(|s| s.shared).collect();
+            all.append(&mut g.tailing);
+            for s in all {
+                if let Ok(mut st) = s.state.lock() {
+                    st.closed = true;
+                }
+            }
         }
     }
 }
@@ -223,21 +280,22 @@ impl Inner {
     }
 
     fn push(&mut self, ch: Channel, data: Vec<u8>) {
-        if self.stopped {
+        if self.closed {
             return;
         }
         let t = self.now();
-        if let Some(p) = &self.part
-            && (p.bytes >= self.cfg.part_bytes || t.saturating_sub(p.start) >= self.cfg.part_time.as_nanos() as u64)
-        {
-            let why = if p.bytes >= self.cfg.part_bytes { "size" } else { "time" };
-            self.close_part(why);
+        if self.cfg.dir.is_some() && !self.stopped {
+            if let Some(p) = &self.part
+                && (p.bytes >= self.cfg.part_bytes || t.saturating_sub(p.start) >= self.cfg.part_time.as_nanos() as u64)
+            {
+                let why = if p.bytes >= self.cfg.part_bytes { "size" } else { "time" };
+                self.close_part(why);
+            }
+            if self.part.is_none() {
+                self.open_part(t);
+            }
         }
-        if self.part.is_none() && !self.open_part(t) {
-            return;
-        }
-        self.remember(&ch, &data);
-        self.write(ch.clone(), &data, t);
+        self.write(ch.clone(), data, t);
         // 청크 닫기는 tick 경계 — 문턱을 반 tick 앞당긴다(tick 이 조금 일찍 와도 한 주기 밀리지 않게 · 정:IMPL-ROOM-STALL 과 같은 꼴)
         let due = (self.cfg.flush.as_nanos() as u64).saturating_sub(self.cfg.tick.as_nanos() as u64 / 2);
         if ch == Channel::Tick && t.saturating_sub(self.last_flush) >= due {
@@ -246,61 +304,97 @@ impl Inner {
         }
     }
 
-    fn remember(&mut self, ch: &Channel, data: &[u8]) {
-        let key = |k: &str| serde_json::from_slice::<Value>(data).ok().and_then(|v| v.get(k).and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_u64().map(|n| n.to_string()))));
-        match ch {
+    fn remember(&mut self, r: &Record) {
+        if matches!(r.channel, Channel::Rtp(_) | Channel::Gap | Channel::Tick) {
+            return;
+        }
+        let Ok(v) = serde_json::from_slice::<Value>(&r.data) else { return };
+        let key = |k: &str| v.get(k).and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_u64().map(|n| n.to_string())));
+        match r.channel {
             Channel::Track => {
-                if let Some(r) = key("room") {
-                    self.snap.track.insert(r, data.to_vec());
+                if let Some(room) = key("room") {
+                    self.snap.track.insert(room, r.clone());
                 }
             }
             Channel::Floor => {
-                if let Some(r) = key("room") {
-                    self.snap.floor.insert(r, data.to_vec());
+                if let Some(room) = key("room") {
+                    self.snap.floor.insert(room, r.clone());
                 }
             }
             Channel::Session => {
                 if let Some(e) = key("event") {
                     let at = key("server").or_else(|| key("room")).unwrap_or_default();
-                    self.snap.session.insert(format!("{e}/{at}"), data.to_vec());
+                    self.snap.session.insert(format!("{e}/{at}"), r.clone());
                 }
             }
             Channel::Sr => {
                 if let Some(s) = key("ssrc").and_then(|s| s.parse().ok()) {
-                    self.snap.sr.insert(s, data.to_vec());
+                    self.snap.sr.insert(s, r.clone());
                 }
             }
             _ => {}
         }
     }
 
-    fn write(&mut self, ch: Channel, data: &[u8], t: u64) {
+    /// 순번을 매겨 파트에 쓰고(켰으면) 라이브 통에 나눈다
+    fn write(&mut self, ch: Channel, data: Vec<u8>, t: u64) {
         self.seq = self.seq.wrapping_add(1);
         let seq = self.seq;
-        let Some(p) = self.part.as_mut() else { return };
-        let id = match p.channels.get(&ch) {
-            Some(id) => *id,
-            None => match p.w.add_channel(0, &ch.topic(), ch.encoding(), &BTreeMap::new()) {
-                Ok(id) => {
-                    p.channels.insert(ch.clone(), id);
-                    id
+        if let Some(p) = self.part.as_mut() {
+            let id = match p.channels.get(&ch) {
+                Some(id) => Some(*id),
+                None => p.w.add_channel(0, &ch.topic(), ch.encoding(), &BTreeMap::new()).ok().inspect(|id| {
+                    p.channels.insert(ch.clone(), *id);
+                }),
+            };
+            if let Some(id) = id {
+                let h = MessageHeader { channel_id: id, sequence: seq, log_time: t, publish_time: t };
+                if p.w.write_to_known_channel(&h, &data).is_ok() {
+                    p.bytes += 31 + data.len() as u64;
+                    p.last_seq = Some(seq);
                 }
-                Err(_) => return,
-            },
-        };
-        let h = MessageHeader { channel_id: id, sequence: seq, log_time: t, publish_time: t };
-        if p.w.write_to_known_channel(&h, data).is_ok() {
-            p.bytes += 31 + data.len() as u64;
-            p.last_seq = Some(seq);
+            }
         }
+        let r = Record { sequence: seq, log_time: t, channel: ch, data };
+        self.remember(&r);
+        self.tap(r);
+    }
+
+    /// 라이브 통마다 — ★넘치면 버리지 않는다: 원시 파트가 있으면 그 통은 넘친 첫 순번부터 꼬리 읽기로 갈아탄다 · 없으면 멈추고 사건(SDK:RULE-PLAT-REC-API 역압)
+    fn tap(&mut self, r: Record) {
+        if self.subs.is_empty() {
+            return;
+        }
+        let tail_ok = self.cfg.dir.is_some() && !self.stopped && self.part.is_some();
+        let part_now = self.part_no.saturating_sub(1);
+        let ev = self.ev.clone();
+        let mut tailing = Vec::new();
+        self.subs.retain(|s| match s.tx.try_send(r.clone()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if let Ok(mut st) = s.shared.state.lock() {
+                    if tail_ok {
+                        st.degraded = Some((r.sequence, part_now));
+                        tailing.push(s.shared.clone());
+                    } else {
+                        st.stopped = true;
+                        let _ = ev.send(Event::RecordConsumerStopped { reason: "overflow".into() });
+                    }
+                }
+                false
+            }
+        });
+        self.tailing.extend(tailing);
     }
 
     fn open_part(&mut self, t: u64) -> bool {
-        if free_bytes(&self.cfg.dir).is_some_and(|f| f < self.cfg.min_free_bytes) {
+        let Some(dir) = self.cfg.dir.clone() else { return false };
+        if free_bytes(&dir).is_some_and(|f| f < self.cfg.min_free_bytes) {
             self.stop();
             return false;
         }
-        let path = self.cfg.dir.join(format!("{}-{:04}.mcap", self.cfg.recording_id, self.part_no));
+        let path = dir.join(format!("{}-{:04}.mcap", self.cfg.recording_id, self.part_no));
         let Some((f, file)) = File::create(&path).ok().and_then(|f| f.try_clone().ok().map(|c| (f, c))) else {
             self.stop();
             return false;
@@ -326,17 +420,9 @@ impl Inner {
         self.part = Some(Part { w, file, channels: HashMap::new(), start: t, bytes: 0, last_seq: None });
         self.part_no += 1;
         // 파트 머리 스냅숏(REC-PART) — 트랙 · 발언권 · 세션 · SR
-        let head: Vec<(Channel, Vec<u8>)> = self
-            .snap
-            .track
-            .values()
-            .map(|d| (Channel::Track, d.clone()))
-            .chain(self.snap.floor.values().map(|d| (Channel::Floor, d.clone())))
-            .chain(self.snap.session.values().map(|d| (Channel::Session, d.clone())))
-            .chain(self.snap.sr.values().map(|d| (Channel::Sr, d.clone())))
-            .collect();
+        let head: Vec<(Channel, Vec<u8>)> = self.snap.all().into_iter().map(|r| (r.channel.clone(), r.data.clone())).collect();
         for (ch, d) in head {
-            self.write(ch, &d, t);
+            self.write(ch, d, t);
         }
         true
     }
@@ -347,7 +433,7 @@ impl Inner {
         if self.cfg.fsync_on_flush {
             let _ = p.file.sync_data();
         }
-        if free_bytes(&self.cfg.dir).is_some_and(|f| f < self.cfg.min_free_bytes) {
+        if self.cfg.dir.as_deref().and_then(free_bytes).is_some_and(|f| f < self.cfg.min_free_bytes) {
             self.stop();
         }
     }

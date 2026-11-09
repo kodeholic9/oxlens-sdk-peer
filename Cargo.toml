@@ -20,6 +20,8 @@ record = ["dep:mcap", "dep:rustix"]
 # 청크 압축 실측(M9) — 기본은 압축 없음
 record-lz4 = ["record", "mcap/lz4"]
 record-zstd = ["record", "mcap/zstd"]
+# 조립 대조군(설계 D15) — webrtc-media SampleBuilder + 디패킷타이저 · 예제 rawtool --ref 몫
+record-ref = ["record", "dep:webrtc-media", "dep:rtp"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
@@ -44,6 +46,8 @@ getrandom = { version = "0.3", features = ["std"] }
 mcap = { version = "0.26", default-features = false, optional = true }
 # 디스크 하한(SDK:RULE-PLAT-REC-PART) — statvfs 를 unsafe 없이
 rustix = { version = "1.1", default-features = false, features = ["std", "fs"], optional = true }
+webrtc-media = { version = "0.17", optional = true }
+rtp = { version = "0.17", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -62,6 +66,11 @@ unused_must_use = "deny"
 [[example]]
 name = "agent"
 path = "examples/agent/main.rs"
+
+[[example]]
+name = "rawtool"
+path = "examples/rawtool.rs"
+required-features = ["record"]
 
 [[example]]
 name = "rawbench"

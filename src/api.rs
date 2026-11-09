@@ -159,6 +159,8 @@ pub enum Event {
     Permission { room: String, permission: Option<Permission> },
     /// 녹음 원시 기록이 멈췄다(SDK:RULE-PLAT-REC-PART 디스크 하한 — `disk_low`)
     RecordStopped { reason: String },
+    /// 라이브 레코드 통이 넘쳐 멈췄다 — 원시 기록을 끈 구성이라 갈아탈 꼬리가 없다(SDK:RULE-PLAT-REC-API 역압 · `overflow`)
+    RecordConsumerStopped { reason: String },
 }
 
 /// 발행할 트랙 — 코덱은 그 방의 미디어 코덱이다(연:RULE-PUB-PUBLISH-PROC — 앱이 고르는 칸이 없다)
@@ -480,6 +482,16 @@ impl Client {
         let (tx, rx) = mpsc::unbounded_channel();
         let _ = self.send(Cmd::Diag(tx));
         Transitions { rx }
+    }
+
+    /// 라이브 레코드 통을 연다(지점 ① — SDK:RULE-PLAT-REC-API) — 연 뒤의 레코드 전량 · `capacity` 를 넘으면 원시 파트 꼬리 읽기로 갈아탄다.
+    /// 녹음(`Config.record`)을 켜지 않았으면 바로 끝나는 통이다. 기록기가 닫히면 끝난다 — ★`close()` 가 아니라 `Client` 를 놓을 때(같은 객체로 다시 `connect` 하는 동안 녹음은 이어진다)
+    #[cfg(feature = "record")]
+    pub fn records(&self, capacity: usize) -> crate::record::Records {
+        let (tx, rx) = mpsc::channel(capacity.max(16));
+        let shared = std::sync::Arc::new(crate::record::Shared::default());
+        let _ = self.send(Cmd::Records(tx, shared.clone()));
+        crate::record::Records::new(rx, shared)
     }
 
     pub async fn stats(&self) -> Stats {

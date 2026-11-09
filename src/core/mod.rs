@@ -58,6 +58,9 @@ pub(crate) enum Cmd {
     PttRelease(String, oneshot::Sender<Result<(), Error>>),
     Message(String, String, oneshot::Sender<Result<String, Error>>),
     Snapshot(oneshot::Sender<Snapshot>),
+    /// 라이브 레코드 통(지점 ①)
+    #[cfg(feature = "record")]
+    Records(mpsc::Sender<crate::record::Record>, std::sync::Arc<crate::record::Shared>),
 }
 
 /// 재동기 응답(HTTP — 루프 밖 태스크가 받아 넘긴다)
@@ -440,6 +443,12 @@ impl Core {
             Cmd::Close(tx) => {
                 self.close_for_app();
                 let _ = tx.send(());
+            }
+            #[cfg(feature = "record")]
+            Cmd::Records(tx, shared) => {
+                if let Some(r) = &self.sink.recorder {
+                    r.subscribe(tx, shared);
+                }
             }
             Cmd::Diag(tx) => {
                 if let Ok(mut g) = self.diag.lock() {

@@ -1075,6 +1075,7 @@ dependencies = [
  "hmac",
  "mcap",
  "rcgen",
+ "rtp",
  "rustix",
  "rustls-pemfile",
  "sctp-proto",
@@ -1085,6 +1086,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "webpki-roots",
+ "webrtc-media",
  "webrtc-srtp",
  "webrtc-util",
 ]
@@ -2033,6 +2035,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "webrtc-media"
+version = "0.17.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62a4248a8932c2d81128ec697256f496e7f4122f321004050aaeaa925271ea2e"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "rand 0.9.5",
+ "rtp",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

@@ -13,13 +13,12 @@
 //! 끝나면 표준 출력에 한 줄 JSON(파일마다 화자 · 수 · 경계 밖 수 · 정리층 계수 · 복구 사실)을 쓴다 — 2층 시험이 이것과 파일을 읽는다.
 
 mod mkv;
-mod ogg;
 mod video;
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use oxpeer::record::RecordConfig;
+use oxpeer::record::{Channel, FileSource, OggSink, Output, Pipeline, Policy, Record, RecordConfig};
 use oxpeer::{Client, Config, Event, TokenReq, Unit};
 use serde_json::{Value, json};
 
@@ -42,10 +41,12 @@ struct Args {
     raw_part_bytes: Option<u64>,
     raw_flush_ms: Option<u64>,
     raw_tick_ms: Option<u64>,
+    /// close() 뒤 Client 를 놓기 전 이만큼 살려 두고 그동안 쓴 CPU 를 잰다(context 202611/20261109d — 닫힌 전송로의 DTLS 읽기 고리 돌기 재발 검사)
+    linger_ms: Option<u64>,
 }
 
 fn args() -> Args {
-    let mut a = Args { base: String::new(), room: String::new(), out: PathBuf::from("."), secs: None, hidden: false, user: "oxpeer-recorder".into(), api_key: "ox_k_demo".into(), api_secret: "ox_s_demo".into(), tls_root: None, video: false, spatial: None, layer_plan: Vec::new(), raw: None, raw_part_ms: None, raw_part_bytes: None, raw_flush_ms: None, raw_tick_ms: None };
+    let mut a = Args { base: String::new(), room: String::new(), out: PathBuf::from("."), secs: None, hidden: false, user: "oxpeer-recorder".into(), api_key: "ox_k_demo".into(), api_secret: "ox_s_demo".into(), tls_root: None, video: false, spatial: None, layer_plan: Vec::new(), raw: None, raw_part_ms: None, raw_part_bytes: None, raw_flush_ms: None, raw_tick_ms: None, linger_ms: None };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         let mut v = || it.next().unwrap_or_default();
@@ -66,6 +67,7 @@ fn args() -> Args {
             "--raw-part-bytes" => a.raw_part_bytes = v().parse().ok(),
             "--raw-flush-ms" => a.raw_flush_ms = v().parse().ok(),
             "--raw-tick-ms" => a.raw_tick_ms = v().parse().ok(),
+            "--linger-ms" => a.linger_ms = v().parse().ok(),
             "--layer-plan" => {
                 a.layer_plan = v().split(',').filter_map(|x| x.split_once(':')).filter_map(|(t, n)| Some((t.parse().ok()?, n.parse().ok()?))).collect();
             }
@@ -77,23 +79,6 @@ fn args() -> Args {
         std::process::exit(2);
     }
     a
-}
-
-struct Utterance {
-    file: PathBuf,
-    csrc: u32,
-    speaker: Option<String>,
-    w: ogg::OggOpus,
-    first_seq: Option<u16>,
-    last_seq: u16,
-}
-
-fn close(cur: &mut Option<Utterance>, done: &mut Vec<Value>) {
-    if let Some(u) = cur.take() {
-        let packets = u.w.packets;
-        let granule = u.w.finish().unwrap_or(0);
-        done.push(json!({ "file": u.file, "speaker": u.speaker, "csrc": u.csrc, "packets": packets, "samples": granule, "first_seq": u.first_seq, "last_seq": u.last_seq }));
-    }
 }
 
 #[tokio::main]
@@ -129,6 +114,9 @@ async fn main() {
             rc.tick = Duration::from_millis(ms);
         }
         cfg.record = Some(rc);
+    } else if !a.video {
+        // 녹음 갈래는 늘 레코드 흐름 위에서 짓는다(SDK:RULE-PLAT-REC-API) — 원시 파트 없이 라이브 통만
+        cfg.record = Some(RecordConfig::live(&a.user));
     }
     let (client, mut events, mut media, frames) = match Client::open(cfg).await {
         Ok(x) => x,
@@ -137,6 +125,8 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // ★입장 전에 연다 — 입장 뒤 레코드 전량을 받아야 파일로 다시 지은 것과 같다(늦게 연 통도 해석 상태는 받는다 — SDK:RULE-PLAT-REC-API)
+    let mut records = client.records(1 << 16);
     if let Err(e) = client.join(&a.room).await {
         eprintln!("입장 실패: {e}");
         std::process::exit(1);
@@ -156,85 +146,149 @@ async fn main() {
         }
     };
     tokio::pin!(stop);
-    let mut cur: Option<Utterance> = None;
-    let mut done: Vec<Value> = Vec::new();
-    let mut n = 0u32;
-    let mut orphan = 0u64;
-    let mut other_audio = 0u64;
-    // 경계 밖 패킷마다 — seq · 서버 침묵 프레임인가 · 마지막 화자 사건(taken · idle · none)과 그 뒤 경과
-    let mut orphans: Vec<Value> = Vec::new();
-    let mut last_speaker: (&str, Instant) = ("none", Instant::now());
+    // ★발언 경계는 파이프라인이 정한다(SDK:RULE-PLAT-REC-SPLIT 발언 — 줄마다 출처가 바뀌면 새 세그먼트 · 출처 없는 프레임은 밖)
+    let mut pipe = Pipeline::new(Policy::Utterance);
+    let mut sink = OggSink::new(&a.out).expect("출력 폴더");
+    let mut tally = Tally::default();
     let mut seen_events: Vec<String> = Vec::new();
     let mut flow = Flow::default();
+    let mut ended = false;
     loop {
         tokio::select! {
             _ = &mut stop => break,
             e = events.next() => {
                 let Some(e) = e else { break };
-                match &e {
-                    Event::Speaker { room, user_id } if *room == a.room => {
-                        last_speaker = (if user_id.is_some() { "taken" } else { "idle" }, Instant::now());
-                    }
-                    _ => {
-                        if flow.on(&e, &a.room) {
-                            break;
-                        }
-                    }
+                if !matches!(e, Event::Speaker { .. }) && flow.on(&e, &a.room) {
+                    ended = true;
+                    break;
                 }
                 seen_events.push(format!("{e:?}").chars().take(160).collect());
             }
-            p = media.next() => {
-                let Some(p) = p else { break };
-                if p.room != a.room || p.kind != "audio" || !p.codec.eq_ignore_ascii_case("opus") {
-                    continue;
-                }
-                // 무전 슬롯 오디오만 담는다(주인 없는 트랙 — 화자는 발언권이 알린다) · 개인 트랙(전이중)은 세기만
-                if p.user_id.is_some() {
-                    other_audio += 1;
-                    continue;
-                }
-                let Some(src) = p.source.clone() else {
-                    close(&mut cur, &mut done);
-                    orphan += 1;
-                    orphans.push(json!({ "seq": p.sequence, "silence": p.payload.as_ref() == [0xF8, 0xFF, 0xFE], "last": last_speaker.0, "since_ms": last_speaker.1.elapsed().as_millis() as u64 }));
-                    continue;
-                };
-                if cur.as_ref().is_some_and(|u| u.csrc != src.csrc) {
-                    close(&mut cur, &mut done);
-                }
-                if cur.is_none() {
-                    n += 1;
-                    let who = src.user_id.clone().unwrap_or_else(|| format!("csrc{}", src.csrc));
-                    let file = a.out.join(format!("{}-{n:03}-{who}.ogg", a.room));
-                    match ogg::OggOpus::create(&file, n) {
-                        Ok(w) => cur = Some(Utterance { file, csrc: src.csrc, speaker: src.user_id.clone(), w, first_seq: None, last_seq: 0 }),
-                        Err(err) => eprintln!("파일을 못 만들었다 {}: {err}", file.display()),
-                    }
-                }
-                if let Some(u) = cur.as_mut() {
-                    if u.speaker.is_none() {
-                        u.speaker = src.user_id.clone();
-                    }
-                    let _ = u.w.push(&p.payload);
-                    u.first_seq.get_or_insert(p.sequence);
-                    u.last_seq = p.sequence;
-                }
+            // 미디어 통은 비워 둔다(이 갈래는 레코드 흐름으로 짓는다 — 통이 차 버리면 계수가 오른다)
+            p = media.next() => if p.is_none() { break },
+            r = records.next() => {
+                let Some(r) = r else { break };
+                tally.feed(&a.room, &mut pipe, &mut sink, &r);
             }
         }
     }
-    close(&mut cur, &mut done);
     let stats = client.stats().await;
     client.close().await;
+    let linger = match a.linger_ms {
+        Some(ms) => {
+            let c0 = cpu_ms();
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Some(json!({ "linger_ms": ms, "cpu_ms": cpu_ms().zip(c0).map(|(b, a)| b.saturating_sub(a)) }))
+        }
+        None => None,
+    };
+    // Client 를 놓아야 SDK 루프가 끝나고 기록기가 닫힌다(같은 객체로 다시 connect 할 수 있어 close 는 기록기를 닫지 않는다)
+    drop(client);
+    // 닫힌 뒤 — 통에 남은 레코드를 다 짓는다(라이브 = 파일 — 같은 레코드열)
+    if !ended {
+        while let Some(r) = records.next().await {
+            tally.feed(&a.room, &mut pipe, &mut sink, &r);
+        }
+    }
+    for o in pipe.finish() {
+        let _ = sink.write(&o);
+    }
+    let done: Vec<Value> = sink.files().iter().map(|f| json!({ "file": f.path, "speaker": f.user_id, "csrc": f.source, "packets": f.packets, "samples": f.samples, "first_seq": f.first_seq, "last_seq": f.last_seq, "segment": f.segment, "reason": f.reason })).collect();
     let mut out = json!({
         "room": a.room,
         "utterances": done,
-        "orphan_packets": orphan,
-        "orphans": orphans,
-        "other_audio": other_audio,
+        "orphan_packets": tally.orphan,
+        "orphans": tally.orphans,
+        "other_audio": tally.other_audio,
         "events": seen_events,
+        "records": records_summary(&pipe, records.degraded()),
     });
+    // 「라이브 = 파일」(context 202611/20261109d) — 원시 파트로 같은 파이프라인을 다시 돌려 `<out>/rebuild/` 에 짓는다
+    if let Some(dir) = &a.raw {
+        out["rebuild"] = rebuild(dir, &a.user, &a.room, &a.out.join("rebuild"));
+    }
+    if let Some(l) = linger {
+        out["linger"] = l;
+    }
     flow.fill(&mut out, &stats);
     println!("{out}");
+}
+
+/// 이 프로세스가 쓴 CPU 시간(ms) — `ps -o time=`(유닉스 계열 · `[[H:]M]M:SS.ss`)
+fn cpu_ms() -> Option<u64> {
+    let o = std::process::Command::new("ps").args(["-o", "time=", "-p", &std::process::id().to_string()]).output().ok()?;
+    let t = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    let mut ms = 0f64;
+    for (i, p) in t.split([':', '-']).rev().enumerate() {
+        let v: f64 = p.parse().ok()?;
+        ms += v * [1_000.0, 60_000.0, 3_600_000.0, 86_400_000.0].get(i)?;
+    }
+    Some(ms as u64)
+}
+
+/// 녹음 갈래의 셈 — 무전 슬롯 음성만 담는다(개인 트랙은 세기만) · 경계 밖 프레임마다 seq · 서버 침묵인가 · 마지막 발언권 사건과 그 뒤 경과(레코드 시각)
+#[derive(Default)]
+struct Tally {
+    orphan: u64,
+    orphans: Vec<Value>,
+    other_audio: u64,
+    last_floor: (&'static str, u64),
+}
+
+impl Tally {
+    fn feed(&mut self, room: &str, pipe: &mut Pipeline, sink: &mut OggSink, r: &Record) {
+        if r.channel == Channel::Floor
+            && let Ok(v) = serde_json::from_slice::<Value>(&r.data)
+            && v["room"].as_str() == Some(room)
+        {
+            self.last_floor = (if v["event"].as_str() == Some("taken") { "taken" } else { "idle" }, r.log_time);
+        }
+        for o in pipe.push(r) {
+            let f = match &o {
+                Output::Frame(f) | Output::Orphan(f) => Some(f),
+                Output::Segment(_) => None,
+            };
+            if let Some(f) = f {
+                if f.room != room || f.kind != "audio" || !f.codec.eq_ignore_ascii_case("opus") {
+                    continue;
+                }
+                if f.owner.is_some() {
+                    self.other_audio += 1;
+                    continue;
+                }
+                if let Output::Orphan(f) = &o {
+                    self.orphan += 1;
+                    let last = if self.last_floor.1 == 0 { "none" } else { self.last_floor.0 };
+                    self.orphans.push(json!({ "seq": f.seq_first, "silence": f.data == [0xF8, 0xFF, 0xFE], "last": last, "since_ms": f.log_time.saturating_sub(self.last_floor.1) / 1_000_000 }));
+                    continue;
+                }
+            }
+            if let Output::Segment(s) = &o
+                && (s.room != room || s.owner.is_some())
+            {
+                continue;
+            }
+            let _ = sink.write(&o);
+        }
+    }
+}
+
+fn records_summary(pipe: &Pipeline, degraded: bool) -> Value {
+    let c = pipe.counts();
+    json!({ "records": c.records, "packets": c.packets, "unrouted": c.unrouted, "frames": c.frames, "broken": c.broken, "before_key": c.before_key, "degraded": degraded })
+}
+
+/// 원시 파트로 다시 짓기 — 라이브와 같은 파이프라인 · 같은 결과물(파일 이름이 같다)
+fn rebuild(dir: &std::path::Path, id: &str, room: &str, out: &std::path::Path) -> Value {
+    let Ok(mut src) = FileSource::open(dir, id) else { return json!({ "error": "원시 파트를 못 열었다" }) };
+    let Ok(mut sink) = OggSink::new(out) else { return json!({ "error": "다시 짓기 폴더" }) };
+    let mut pipe = Pipeline::new(Policy::Utterance);
+    let mut tally = Tally::default();
+    src.run(|r| tally.feed(room, &mut pipe, &mut sink, &r));
+    for o in pipe.finish() {
+        let _ = sink.write(&o);
+    }
+    json!({ "dir": out, "parts": src.parts().len(), "files": sink.files().iter().map(|f| json!({ "file": f.path, "segment": f.segment, "packets": f.packets })).collect::<Vec<_>>(), "records": records_summary(&pipe, false) })
 }
 
 /// 복구 사실 — 세션 · 연결 상태가 바뀐 차례(같은 값이 이어지면 한 번) · 다시 세움 · 입장 · 재동기 횟수(2층 복구 시나리오가 읽는다)

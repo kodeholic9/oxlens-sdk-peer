@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use std::sync::Arc;
+
 use super::*;
 
 fn tmp(name: &str) -> PathBuf {
@@ -179,4 +181,270 @@ fn channel_topics_round_trip() {
         assert_eq!(Channel::parse(&ch.topic()), Some(ch));
     }
     assert_eq!(Channel::parse("rtp/x"), None);
+}
+
+// ── 2단계 — 파이프라인 · Ogg · 라이브 통(SDK:RULE-PLAT-REC-PIPE · REC-SPLIT · REC-API) ──
+
+fn pkt(seq: u16, ts: u32, marker: bool, csrc: Option<u32>, payload: &[u8]) -> Vec<u8> {
+    let mut v = vec![if csrc.is_some() { 0x81 } else { 0x80 }, if marker { 0xEF } else { 0x6F }, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    v[2..4].copy_from_slice(&seq.to_be_bytes());
+    v[4..8].copy_from_slice(&ts.to_be_bytes());
+    if let Some(c) = csrc {
+        v.extend_from_slice(&c.to_be_bytes());
+    }
+    v.extend_from_slice(payload);
+    v
+}
+
+fn rec(seq: u32, t: u64, ch: Channel, data: Vec<u8>) -> Record {
+    Record { sequence: seq, log_time: t, channel: ch, data }
+}
+
+fn tracks(room: &str) -> Vec<u8> {
+    serde_json::json!({
+        "room": room,
+        "tracks": [{ "track_id": "slot-a", "kind": "audio" }, { "track_id": "cam-u1", "kind": "video", "user_id": "u1", "csrc": 9 }],
+        "rows": { "100": { "track_id": "slot-a", "kind": "audio", "codec": "opus", "pt": 111 }, "200": { "track_id": "cam-u1", "kind": "video", "codec": "VP8", "pt": 96 } }
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// 무전 슬롯: 출처 없음(예열 침묵) · A(7) 둘 · B(8) 하나 · 출처 없음 / 영상: 델타(버림) · 키 · 델타 · gap · 델타(버림) · 키
+fn stream() -> Vec<Record> {
+    let ms = 1_000_000u64;
+    let mut v = vec![rec(1, 0, Channel::Track, tracks("r")), rec(2, ms, Channel::Floor, br#"{"room":"r","event":"taken","user_id":"A","sources":[7],"seq":1}"#.to_vec())];
+    let mut n = 3u32;
+    let mut put = |v: &mut Vec<Record>, ch: Channel, d: Vec<u8>| {
+        v.push(rec(n, u64::from(n) * 20 * ms, ch, d));
+        n += 1;
+    };
+    put(&mut v, Channel::Rtp(100), pkt(1, 0, true, None, &[0xF8, 0xFF, 0xFE]));
+    put(&mut v, Channel::Rtp(100), pkt(2, 960, true, Some(7), &[0x78, 1]));
+    put(&mut v, Channel::Rtp(100), pkt(3, 1920, true, Some(7), &[0x78, 2]));
+    put(&mut v, Channel::Floor, br#"{"room":"r","event":"taken","user_id":"B","sources":[8],"seq":2}"#.to_vec());
+    put(&mut v, Channel::Rtp(100), pkt(4, 2880, true, Some(8), &[0x78, 3]));
+    put(&mut v, Channel::Rtp(100), pkt(5, 3840, true, None, &[0xF8, 0xFF, 0xFE]));
+    put(&mut v, Channel::Sr, br#"{"ssrc":200,"ntp":16045690984503098046,"rtp":3000}"#.to_vec());
+    put(&mut v, Channel::Rtp(200), pkt(1, 3000, true, Some(9), &[0x10, 0x01, 1]));
+    put(&mut v, Channel::Rtp(200), pkt(2, 6000, true, Some(9), &[0x10, 0x00, 2]));
+    put(&mut v, Channel::Rtp(200), pkt(3, 9000, true, Some(9), &[0x10, 0x01, 3]));
+    put(&mut v, Channel::Gap, br#"{"ssrc":200,"from":4,"to":4,"count":1,"reason":"nack_exhausted"}"#.to_vec());
+    put(&mut v, Channel::Rtp(200), pkt(5, 15000, true, Some(9), &[0x10, 0x01, 5]));
+    put(&mut v, Channel::Rtp(200), pkt(6, 18000, true, Some(9), &[0x10, 0x00, 6]));
+    v
+}
+
+fn run_pipe(p: Policy, recs: &[Record]) -> Vec<Output> {
+    let mut pl = Pipeline::new(p);
+    let mut out: Vec<Output> = recs.iter().flat_map(|r| pl.push(r)).collect();
+    out.extend(pl.finish());
+    out
+}
+
+#[test]
+fn pipeline_is_deterministic() {
+    assert_eq!(run_pipe(Policy::Utterance, &stream()), run_pipe(Policy::Utterance, &stream()));
+}
+
+#[test]
+fn utterance_policy_splits_by_source_and_leaves_server_silence_out() {
+    let out = run_pipe(Policy::Utterance, &stream());
+    let audio: Vec<(Option<u32>, Option<u64>, Option<String>)> = out
+        .iter()
+        .filter_map(|o| match o {
+            Output::Frame(f) if f.kind == "audio" => Some((f.source, f.segment, f.user_id.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(audio, vec![(Some(7), Some(0), Some("A".into())), (Some(7), Some(0), Some("A".into())), (Some(8), Some(1), Some("B".into()))]);
+    let orphans = out.iter().filter(|o| matches!(o, Output::Orphan(f) if f.data == [0xF8, 0xFF, 0xFE])).count();
+    assert_eq!(orphans, 2, "서버 침묵은 세그먼트 밖");
+    let closed: Vec<(u64, Option<&str>)> = out.iter().filter_map(|o| if let Output::Segment(s) = o { (s.event == SegmentKind::Closed).then_some((s.id, s.reason)) } else { None }).collect();
+    assert_eq!(&closed[..2], &[(0, Some("source")), (1, Some("no_source"))]);
+}
+
+#[test]
+fn video_starts_at_keyframe_and_gap_breaks_until_next_key() {
+    let out = run_pipe(Policy::Utterance, &stream());
+    let video: Vec<(u32, bool)> = out.iter().filter_map(|o| if let Output::Frame(f) = o { (f.kind == "video").then_some((f.rtp_ts, f.keyframe)) } else { None }).collect();
+    assert_eq!(video, vec![(6000, true), (9000, false), (18000, true)], "첫 델타 · gap 뒤 델타는 버린다");
+    let mut pl = Pipeline::new(Policy::Utterance);
+    for r in stream() {
+        pl.push(&r);
+    }
+    assert_eq!((pl.counts().before_key, pl.counts().broken), (2, 0));
+}
+
+#[test]
+fn sr_maps_rtp_time_to_utc() {
+    let out = run_pipe(Policy::Utterance, &stream());
+    let utc: Vec<Option<u64>> = out.iter().filter_map(|o| if let Output::Frame(f) = o { (f.kind == "video").then_some(f.utc_ns) } else { None }).collect();
+    // NTP 16045690984503098046 = 유닉스 1527000000.5 초 무렵 · RTP 3000 기준 · 90kHz
+    let base = (16045690984503098046u64 >> 32) - 2_208_988_800;
+    let frac = ((16045690984503098046u64 & 0xffff_ffff) * 1_000_000_000) >> 32;
+    let t0 = base * 1_000_000_000 + frac;
+    assert_eq!(utc, vec![Some(t0 + 3_000 * 1_000_000_000 / 90_000), Some(t0 + 6_000 * 1_000_000_000 / 90_000), Some(t0 + 15_000 * 1_000_000_000 / 90_000)]);
+    let audio_utc = out.iter().any(|o| matches!(o, Output::Frame(f) if f.kind == "audio" && f.utc_ns.is_some()));
+    assert!(!audio_utc, "SR 전 · SR 없는 줄은 UTC 가 없다(받은 시각으로 메우지 않는다)");
+}
+
+#[test]
+fn span_policy_cuts_audio_anywhere_and_video_at_keyframe() {
+    let out = run_pipe(Policy::Span { time_ns: 30_000_000, bytes: u64::MAX }, &stream());
+    let segs: Vec<(String, u64, Option<&str>)> = out.iter().filter_map(|o| if let Output::Segment(s) = o { (s.event == SegmentKind::Closed).then(|| (s.track_id.clone(), s.frames, s.reason)) } else { None }).collect();
+    assert!(segs.iter().filter(|s| s.0 == "slot-a").count() >= 2, "음성은 T 뒤 아무 프레임에서 자른다: {segs:?}");
+    let v: Vec<_> = segs.iter().filter(|s| s.0 == "cam-u1").collect();
+    assert_eq!(v.len(), 2, "영상은 T 뒤 첫 키프레임(18000)에서: {segs:?}");
+    let silence_in = out.iter().filter(|o| matches!(o, Output::Frame(f) if f.data == [0xF8, 0xFF, 0xFE] && f.segment.is_some())).count();
+    assert_eq!(silence_in, 2, "연속 정책은 서버 침묵도 담는다");
+}
+
+#[test]
+fn ogg_sink_bytes_are_identical_for_identical_records() {
+    let d1 = tmp("ogg1");
+    let d2 = tmp("ogg2");
+    for d in [&d1, &d2] {
+        let mut sink = OggSink::new(d).unwrap();
+        for o in run_pipe(Policy::Utterance, &stream()) {
+            sink.write(&o).unwrap();
+        }
+        assert_eq!(sink.files().len(), 2);
+        assert_eq!(sink.files()[0].packets, 2);
+        assert_eq!(sink.files()[0].samples, 1_920);
+    }
+    for name in ["r-0000-A.ogg", "r-0001-B.ogg"] {
+        assert_eq!(std::fs::read(d1.join(name)).unwrap(), std::fs::read(d2.join(name)).unwrap(), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn live_tap_equals_file_records() {
+    let d = tmp("tap");
+    let (ev, _rx) = mpsc::unbounded_channel();
+    let mut c = cfg(&d);
+    c.part_bytes = 300;
+    let r = Recorder::start(c, ev).unwrap();
+    let (tx, rx) = mpsc::channel(10_000);
+    let shared = Arc::new(Shared::default());
+    r.subscribe(tx, shared.clone());
+    let mut live = Records::new(rx, shared);
+    for x in stream() {
+        r.push(x.channel, x.data);
+    }
+    r.close();
+    let mut got = Vec::new();
+    while let Some(x) = live.next().await {
+        got.push(x);
+    }
+    let (file, scans) = all(&d);
+    assert!(scans.len() > 1, "회전이 끼어도");
+    assert_eq!(got, file, "라이브 통 = 파일(머리 스냅숏 포함 · 같은 순번 · 시각)");
+}
+
+#[tokio::test]
+async fn overflow_downgrades_to_tail_read_without_loss_or_duplicates() {
+    let d = tmp("tail");
+    let (ev, _rx) = mpsc::unbounded_channel();
+    let mut c = cfg(&d);
+    c.part_bytes = 3_000;
+    c.flush = Duration::ZERO;
+    c.tick = Duration::from_millis(20);
+    let r = Recorder::start(c, ev).unwrap();
+    let (tx, rx) = mpsc::channel(16);
+    let shared = Arc::new(Shared::default());
+    r.subscribe(tx, shared.clone());
+    let mut live = Records::new(rx, shared);
+    for s in 0..300u16 {
+        r.push(Channel::Rtp(1), rtp(s));
+        if s % 10 == 0 {
+            r.push(Channel::Tick, b"{}".to_vec());
+        }
+    }
+    let reader = tokio::spawn(async move {
+        let mut got = Vec::new();
+        while let Some(x) = live.next().await {
+            got.push(x.sequence);
+        }
+        (got, live.degraded())
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for s in 300..320u16 {
+        r.push(Channel::Rtp(1), rtp(s));
+    }
+    r.close();
+    let (got, degraded) = tokio::time::timeout(Duration::from_secs(5), reader).await.unwrap().unwrap();
+    assert!(degraded, "16 칸 통이 넘쳤다");
+    let (file, _) = all(&d);
+    let want: Vec<u32> = file.iter().map(|x| x.sequence).collect();
+    assert_eq!(got, want, "넘친 뒤도 빠짐 · 겹침 없이 파일과 같은 차례");
+}
+
+#[tokio::test]
+async fn overflow_without_raw_stops_with_event() {
+    let (ev, mut evs) = mpsc::unbounded_channel();
+    let mut c = RecordConfig::live("live");
+    c.tick = Duration::from_secs(3_600);
+    let r = Recorder::start(c, ev).unwrap();
+    let (tx, rx) = mpsc::channel(16);
+    let shared = Arc::new(Shared::default());
+    r.subscribe(tx, shared.clone());
+    let mut live = Records::new(rx, shared);
+    for s in 0..40u16 {
+        r.push(Channel::Rtp(1), rtp(s));
+    }
+    let mut n = 0;
+    while live.next().await.is_some() {
+        n += 1;
+    }
+    assert_eq!(n, 16, "넘치기 전까지만 · 섞인 결과를 몰래 내지 않는다");
+    assert!(live.stopped());
+    assert!(matches!(evs.try_recv(), Ok(Event::RecordConsumerStopped { .. })));
+}
+
+#[tokio::test]
+async fn closed_recorder_takes_nothing_and_opens_no_new_part() {
+    // 닫힌 뒤 tick 이 밀어 넣어도 새 파트를 열지 않는다(꼬리 읽기가 끝을 볼 수 있게 — 20261109d 에서 드러남)
+    let d = tmp("closed");
+    let (ev, _rx) = mpsc::unbounded_channel();
+    let r = Recorder::start(cfg(&d), ev).unwrap();
+    r.push(Channel::Rtp(1), rtp(0));
+    r.close();
+    r.push(Channel::Tick, b"{}".to_vec());
+    r.push(Channel::Rtp(1), rtp(1));
+    let (got, scans) = all(&d);
+    assert_eq!(scans.len(), 1);
+    assert_eq!(got.len(), 1);
+}
+
+#[tokio::test]
+async fn late_subscriber_gets_current_state_first() {
+    // 늦게 연 통 — 트랙 · 발언권 · SR 의 마지막 레코드를 원래 순번 · 시각으로 먼저 받아 줄 → 트랙을 안다(20261109d 2층에서 드러남 — 입장 뒤 연 통이 줄 표를 몰라 패킷 전부가 「줄 모름」)
+    let (ev, _rx) = mpsc::unbounded_channel();
+    let mut c = RecordConfig::live("late");
+    c.tick = Duration::from_secs(3_600);
+    let r = Recorder::start(c, ev).unwrap();
+    let recs = stream();
+    for x in &recs[..2] {
+        r.push(x.channel.clone(), x.data.clone());
+    }
+    let (tx, rx) = mpsc::channel(1_000);
+    let shared = Arc::new(Shared::default());
+    r.subscribe(tx, shared.clone());
+    let mut live = Records::new(rx, shared);
+    for x in &recs[2..] {
+        r.push(x.channel.clone(), x.data.clone());
+    }
+    r.close();
+    let mut got = Vec::new();
+    while let Some(x) = live.next().await {
+        got.push(x);
+    }
+    assert_eq!((got[0].channel.clone(), got[0].sequence), (Channel::Track, 1));
+    assert_eq!((got[1].channel.clone(), got[1].sequence), (Channel::Floor, 2));
+    let mut pl = Pipeline::new(Policy::Utterance);
+    for x in &got {
+        pl.push(x);
+    }
+    assert_eq!(pl.counts().unrouted, 0);
 }

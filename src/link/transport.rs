@@ -396,6 +396,8 @@ async fn run(server: SocketAddr, mut creds: Creds, cert: Certificate, role: Role
     let mut dtls_rx = Some(dtls_rx);
     let mut cert = Some(cert);
     let mut sctp: Option<mpsc::UnboundedSender<SctpCtl>> = None;
+    // 전송로가 끝나면(돌아가든 abort 되든) DTLS 를 닫는다 — dtls 크레이트가 띄운 읽기 고리를 정식 닫힘 통로로 멈춘다
+    let mut _dtls_guard: Option<DtlsGuard> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     loop {
         tokio::select! {
@@ -444,6 +446,7 @@ async fn run(server: SocketAddr, mut creds: Creds, cert: Certificate, role: Role
                     };
                     let _ = tx_ctx.set(Mutex::new(tx));
                     let _ = rx_ctx.set(Mutex::new(rx));
+                    _dtls_guard = Some(DtlsGuard(conn.clone()));
                     say.send(Fact::Dtls(true));
                     if role == Role::Publish {
                         let (stx, srx) = mpsc::unbounded_channel();
@@ -702,6 +705,20 @@ async fn handshake(sock: Arc<UdpSocket>, server: SocketAddr, rx: mpsc::Receiver<
     Ok((dtls, tx, rx))
 }
 
+/// 전송로 수명에 묶인 DTLS 닫기 — 놓일 때(전송로 끝 · abort) `close()` 를 띄운다(Drop 은 기다릴 수 없다)
+struct DtlsGuard(Arc<DTLSConn>);
+
+impl Drop for DtlsGuard {
+    fn drop(&mut self) {
+        let c = self.0.clone();
+        if let Ok(h) = tokio::runtime::Handle::try_current() {
+            h.spawn(async move {
+                let _ = c.close().await;
+            });
+        }
+    }
+}
+
 /// DTLS 를 UDP 소켓 위에 — 받는 것은 갈라 받은 DTLS 레코드만
 struct ChanConn {
     rx: AsyncMutex<mpsc::Receiver<Vec<u8>>>,
@@ -722,7 +739,9 @@ impl Conn for ChanConn {
                 buf[..n].copy_from_slice(&p[..n]);
                 Ok(n)
             }
-            None => Err(webrtc_util::Error::ErrUseClosedNetworkConn),
+            // ★통로가 닫혔으면(전송로 태스크가 끝났다) 기다린다 — 오류를 내면 dtls 읽기 고리가 ErrAlertFatalOrClose 가 아닌 오류에서 곧바로 다시 돌아
+            //   코어 하나를 태운다(20261109d 2층 — close 뒤 살아 있는 녹음기 CPU 100%). 고리는 DtlsGuard 가 닫아 멈춘다
+            None => std::future::pending().await,
         }
     }
     async fn recv_from(&self, buf: &mut [u8]) -> webrtc_util::Result<(usize, SocketAddr)> {

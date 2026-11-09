@@ -27,11 +27,23 @@ pub struct Config {
     pub frames_capacity: usize,
     /// 받는 단위 기본(SDK:RULE-PLAT-SERVER 수신 단위 · 시각) — 트랙마다는 `Client::set_unit`
     pub unit: Unit,
+    /// 녹음 원시 기록(SDK:RULE-PLAT-REC-TAP) — 주면 받는 줄 전부의 정리층 출구 RTP 와 제어 사건을 MCAP 파트에 적는다
+    #[cfg(feature = "record")]
+    pub record: Option<crate::record::RecordConfig>,
 }
 
 impl Config {
     pub fn new(base: impl Into<String>, token: impl Into<String>) -> Config {
-        Config { base: base.into(), tls_root_pem: None, token: token.into(), media_capacity: 4_096, frames_capacity: 1_024, unit: Unit::Packet }
+        Config {
+            base: base.into(),
+            tls_root_pem: None,
+            token: token.into(),
+            media_capacity: 4_096,
+            frames_capacity: 1_024,
+            unit: Unit::Packet,
+            #[cfg(feature = "record")]
+            record: None,
+        }
     }
 }
 
@@ -145,6 +157,8 @@ pub enum Event {
     Message { room: String, user_id: String, content: String },
     /// 내 권한이 바뀌었다(PARTICIPANT_STATE — 투명 참가자도 본인에겐 온다)
     Permission { room: String, permission: Option<Permission> },
+    /// 녹음 원시 기록이 멈췄다(SDK:RULE-PLAT-REC-PART 디스크 하한 — `disk_low`)
+    RecordStopped { reason: String },
 }
 
 /// 발행할 트랙 — 코덱은 그 방의 미디어 코덱이다(연:RULE-PUB-PUBLISH-PROC — 앱이 고르는 칸이 없다)

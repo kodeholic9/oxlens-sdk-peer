@@ -116,7 +116,7 @@ fn run(rt: &Route, frames: &[(u32, Vec<Vec<u8>>)]) -> (Vec<Frame>, Arc<Counters>
     let mut seq = 40_000u16;
     for (ts, ps) in frames {
         for (i, p) in ps.iter().enumerate() {
-            pkts.push(Rtp { seq, ts: *ts, marker: i == ps.len() - 1, pt: 96, payload: Bytes::copy_from_slice(p), recovered: false, source: None });
+            pkts.push(Rtp { seq, ts: *ts, marker: i == ps.len() - 1, pt: 96, payload: Bytes::copy_from_slice(p), recovered: false, source: None, raw: None });
             seq = seq.wrapping_add(1);
         }
     }
@@ -152,7 +152,7 @@ fn run(rt: &Route, frames: &[(u32, Vec<Vec<u8>>)]) -> (Vec<Frame>, Arc<Counters>
         .into_iter()
         .filter_map(|o| match o {
             Out::Frame(f) => Some(Frame { ts: f.timestamp, key: f.keyframe, data: f.data.to_vec() }),
-            Out::Packet(_) => None,
+            _ => None,
         })
         .collect();
     (got, c)

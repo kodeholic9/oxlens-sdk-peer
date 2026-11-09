@@ -15,6 +15,11 @@ publish = false
 default = ["serde"]
 # 생성 상태기(src/gen/*_client.rs)의 serde 파생 — 1층 벡터 시험이 TS 판이 낸 호출을 Rust 판에 넣어 맞댄다
 serde = []
+# 녹음 원시 기록(SDK:RULE-PLAT-REC-RAW — MCAP) — 녹음 없는 에이전트는 MCAP 을 물지 않는다(context 202611/20261109c K2)
+record = ["dep:mcap", "dep:rustix"]
+# 청크 압축 실측(M9) — 기본은 압축 없음
+record-lz4 = ["record", "mcap/lz4"]
+record-zstd = ["record", "mcap/zstd"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
@@ -36,6 +41,9 @@ hmac = "0.12"
 sha1 = "0.10"
 crc32fast = "1"
 getrandom = { version = "0.3", features = ["std"] }
+mcap = { version = "0.26", default-features = false, optional = true }
+# 디스크 하한(SDK:RULE-PLAT-REC-PART) — statvfs 를 unsafe 없이
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -45,6 +53,7 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 [[example]]
 name = "recorder"
 path = "examples/recorder/main.rs"
+required-features = ["record"]
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -53,3 +62,8 @@ unused_must_use = "deny"
 [[example]]
 name = "agent"
 path = "examples/agent/main.rs"
+
+[[example]]
+name = "rawbench"
+path = "examples/rawbench.rs"
+required-features = ["record"]

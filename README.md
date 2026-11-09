@@ -54,6 +54,13 @@ cargo run --example recorder -- --base http://127.0.0.1:1974/media --room conf-1
 cargo run --example agent -- --base http://127.0.0.1:1974/media --room ch-1 --mode echo
 ```
 
+### 녹음 원시 기록(기능 `record` — context 202611/20261109c)
+
+`Config.record = Some(RecordConfig::new(dir, recording_id))` 면 받는 줄 전부를 ★수신 정리층 출구에서 MCAP 파트(`<recording_id>-NNNN.mcap`)로 적는다 —
+복호한 RTP 원본(RTX 로 메운 것은 원래 패킷으로) · 빈 번호(`gap`) · SR · 트랙 목록 · 발언권 · 세션 사건 · `tick`(SDK:RULE-PLAT-REC-TAP · REC-RAW · REC-CLOCK · REC-PART).
+청크는 tick 경계에서 F(기본 2초)마다 닫는다 — 프로세스가 죽어도 잃는 것은 닫히지 않은 청크뿐이다. 파트는 크기(기본 1GiB) · 시간(기본 1시간) 중 먼저 닿는 쪽에서 돈다 · 파트마다 머리 스냅숏이 있어 따로 읽힌다.
+다시 읽기는 `record::FileSource`(파일 차례 그대로 · Footer 없는 파트는 마지막 닫힌 청크까지). 예제 `recorder --raw DIR [--raw-part-ms N] [--raw-flush-ms N]` · 실측 `cargo run --release --example rawbench --features record-lz4,record-zstd`.
+
 녹화 파일은 트랙마다 따로다 — 사람 · 트랙 합치기(음성 + 영상)는 예제 밖이다(ffmpeg 등). 블록 시각은 RTP 시각 차 · 파일 시작 벽시계(`DateUTC`)는 첫 SR 동기 프레임에서 거꾸로 셈한다 — 트랙끼리 그 값으로 맞춘다.
 
 ## 구조
@@ -65,7 +72,9 @@ cargo run --example agent -- --base http://127.0.0.1:1974/media --room ch-1 --mo
 | `src/link/` | 전송(UDP · ICE consent · DTLS · SRTP · SCTP/DCEP) — 층마다 사실을 낸다 · `recv.rs` 수신 정리층 · `depack.rs` RTP 꼴 → 코덱 꼴 |
 | `src/sig.rs` · `src/wire/` | WS 소켓 · 대기표 · 프레임 머리(WS · DC) |
 | `tests/vectors/` | 규격 짓기의 재생 시험이 TS 판 상태기에 넣은 호출과 결과 — Rust 판이 같은 결과를 내는지 1층이 맞댄다 |
-| `examples/recorder/` | 예제 녹음 · 녹화기(Ogg Opus · `--video` Matroska) |
+| `src/record/` | 녹음 원시 기록(기능 `record`) — 기록기 · 파트 회전 · `FileSource` |
+| `examples/recorder/` | 예제 녹음 · 녹화기(Ogg Opus · `--video` Matroska · `--raw` MCAP 원시) |
+| `examples/rawbench.rs` | 원시 기록 실측(합성 RTP — F · fsync · 압축 · 시간당 크기) |
 | `examples/agent/` | 예제 에이전트(무전 되울림 · 전이중 표지 발행) |
 | `src/core/pubs.rs` · `src/link/send.rs` | 말하는 쪽 — 발행 · 소속 · 누름 · 메시지 결합 / 패킷화 · 확장 · 보낸 기록 · RTX · SR |
 
@@ -91,6 +100,8 @@ lib 시험(`media_fixture_*` · `#[ignore]`)이 libwebrtc 꼴 RTP(VP8 서술자 
 | `peer_recorder_freeze` | 프로세스 35초 얼림 | 이어받기 + ICE 재시작 |
 | `peer_recorder_freeze_long` | 프로세스 95초 얼림(서버 재개 창 밖) | 새 세션 — 다시 세움 |
 | `peer_recorder_unit_down` | 방을 든 미디어 유닛 내림 | 그 서버 재구축 → 방 없음(3001)으로 끝 · 세션은 산다 |
+| `peer_record_raw` | 없음(무전 화자 전환 + 원시 기록 T 2초 · F 1초) | 사슬 · 회전(정상 닫힘 · 파트마다 Footer) |
+| `peer_record_raw_kill` | 발언 중 SIGKILL | 비정상 종료 — 마지막 log_time ≥ 죽인 시각 − F |
 
 DC 만 닫히는 경우(같은 연관 위 DC 다시 열기)는 바깥에서 걸 자극이 없어(서버 운영 표면에 그 손잡이가 없다) 1층 벡터(상태기)만 지난다.
 

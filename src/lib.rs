@@ -21,6 +21,8 @@ mod error;
 mod generated;
 mod http;
 mod link;
+#[cfg(feature = "record")]
+pub mod record;
 mod sig;
 mod tls;
 mod token;

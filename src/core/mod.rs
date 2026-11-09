@@ -249,6 +249,11 @@ pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::
         senders: Arc::default(),
         remb: Arc::new(AtomicU64::new(0)),
         rtx_sent: Arc::new(AtomicU64::new(0)),
+        #[cfg(feature = "record")]
+        recorder: match cfg.record.clone() {
+            Some(rc) => Some(crate::record::Recorder::start(rc, ev.clone()).map_err(|e| Error::transport(format!("녹음 원시 기록: {e}")))?),
+            None => None,
+        },
         unrouted: Arc::new(AtomicU64::new(0)),
         decrypt_fail: Arc::new(AtomicU64::new(0)),
     };
@@ -323,6 +328,10 @@ async fn run(mut core: Core, mut cmd: mpsc::UnboundedReceiver<Cmd>, mut int: mps
                 None => {
                     core.close_for_app();
                     core.drain();
+                    #[cfg(feature = "record")]
+                    if let Some(r) = &core.sink.recorder {
+                        r.close();
+                    }
                     break;
                 }
             },
@@ -378,6 +387,12 @@ impl Core {
     }
 
     pub(crate) fn emit(&self, e: Event) {
+        #[cfg(feature = "record")]
+        if let Some(r) = &self.sink.recorder
+            && let Some(b) = crate::record::session_body(&e)
+        {
+            r.push(crate::record::Channel::Session, b.to_string().into_bytes());
+        }
         let _ = self.ev.send(e);
     }
 

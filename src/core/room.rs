@@ -105,7 +105,7 @@ impl Room {
     }
 
     /// 내 개인 트랙 — 받을 트랙이 아니다
-    fn own(&self, t: &TrackEntry, me: Option<&str>) -> bool {
+    pub(super) fn own(&self, t: &TrackEntry, me: Option<&str>) -> bool {
         t.type_ == TrackEntryType::Individual && t.user_id.as_deref() == me && me.is_some()
     }
 }
@@ -1076,6 +1076,18 @@ impl Core {
         let Some((room, rx)) = dc::parse(bytes) else { return };
         if self.rooms.get(&room).and_then(|r| r.sfu.as_deref()) != Some(server) {
             return;
+        }
+        // 발언권 사건(SDK:RULE-PLAT-REC-RAW `ctl/floor`) — TAKEN · IDLE 과 출처 번호
+        #[cfg(feature = "record")]
+        if let Some(rec) = &self.sink.recorder {
+            let b = match &rx {
+                fc::Rx::Taken(m) => Some(serde_json::json!({ "room": room, "event": "taken", "user_id": m.speaker, "sources": m.sources, "seq": m.seq })),
+                fc::Rx::Idle(m) => Some(serde_json::json!({ "room": room, "event": "idle", "user_id": serde_json::Value::Null, "prev": m.prev, "seq": m.seq })),
+                _ => None,
+            };
+            if let Some(b) = b {
+                rec.push(crate::record::Channel::Floor, b.to_string().into_bytes());
+            }
         }
         // 화자의 출처 번호(연:RULE-FLR-SLOT-SOURCES) — 반이중 발행은 트랙 목록에 없어 슬롯 패킷의 CSRC 는 이것으로 주인을 안다
         if let fc::Rx::Taken(m) = &rx {

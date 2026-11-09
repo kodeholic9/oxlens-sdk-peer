@@ -825,6 +825,16 @@ impl Core {
         for (c, u) in &self.talk_sources {
             routes.sources.entry(*c).or_insert_with(|| Source { csrc: *c, user_id: Some(u.clone()), track_id: None });
         }
+        // 트랙 목록 전체 + 줄 SSRC → track_id(SDK:RULE-PLAT-REC-RAW `ctl/track`) — 방마다 앞과 같으면 기록기가 거른다
+        #[cfg(feature = "record")]
+        if let Some(rec) = &self.sink.recorder {
+            let me = self.user_id.clone();
+            for r in self.rooms.values() {
+                let tracks: Vec<&crate::generated::ws_wire::TrackEntry> = r.entries.values().filter(|t| !r.own(t, me.as_deref())).collect();
+                let rows: std::collections::BTreeMap<String, &str> = routes.media.iter().filter(|(_, x)| x.room == r.id).map(|(k, x)| (k.to_string(), x.track_id.as_str())).collect();
+                rec.track(&r.id, serde_json::json!({ "room": r.id, "tracks": tracks, "rows": rows }));
+            }
+        }
         if let Ok(mut g) = self.sink.routes.write() {
             *g = routes;
         }

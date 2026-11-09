@@ -173,6 +173,9 @@ pub(crate) struct MediaSink {
     /// 서버가 준 대역 상한(REMB · bps) · RTX 로 다시 보낸 패킷 수
     pub remb: Arc<AtomicU64>,
     pub rtx_sent: Arc<AtomicU64>,
+    /// 녹음 원시 기록(SDK:RULE-PLAT-REC-TAP) — 정리층 출구 · SR 을 여기 직접 적는다
+    #[cfg(feature = "record")]
+    pub recorder: Option<Arc<crate::record::Recorder>>,
     /// 경로표에 없는 ssrc 로 온 패킷 수
     pub unrouted: Arc<AtomicU64>,
     pub decrypt_fail: Arc<AtomicU64>,
@@ -340,6 +343,7 @@ async fn run(server: SocketAddr, mut creds: Creds, cert: Certificate, role: Role
         let mut me = [0u8; 4];
         let _ = getrandom::fill(&mut me);
         let mut rv = Recv::new(u32::from_be_bytes(me), sink2.counters.clone());
+        rv.record = sink2.recording();
         let mut tick = tokio::time::interval(RECV_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -508,7 +512,9 @@ fn on_rtp(pkt: &[u8], rx: &Arc<OnceLock<Mutex<Context>>>, sink: &MediaSink, seen
         if body.len() < 2 {
             return;
         }
-        Rtp { seq: u16::from_be_bytes([body[0], body[1]]), ts: h.ts, marker: h.marker, pt: r.pt, payload: body.slice(2..), recovered: true, source }
+        let osn = u16::from_be_bytes([body[0], body[1]]);
+        let raw = sink.recording().then(|| rtx_original(&p, &h, osn, r.pt, r.ssrc));
+        Rtp { seq: osn, ts: h.ts, marker: h.marker, pt: r.pt, payload: body.slice(2..), recovered: true, source, raw }
     } else {
         if seen.insert(h.ssrc) {
             say.send(Fact::FirstRtp(h.ssrc));
@@ -520,7 +526,8 @@ fn on_rtp(pkt: &[u8], rx: &Arc<OnceLock<Mutex<Context>>>, sink: &MediaSink, seen
                 return;
             }
         }
-        Rtp { seq: h.seq, ts: h.ts, marker: h.marker, pt: h.pt, payload: body, recovered: false, source }
+        let raw = sink.recording().then(|| p.clone());
+        Rtp { seq: h.seq, ts: h.ts, marker: h.marker, pt: h.pt, payload: body, recovered: false, source, raw }
     };
     let outs = rv.on_rtp(&r, rtp, Instant::now(), std::time::SystemTime::now());
     deliver(outs, sink);
@@ -532,6 +539,10 @@ fn on_rtcp(pkt: &[u8], rx: &Arc<OnceLock<Mutex<Context>>>, rv: &mut Recv, sink: 
     let now = Instant::now();
     for (ssrc, ntp, rtp) in recv::sender_reports(&p) {
         rv.on_sr(ssrc, ntp, rtp, now);
+        #[cfg(feature = "record")]
+        if let Some(r) = &sink.recorder {
+            r.push(crate::record::Channel::Sr, serde_json::json!({ "ssrc": ssrc, "ntp": ntp, "rtp": rtp }).to_string().into_bytes());
+        }
     }
     // 발행자 몫 — 서버가 내 발행에 묻는 것(정:IMPL-RTCP-TERMINATE): NACK → RTX · PLI → 앱 · REMB → 계수
     let fb = send::feedback(&p);
@@ -578,8 +589,48 @@ fn deliver(outs: Vec<Out>, sink: &MediaSink) {
                     sink.frames_dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            #[cfg(feature = "record")]
+            Out::Raw { ssrc, data } => {
+                if let Some(r) = &sink.recorder {
+                    r.push(crate::record::Channel::Rtp(ssrc), data.to_vec());
+                }
+            }
+            #[cfg(feature = "record")]
+            Out::Gap(g) => {
+                if let Some(r) = &sink.recorder {
+                    r.push(crate::record::Channel::Gap, serde_json::json!({ "ssrc": g.ssrc, "from": g.from, "to": g.to, "count": g.count, "reason": g.reason }).to_string().into_bytes());
+                }
+            }
+            #[cfg(not(feature = "record"))]
+            Out::Raw { .. } | Out::Gap(_) => {}
         }
     }
+}
+
+impl MediaSink {
+    /// 녹음 원시 기록을 켰나
+    pub(crate) fn recording(&self) -> bool {
+        #[cfg(feature = "record")]
+        {
+            self.recorder.is_some()
+        }
+        #[cfg(not(feature = "record"))]
+        {
+            false
+        }
+    }
+}
+
+/// RTX 패킷 → 원래 패킷(SDK:RULE-PLAT-REC-TAP) — seq = OSN · PT = 원래 PT · SSRC = 원래 줄 · 앞 두 바이트(OSN)를 뗀다 · 채움을 뗀다(P 비트 내림) · CSRC · 확장은 그대로
+fn rtx_original(p: &Bytes, h: &RtpHeader, osn: u16, pt: u8, ssrc: u32) -> Bytes {
+    let mut v = Vec::with_capacity(h.end.saturating_sub(2));
+    v.extend_from_slice(&p[..h.start]);
+    v[0] &= !0x20;
+    v[1] = (v[1] & 0x80) | (pt & 0x7f);
+    v[2..4].copy_from_slice(&osn.to_be_bytes());
+    v[8..12].copy_from_slice(&ssrc.to_be_bytes());
+    v.extend_from_slice(&p[h.start + 2..h.end]);
+    Bytes::from(v)
 }
 
 pub(crate) struct RtpHeader {
@@ -853,6 +904,24 @@ async fn sctp_client(dtls: Arc<DTLSConn>, say: Say, mut ctl: mpsc::UnboundedRece
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rtx_original_restores_seq_pt_ssrc_and_keeps_csrc_ext() {
+        // SDK:RULE-PLAT-REC-TAP — RTX(PT 97 · ssrc 0xBB · seq 900 · OSN 57) → 원래 패킷(PT 96 · ssrc 0xAA · seq 57) · CSRC · 확장 그대로 · 채움 뗌
+        let mut p = vec![0xB1, 0x80 | 97, 0x03, 0x84, 0, 0, 0, 9, 0, 0, 0, 0xBB];
+        p.extend_from_slice(&[0, 0, 0, 0x12]);
+        p.extend_from_slice(&[0xBE, 0xDE, 0, 1, 1, 2, 3, 4]);
+        p.extend_from_slice(&[0, 57, 0xAA, 0xCC]);
+        p.extend_from_slice(&[0, 0, 0, 4]);
+        let h = rtp_header(&p).unwrap();
+        let o = rtx_original(&Bytes::from(p.clone()), &h, 57, 96, 0xAA);
+        let g = rtp_header(&o).unwrap();
+        assert_eq!((g.seq, g.pt, g.ssrc, g.csrc, g.marker), (57, 96, 0xAA, Some(0x12), true));
+        assert_eq!(&o[g.start..g.end], &[0xAA, 0xCC]);
+        assert_eq!(&o[12..24], &p[12..24], "CSRC · 확장 머리 그대로");
+        assert_eq!(o[0] & 0x20, 0, "채움 비트 내림");
+        assert_eq!(o.len(), 24 + 2);
+    }
 
     #[test]
     fn rtp_header_skips_csrc_ext_padding() {

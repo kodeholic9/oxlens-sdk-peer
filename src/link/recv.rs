@@ -70,6 +70,23 @@ pub struct MediaFrame {
 pub(crate) enum Out {
     Packet(MediaPacket),
     Frame(MediaFrame),
+    /// 정리층 출구 — 차례가 선 패킷의 원본(녹음 원시 기록 · SDK:RULE-PLAT-REC-TAP) · `record` 기능이 없으면 만들어지지 않는다
+    #[cfg_attr(not(feature = "record"), allow(dead_code))]
+    Raw { ssrc: u32, data: Bytes },
+    /// 빈 번호 · 스트림 재설정(SDK:RULE-PLAT-REC-TAP 빈 번호) — 녹음을 켰을 때만
+    #[cfg_attr(not(feature = "record"), allow(dead_code))]
+    Gap(Gap),
+}
+
+/// 빈 번호 사건 — `from` · `to` 는 16비트 seq(양 끝 포함)
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "record"), allow(dead_code))]
+pub(crate) struct Gap {
+    pub ssrc: u32,
+    pub from: u16,
+    pub to: u16,
+    pub count: u64,
+    pub reason: &'static str,
 }
 
 /// 정리층 계수 — 모든 전송이 같이 센다
@@ -101,6 +118,8 @@ pub(crate) struct Rtp {
     pub payload: Bytes,
     pub recovered: bool,
     pub source: Option<Source>,
+    /// 복호한 패킷 원본(녹음 원시 기록을 켰을 때만 — SDK:RULE-PLAT-REC-TAP) · RTX 는 원래 패킷으로 다시 지은 것
+    pub raw: Option<Bytes>,
 }
 
 #[derive(Clone, Copy)]
@@ -269,10 +288,18 @@ impl Stream {
     }
 
     /// 순서가 선 것을 내보낸다 — 앞이 비었으면 포기할 때까지 기다린다
-    fn release(&mut self, now: Instant, c: &Counters, out: &mut Vec<Out>) {
+    fn release(&mut self, now: Instant, c: &Counters, out: &mut Vec<Out>, record: bool) {
+        // 포기한 번호가 이어지면 빈 번호 사건 하나(SDK:RULE-PLAT-REC-TAP)
+        let mut run: Option<(u64, u64)> = None;
         while self.base <= self.highest {
             if let Some(p) = self.buf.remove(&self.base) {
                 self.base += 1;
+                if let Some(g) = run.take() {
+                    self.gap_out(g, out);
+                }
+                if record && let Some(raw) = &p.rtp.raw {
+                    out.push(Out::Raw { ssrc: self.route.ssrc, data: raw.clone() });
+                }
                 self.feed(Some(p), c, out);
                 continue;
             }
@@ -285,9 +312,19 @@ impl Stream {
             }
             self.missing.remove(&self.base);
             Counters::add(&c.lost, 1);
+            if record {
+                run = Some(run.map_or((self.base, self.base), |(a, _)| (a, self.base)));
+            }
             self.base += 1;
             self.feed(None, c, out);
         }
+        if let Some(g) = run {
+            self.gap_out(g, out);
+        }
+    }
+
+    fn gap_out(&self, (a, b): (u64, u64), out: &mut Vec<Out>) {
+        out.push(Out::Gap(Gap { ssrc: self.route.ssrc, from: a as u16, to: b as u16, count: b - a + 1, reason: "nack_exhausted" }));
     }
 
     /// 조립 — None 은 포기한 틈
@@ -405,11 +442,13 @@ pub(crate) struct Recv {
     streams: HashMap<u32, Stream>,
     counters: Arc<Counters>,
     rr_at: Option<Instant>,
+    /// 녹음 원시 기록을 켰나 — 켜면 빈 번호 사건을 낸다
+    pub(crate) record: bool,
 }
 
 impl Recv {
     pub(crate) fn new(me: u32, counters: Arc<Counters>) -> Recv {
-        Recv { me, streams: HashMap::new(), counters, rr_at: None }
+        Recv { me, streams: HashMap::new(), counters, rr_at: None, record: false }
     }
 
     /// 받은 패킷 하나 — `route` 는 그 줄 ssrc 의 경로(RTX 면 원래 줄의 것)
@@ -419,6 +458,9 @@ impl Recv {
         if fresh {
             if r.recovered {
                 return out;
+            }
+            if self.record && self.streams.contains_key(&route.ssrc) {
+                out.push(Out::Gap(Gap { ssrc: route.ssrc, from: r.seq, to: r.seq, count: 0, reason: "stream_reset" }));
             }
             self.streams.insert(route.ssrc, Stream::new(route, r.seq, now));
         }
@@ -435,6 +477,9 @@ impl Recv {
         if ext > s.highest {
             let gap = ext - s.highest - 1;
             if gap > MAX_GAP {
+                if self.record {
+                    out.push(Out::Gap(Gap { ssrc: route.ssrc, from: (s.highest + 1) as u16, to: (ext - 1) as u16, count: gap, reason: "stream_reset" }));
+                }
                 s.buf.clear();
                 s.missing.clear();
                 s.asm = None;
@@ -472,7 +517,7 @@ impl Recv {
         }
         s.missing.remove(&ext);
         s.buf.insert(ext, Pkt { rtp: r, at: now, wall });
-        s.release(now, &c, &mut out);
+        s.release(now, &c, &mut out, self.record);
         out
     }
 
@@ -496,9 +541,10 @@ impl Recv {
         let mut keys: Vec<&u32> = self.streams.keys().collect();
         keys.sort();
         let keys: Vec<u32> = keys.into_iter().copied().collect();
+        let record = self.record;
         for k in &keys {
             let Some(s) = self.streams.get_mut(k) else { continue };
-            s.release(now, &c, &mut out);
+            s.release(now, &c, &mut out, record);
             if s.route.nack {
                 let mut seqs = Vec::new();
                 for (e, m) in s.missing.iter_mut() {
@@ -627,14 +673,14 @@ mod tests {
     }
 
     fn rtp(seq: u16, ts: u32, marker: bool, payload: &[u8]) -> Rtp {
-        Rtp { seq, ts, marker, pt: 96, payload: Bytes::copy_from_slice(payload), recovered: false, source: None }
+        Rtp { seq, ts, marker, pt: 96, payload: Bytes::copy_from_slice(payload), recovered: false, source: None, raw: None }
     }
 
     fn frames(o: &[Out]) -> Vec<(u32, bool, Vec<u8>)> {
         o.iter()
             .filter_map(|x| match x {
                 Out::Frame(f) => Some((f.timestamp, f.keyframe, f.data.to_vec())),
-                Out::Packet(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -720,6 +766,70 @@ mod tests {
         assert_eq!(ts, vec![3000, 6000, 9000]);
         assert_eq!(c.rtx_recovered.load(Ordering::Relaxed), 2);
         assert_eq!(c.lost.load(Ordering::Relaxed), 0);
+    }
+
+    fn raw(seq: u16, ts: u32, marker: bool, payload: &[u8]) -> Rtp {
+        let mut v = vec![0x80, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x04, 0x57];
+        v[2..4].copy_from_slice(&seq.to_be_bytes());
+        v.extend_from_slice(payload);
+        Rtp { raw: Some(Bytes::from(v)), ..rtp(seq, ts, marker, payload) }
+    }
+
+    fn raw_seqs(o: &[Out]) -> Vec<u16> {
+        o.iter().filter_map(|x| if let Out::Raw { data, .. } = x { Some(u16::from_be_bytes([data[2], data[3]])) } else { None }).collect()
+    }
+
+    fn gaps(o: &[Out]) -> Vec<Gap> {
+        o.iter().filter_map(|x| if let Out::Gap(g) = x { Some(g.clone()) } else { None }).collect()
+    }
+
+    #[test]
+    fn record_exit_is_in_order_with_gap_for_given_up_run() {
+        // SDK:RULE-PLAT-REC-TAP — 출구는 차례가 선 뒤 · 포기한 번호가 이어지면 빈 번호 사건 하나
+        let c = Arc::new(Counters::default());
+        let mut r = Recv::new(9, c.clone());
+        r.record = true;
+        let rt = route("video", "VP8", Unit::Packet);
+        let t0 = Instant::now();
+        let w = SystemTime::now();
+        let mut o = r.on_rtp(&rt, raw(1, 0, true, &[0x10, 0x00]), t0, w);
+        o.extend(r.on_rtp(&rt, raw(5, 3000, true, &VP8_DELTA), t0, w));
+        o.extend(r.on_rtp(&rt, raw(3, 1500, true, &VP8_DELTA), t0, w));
+        assert_eq!(raw_seqs(&o), vec![1], "도착 차례(1 · 5 · 3)가 아니라 출구 차례 — 2 가 비어 3 · 5 는 아직 못 나간다");
+        let mut t = t0;
+        for _ in 0..15 {
+            let (x, _) = r.tick(t);
+            o.extend(x);
+            t += NACK_INTERVAL;
+        }
+        assert_eq!(raw_seqs(&o), vec![1, 3, 5]);
+        assert_eq!(gaps(&o), vec![Gap { ssrc: 1111, from: 2, to: 2, count: 1, reason: "nack_exhausted" }, Gap { ssrc: 1111, from: 4, to: 4, count: 1, reason: "nack_exhausted" }]);
+        assert_eq!(c.lost.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn record_off_has_no_raw_or_gap() {
+        let c = Arc::new(Counters::default());
+        let mut r = Recv::new(9, c);
+        let rt = route("audio", "opus", Unit::Packet);
+        let t0 = Instant::now();
+        let mut o = r.on_rtp(&rt, raw(1, 0, true, &[1]), t0, SystemTime::now());
+        o.extend(r.on_rtp(&rt, raw(3, 960, true, &[1]), t0, SystemTime::now()));
+        o.extend(r.tick(t0 + HOLD_NO_NACK * 2).0);
+        assert!(raw_seqs(&o).is_empty() && gaps(&o).is_empty());
+    }
+
+    #[test]
+    fn record_huge_jump_is_stream_reset() {
+        let c = Arc::new(Counters::default());
+        let mut r = Recv::new(9, c);
+        r.record = true;
+        let rt = route("audio", "opus", Unit::Packet);
+        let t0 = Instant::now();
+        let mut o = r.on_rtp(&rt, raw(10, 0, true, &[1]), t0, SystemTime::now());
+        o.extend(r.on_rtp(&rt, raw(5_000, 960, true, &[1]), t0, SystemTime::now()));
+        assert_eq!(gaps(&o), vec![Gap { ssrc: 1111, from: 11, to: 4_999, count: 4_989, reason: "stream_reset" }]);
+        assert_eq!(raw_seqs(&o), vec![10, 5_000]);
     }
 
     #[test]
@@ -811,7 +921,7 @@ mod tests {
                     .into_iter()
                     .filter_map(|o| match o {
                         Out::Packet(p) => Some(p.sequence),
-                        Out::Frame(_) => None,
+                        _ => None,
                     })
                     .collect::<Vec<_>>()
             })

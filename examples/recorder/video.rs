@@ -2,12 +2,13 @@
 //! 녹화 갈래(`--video` · 20261107a B4 · B5 → ★202611/20261110a 레코드 흐름 위로) — 녹음 갈래와 같은 파이프라인(SDK:RULE-PLAT-REC-PIPE) · 결과물만 Matroska(`MkvSink` — SDK:RULE-PLAT-REC-MKV).
 //! 정책 기본 = 발언(SDK:RULE-PLAT-REC-SPLIT) — 개인 트랙은 출처가 안 바뀌어 녹화 내내 파일 하나 · 무전 슬롯은 발언 한 건 = 파일 하나 · 영상은 키프레임부터.
 //!   `--span-secs N` 이면 길이 정책(트랙마다 N 초 뒤 영상은 첫 키프레임 · 음성은 아무 프레임에서 새 파일).
+//! `--hls`(202611/20261110b) — 결과물을 HLS(fMP4 · `HlsSink` — SDK:RULE-PLAT-REC-HLS)로. 파이프라인은 잇는 길이 정책(끝없음) · 조각 경계 1초 전에 영상 키프레임을 요청한다.
 //! 층은 앱이 고른다(B3) — 시뮬캐스트 트랙은 `--spatial` 이 없으면 최고 단을 상한으로 · `--layer-plan` 이 있으면 그 초에 바꾼다.
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use oxpeer::record::{FileSource, MkvSink, Output, Pipeline, Policy, Record, Records};
+use oxpeer::record::{FileSource, HlsConfig, HlsSink, MkvSink, Output, Pipeline, Policy, Record, Records};
 use oxpeer::{Client, Event, Events, Layer, Media, TrackEntry};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -39,7 +40,78 @@ fn ask_layer(client: &Client, tx: &mpsc::UnboundedSender<Value>, track: String, 
     });
 }
 
+/// 결과물 — Matroska(세그먼트마다 파일) · HLS(묶음마다 스트림)
+pub enum Out {
+    Mkv(MkvSink),
+    Hls(HlsSink),
+}
+
+impl Out {
+    fn open(a: &Args, dir: &std::path::Path) -> std::io::Result<Out> {
+        Ok(if a.hls { Out::Hls(HlsSink::new(dir, HlsConfig::default())?) } else { Out::Mkv(MkvSink::new(dir)?) })
+    }
+
+    fn write(&mut self, o: &Output) -> std::io::Result<()> {
+        match self {
+            Out::Mkv(s) => s.write(o),
+            Out::Hls(s) => s.write(o),
+        }
+    }
+
+    fn last_rtp(&self, track: &str) -> Option<u32> {
+        match self {
+            Out::Mkv(s) => s.last_rtp(track),
+            Out::Hls(_) => None,
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Out::Hls(s) = self
+            && let Err(e) = s.finish()
+        {
+            eprintln!("[recorder] HLS 마무리 실패: {e}");
+        }
+    }
+
+    /// 요약 — Matroska 는 `files` · HLS 는 `hls`(묶음마다) + `hls_files`(라이브 = 파일 대조 재료 — 모든 파일)
+    fn summary(&self, out: &mut Value) {
+        match self {
+            Out::Mkv(s) => {
+                out["files"] = json!(files(s));
+                out["unknown_codec"] = json!(s.unknown());
+            }
+            Out::Hls(s) => {
+                let name = |p: &std::path::Path| p.display().to_string();
+                out["hls"] = json!(s.streams().iter().map(|st| json!({
+                    "key": st.key, "dir": name(&st.dir), "room": st.room, "owner": st.owner, "base": st.base, "refused": st.refused,
+                    "over_target": st.over_target, "keyframe_requests": st.keyframe_requests,
+                    "tracks": st.tracks, "inits": st.inits.iter().map(|p| name(p)).collect::<Vec<_>>(),
+                    "event": name(&st.event_playlist), "live": name(&st.live_playlist),
+                    "segments": st.segments.iter().map(|x| json!({ "file": name(&x.file), "init": name(&x.init), "discontinuity": x.discontinuity, "duration": x.duration })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>());
+                out["hls_files"] = json!(hls_files(s).iter().map(|f| json!({ "file": f })).collect::<Vec<_>>());
+            }
+        }
+    }
+}
+
+fn hls_files(s: &HlsSink) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    for st in s.streams() {
+        v.extend(st.inits.iter().map(|p| p.display().to_string()));
+        v.extend(st.segments.iter().map(|x| x.file.display().to_string()));
+        if !st.segments.is_empty() {
+            v.push(st.event_playlist.display().to_string());
+            v.push(st.live_playlist.display().to_string());
+        }
+    }
+    v
+}
+
 pub fn policy(a: &Args) -> Policy {
+    if a.hls {
+        return Policy::Span { time_ns: u64::MAX, bytes: u64::MAX };
+    }
     match a.span_secs {
         Some(s) => Policy::Span { time_ns: s * 1_000_000_000, bytes: u64::MAX },
         None => Policy::Utterance,
@@ -54,13 +126,13 @@ pub struct Tally {
 }
 
 impl Tally {
-    pub fn feed(&mut self, room: &str, pipe: &mut Pipeline, sink: &mut MkvSink, r: &Record, since: Option<Instant>) {
+    pub fn feed(&mut self, room: &str, pipe: &mut Pipeline, sink: &mut Out, r: &Record, since: Option<Instant>) {
         for o in pipe.push(r) {
             self.out(room, sink, &o, since);
         }
     }
 
-    pub fn out(&mut self, room: &str, sink: &mut MkvSink, o: &Output, since: Option<Instant>) {
+    pub fn out(&mut self, room: &str, sink: &mut Out, o: &Output, since: Option<Instant>) {
         match o {
             Output::Frame(f) if f.room == room => {
                 if let Some(t) = since {
@@ -95,14 +167,19 @@ fn files(sink: &MkvSink) -> Vec<Value> {
 pub fn rebuild(a: &Args, out: &std::path::Path) -> Value {
     let Some(dir) = &a.raw else { return Value::Null };
     let Ok(mut src) = FileSource::open(dir, &a.user) else { return json!({ "error": "원시 파트를 못 열었다" }) };
-    let Ok(mut sink) = MkvSink::new(out) else { return json!({ "error": "다시 짓기 폴더" }) };
+    let Ok(mut sink) = Out::open(a, out) else { return json!({ "error": "다시 짓기 폴더" }) };
     let mut pipe = Pipeline::new(policy(a));
     let mut tally = Tally::default();
     src.run(|r| tally.feed(&a.room, &mut pipe, &mut sink, &r, None));
     for o in pipe.finish() {
         tally.out(&a.room, &mut sink, &o, None);
     }
-    json!({ "dir": out, "parts": src.parts().len(), "files": files(&sink).iter().map(|f| json!({ "file": f["file"], "segment": f["segment"], "frames": f["frames"] })).collect::<Vec<_>>(), "records": records_summary(&pipe, false) })
+    sink.finish();
+    let list: Vec<Value> = match &sink {
+        Out::Mkv(s) => files(s).iter().map(|f| json!({ "file": f["file"], "segment": f["segment"], "frames": f["frames"] })).collect(),
+        Out::Hls(s) => hls_files(s).iter().map(|f| json!({ "file": f })).collect(),
+    };
+    json!({ "dir": out, "parts": src.parts().len(), "files": list, "records": records_summary(&pipe, false) })
 }
 
 pub async fn run(a: &Args, client: Client, mut events: Events, mut media: Media, mut records: Records) -> Value {
@@ -117,7 +194,7 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut media: Media,
     tokio::pin!(stop);
     let started = Instant::now();
     let mut pipe = Pipeline::new(policy(a));
-    let mut sink = MkvSink::new(&a.out).expect("출력 폴더");
+    let mut sink = Out::open(a, &a.out).expect("출력 폴더");
     let mut tally = Tally::default();
     let mut video: BTreeMap<String, TrackEntry> = BTreeMap::new();
     // 커버리지(20261107b Q4) — 영상 트랙이 방 목록에 처음 보인 때 · 첫 프레임이 실린 때(시작 뒤 ms). 줄 상한 밖이면 실린 때가 늦거나 없다
@@ -146,6 +223,12 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut media: Media,
                         }
                     }
                     plan_at += 1;
+                }
+                // HLS 조각 경계 — 결과물이 낸 키프레임 요청을 SDK 에 넘긴다(SDK:RULE-PLAT-REC-HLS · 결과물 바이트와 무관)
+                if let Out::Hls(s) = &mut sink {
+                    for t in s.take_keyframe_requests() {
+                        let _ = client.request_keyframe(t);
+                    }
                 }
             }
             Some(v) = lrx.recv() => layer_calls.push(v),
@@ -197,14 +280,13 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut media: Media,
     for o in pipe.finish() {
         tally.out(&a.room, &mut sink, &o, Some(started));
     }
+    sink.finish();
     let c = pipe.counts().clone();
     let mut out = json!({
         "room": a.room,
-        "files": files(&sink),
         "orphan_frames": tally.orphan,
         "skipped_until_key": c.before_key,
         "late_frames": c.late,
-        "unknown_codec": sink.unknown(),
         "layer_calls": layer_calls,
         "events": seen_events,
         "records": records_summary(&pipe, records.degraded()),
@@ -213,6 +295,7 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut media: Media,
         })).collect::<Vec<_>>(),
         "not_recorded": video.iter().filter(|(id, t)| t.user_id.is_some() && !tally.loaded_at.contains_key(*id)).map(|(id, _)| id.clone()).collect::<Vec<_>>(),
     });
+    sink.summary(&mut out);
     if a.raw.is_some() {
         out["rebuild"] = rebuild(a, &a.out.join("rebuild"));
     }

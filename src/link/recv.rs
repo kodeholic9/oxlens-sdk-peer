@@ -169,6 +169,9 @@ struct Stream {
     pli_at: Option<Instant>,
     key_wait: Option<Instant>,
     layer_gen: u64,
+    /// 앱 키프레임 요청 — 차례가 바뀌면 다음 차례에 PLI 한 번
+    key_gen: u64,
+    ask_key: bool,
     received: u64,
     expected_prior: u64,
     received_prior: u64,
@@ -201,6 +204,8 @@ impl Stream {
             pli_at: None,
             key_wait: None,
             layer_gen: route.layer_gen,
+            key_gen: route.key_gen,
+            ask_key: false,
             received: 0,
             expected_prior: 0,
             received_prior: 0,
@@ -483,6 +488,10 @@ impl Recv {
                 s.key_wait = Some(now + LAYER_KEY_WAIT);
             }
         }
+        if s.key_gen != route.key_gen {
+            s.key_gen = route.key_gen;
+            s.ask_key = s.video;
+        }
         let ext = s.extend(r.seq);
         if ext > s.highest {
             let gap = ext - s.highest - 1;
@@ -585,8 +594,9 @@ impl Recv {
             }
             if s.video && s.route.pli {
                 let late = s.key_wait.is_some_and(|t| now >= t);
-                if (s.want_key || late) && s.pli_at.is_none_or(|t| now.duration_since(t) >= PLI_INTERVAL) {
+                if (s.want_key || late || s.ask_key) && s.pli_at.is_none_or(|t| now.duration_since(t) >= PLI_INTERVAL) {
                     s.pli_at = Some(now);
+                    s.ask_key = false;
                     if late {
                         s.key_wait = None;
                     }
@@ -693,7 +703,7 @@ mod tests {
 
     fn route(kind: &str, codec: &str, unit: Unit) -> Route {
         let video = kind == "video";
-        Route { room: "r".into(), track_id: "t".into(), user_id: Some("u".into()), kind: kind.into(), codec: codec.into(), mid: "1".into(), ssrc: 1111, pt: 96, nack: video, pli: video, unit, layer_gen: 0 }
+        Route { room: "r".into(), track_id: "t".into(), user_id: Some("u".into()), kind: kind.into(), codec: codec.into(), mid: "1".into(), ssrc: 1111, pt: 96, nack: video, pli: video, unit, layer_gen: 0, key_gen: 0 }
     }
 
     fn rtp(seq: u16, ts: u32, marker: bool, payload: &[u8]) -> Rtp {
@@ -929,6 +939,27 @@ mod tests {
         let (_, fb) = r.tick(t0 + LAYER_KEY_WAIT);
         assert!(split(&fb.unwrap()).iter().any(|x| x.0 == 206));
         assert!(r.tick(t0 + LAYER_KEY_WAIT * 3).1.is_none_or(|b| !split(&b).iter().any(|x| x.0 == 206)));
+    }
+
+    #[test]
+    fn app_keyframe_request_sends_one_pli_respecting_interval() {
+        let c = Arc::new(Counters::default());
+        let mut r = Recv::new(9, c.clone());
+        let mut rt = route("video", "VP8", Unit::Frame);
+        let t0 = Instant::now();
+        let w = SystemTime::now();
+        r.on_rtp(&rt, rtp(1, 0, true, &[0x10, 0x00]), t0, w);
+        let (_, fb) = r.tick(t0);
+        assert!(fb.is_none_or(|b| !split(&b).iter().any(|x| x.0 == 206)), "키프레임을 받았으니 묻지 않는다");
+        rt.key_gen = 1;
+        r.on_rtp(&rt, rtp(2, 3000, true, &VP8_DELTA), t0, w);
+        let (_, fb) = r.tick(t0);
+        assert!(split(&fb.unwrap()).iter().any(|x| x.0 == 206), "앱이 요청하면 다음 차례에 PLI");
+        assert!(r.tick(t0 + Duration::from_millis(100)).1.is_none_or(|b| !split(&b).iter().any(|x| x.0 == 206)), "한 번만");
+        rt.key_gen = 2;
+        r.on_rtp(&rt, rtp(3, 6000, true, &VP8_DELTA), t0, w);
+        assert!(r.tick(t0 + Duration::from_millis(200)).1.is_none_or(|b| !split(&b).iter().any(|x| x.0 == 206)), "간격(1s) 안에는 미룬다");
+        assert!(split(&r.tick(t0 + PLI_INTERVAL).1.unwrap()).iter().any(|x| x.0 == 206), "간격이 지나면 낸다");
     }
 
     #[test]

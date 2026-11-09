@@ -1,12 +1,98 @@
 // author: kodeholic (powered by Claude)
 //! 재생기 호환 실측 도구(context 202611/20261107a 미결) — 수신 정리층이 다시 이은 진짜 코덱 프레임(`frames_<코덱>.bin` · lib 시험 `media_fixture_*`)을
 //! ★공개 결과물 `MkvSink`(SDK:RULE-PLAT-REC-MKV · 지점 ② ③ — 202611/20261110a)로 파일에 쓴다. 판정은 `scripts/media_check.sh` 가 ffprobe · ffmpeg 로 한다.
+//! 같은 표본(H264 + Opus — 한 사람의 두 트랙 · RTP 시각 순으로 섞어)을 ★공개 결과물 `HlsSink`(SDK:RULE-PLAT-REC-HLS — 202611/20261110b)로 `hls/` 에 짓는다(해상도 바뀜 → 끊김).
 //!
 //!   cargo run --example mkvcheck --features record -- <표본 폴더>
 
 use std::path::PathBuf;
 
-use oxpeer::record::{Frame, MkvSink, Output, Segment, SegmentKind};
+use oxpeer::record::{Frame, HlsConfig, HlsSink, MkvSink, Output, Segment, SegmentKind};
+
+/// `frames_<코덱>.bin` → [(키, RTP 시각, 본문)]
+fn load(dir: &std::path::Path, name: &str) -> Vec<(bool, u32, Vec<u8>)> {
+    let b = std::fs::read(dir.join(format!("frames_{name}.bin"))).expect("frames");
+    let (mut i, mut out) = (0, Vec::new());
+    while i + 9 <= b.len() {
+        let len = u32::from_be_bytes([b[i + 5], b[i + 6], b[i + 7], b[i + 8]]) as usize;
+        out.push((b[i] == 1, u32::from_be_bytes([b[i + 1], b[i + 2], b[i + 3], b[i + 4]]), b[i + 9..i + 9 + len].to_vec()));
+        i += 9 + len;
+    }
+    out
+}
+
+fn seg(id: u64, kind: &str, codec: &str, event: SegmentKind) -> Segment {
+    Segment {
+        event,
+        id,
+        room: "mkvcheck".into(),
+        track_id: codec.into(),
+        owner: Some("u".into()),
+        kind: kind.into(),
+        codec: codec.into(),
+        source: None,
+        user_id: Some("u".into()),
+        first_utc_ns: None,
+        last_utc_ns: None,
+        first_log_time: 0,
+        last_log_time: 0,
+        frames: 0,
+        bytes: 0,
+        filled: 0,
+        reason: if event == SegmentKind::Closed { Some("end") } else { None },
+    }
+}
+
+/// H264 + Opus 를 RTP 시각(초) 순으로 섞어 HLS 로 — 두 트랙 같은 UTC 원점
+fn hls(dir: &std::path::Path) {
+    let mut sink = HlsSink::new(dir.join("hls"), HlsConfig::default()).expect("폴더");
+    let tracks = [("h264", "video", 90_000u64, 1u64), ("opus", "audio", 48_000, 2)];
+    let mut all: Vec<(u64, usize, bool, u32, Vec<u8>)> = Vec::new();
+    for (k, (name, _, clock, _)) in tracks.iter().enumerate() {
+        let fr = load(dir, name);
+        let t0 = fr[0].1;
+        for (key, ts, data) in fr {
+            all.push((u64::from(ts.wrapping_sub(t0)) * 1_000_000_000 / clock, k, key, ts, data));
+        }
+    }
+    all.sort_by_key(|x| (x.0, x.1));
+    for (name, kind, _, id) in tracks {
+        sink.write(&Output::Segment(seg(id, kind, name, SegmentKind::Opened))).expect("열기");
+    }
+    let base = 1_800_000_000_000_000_000u64;
+    for (at, k, key, ts, data) in all {
+        let (name, kind, _, id) = tracks[k];
+        let f = Frame {
+            segment: Some(id),
+            room: "mkvcheck".into(),
+            track_id: name.into(),
+            owner: Some("u".into()),
+            kind: kind.into(),
+            codec: name.into(),
+            ssrc: id as u32,
+            source: None,
+            user_id: Some("u".into()),
+            keyframe: key,
+            rtp_ts: ts,
+            utc_ns: Some(base + at),
+            log_time: base + at,
+            seq_first: 0,
+            seq_last: 0,
+            rec_first: 0,
+            rec_last: 0,
+            data,
+            filled: false,
+        };
+        sink.write(&Output::Frame(f)).expect("프레임");
+    }
+    for (name, kind, _, id) in tracks {
+        sink.write(&Output::Segment(seg(id, kind, name, SegmentKind::Closed))).expect("닫기");
+    }
+    sink.finish().expect("끝");
+    for st in sink.streams() {
+        println!("{} 조각 {} · init {} · 넘음 {} · 끊김 {}", st.event_playlist.display(), st.segments.len(), st.inits.len(), st.over_target, st.segments.iter().filter(|x| x.discontinuity).count());
+    }
+}
 
 fn main() {
     let dir = PathBuf::from(std::env::args().nth(1).expect("표본 폴더"));
@@ -72,4 +158,5 @@ fn main() {
         std::fs::rename(&sink.files().last().expect("파일").path, &out).expect("이름");
         println!("{} {n} 프레임", out.display());
     }
+    hls(&dir);
 }

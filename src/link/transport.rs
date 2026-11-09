@@ -112,6 +112,8 @@ pub(crate) struct Route {
     pub unit: Unit,
     /// 앱이 이 트랙의 층을 바꾼 차례 — 바뀌면 정리층이 키프레임을 기다린다
     pub layer_gen: u64,
+    /// 앱이 이 트랙에 키프레임을 요청한 차례 — 바뀌면 정리층이 다음 차례에 PLI(SDK:RULE-PLAT-SERVER 수신 정리층)
+    pub key_gen: u64,
 }
 
 /// 경로표 — 줄 ssrc → 경로 · RTX ssrc → 줄 ssrc

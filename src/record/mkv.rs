@@ -109,7 +109,7 @@ fn void(n: usize) -> Vec<u8> {
 }
 
 /// Annex-B → NAL 목록
-fn nals(b: &[u8]) -> Vec<&[u8]> {
+pub(super) fn nals(b: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut starts = Vec::new();
     let mut i = 0;
@@ -134,7 +134,7 @@ fn nals(b: &[u8]) -> Vec<&[u8]> {
 }
 
 /// avcC(ISO 14496-15 §5.2.4.1) — SPS · PPS 가 없으면 줄의 profile(기본 42e0 · level 1f)로 빈 목록
-fn avcc(sps: Option<&[u8]>, pps: Option<&[u8]>) -> Vec<u8> {
+pub(super) fn avcc(sps: Option<&[u8]>, pps: Option<&[u8]>) -> Vec<u8> {
     let (p, c, l) = match sps {
         Some(s) if s.len() >= 4 => (s[1], s[2], s[3]),
         _ => (0x42, 0xe0, 0x1f),
@@ -223,7 +223,7 @@ impl Bits {
 }
 
 /// SPS(H.264 §7.3.2.1.1) → 잘라 낸 뒤 화면 크기
-fn h264_dims(sps: &[u8]) -> Option<(u64, u64)> {
+pub(super) fn h264_dims(sps: &[u8]) -> Option<(u64, u64)> {
     let mut r = Bits::new(sps.get(1..)?);
     let profile = r.bits(8)?;
     r.bits(16)?;

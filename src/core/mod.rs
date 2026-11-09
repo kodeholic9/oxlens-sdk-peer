@@ -46,6 +46,8 @@ pub(crate) enum Cmd {
     Diag(mpsc::UnboundedSender<crate::api::Transition>),
     SetUnit(String, Unit),
     SetLayer(String, Layer, oneshot::Sender<Result<(), Error>>),
+    /// 받는 영상 트랙에 키프레임 요청(SDK:RULE-PLAT-SERVER 수신 정리층 — 녹화 조각 경계)
+    RequestKey(String),
     /// 말하는 쪽(20261107c)
     JoinSpeaking(String, oneshot::Sender<Result<(), Error>>),
     SetSpeakingRoom(String, oneshot::Sender<Result<(), Error>>),
@@ -206,6 +208,8 @@ pub(crate) struct Core {
     pub(crate) units: HashMap<String, Unit>,
     /// 트랙마다 층을 바꾼 차례(정리층이 키프레임을 기다리는 표시)
     pub(crate) layer_gen: HashMap<String, u64>,
+    /// 앱 키프레임 요청 차례(트랙마다 — `Client::request_keyframe`)
+    pub(crate) key_gen: HashMap<String, u64>,
     /// 화자 출처 번호 → 사용자 — `TAKEN` 이 준다(연:RULE-FLR-SLOT-SOURCES · 번호는 트랙이 사는 동안 같다)
     pub(crate) talk_sources: BTreeMap<u32, String>,
     /// 운영 로그
@@ -300,6 +304,7 @@ pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::
         unit: cfg.unit,
         units: HashMap::new(),
         layer_gen: HashMap::new(),
+        key_gen: HashMap::new(),
         talk_sources: BTreeMap::new(),
         cert,
         connect_waiters: Vec::new(),
@@ -549,6 +554,10 @@ impl Core {
                 self.rebuild_routes();
             }
             Cmd::SetLayer(track, layer, tx) => self.set_layer(track, layer, tx),
+            Cmd::RequestKey(track) => {
+                *self.key_gen.entry(track).or_default() += 1;
+                self.rebuild_routes();
+            }
             Cmd::JoinSpeaking(room, tx) => self.join_speaking(room, tx),
             Cmd::SetSpeakingRoom(room, tx) => self.set_speaking_room(room, tx),
             Cmd::Publish(room, spec, frames, tx) => self.publish(room, spec, frames, tx),

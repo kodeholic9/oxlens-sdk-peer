@@ -7,6 +7,7 @@
 //! `sequence` · `log_time` 은 기록기 잠금 안 한 곳에서 매긴다(REC-CLOCK) — 그래서 파일 차례로 둘 다 오른다.
 
 mod file;
+mod hls;
 mod live;
 mod mkv;
 mod ogg;
@@ -15,6 +16,7 @@ mod pipeline;
 pub use file::{FileSource, PartScan, scan_part};
 pub(crate) use live::Shared;
 pub use live::Records;
+pub use hls::{HlsConfig, HlsSegment, HlsSink, HlsStream};
 pub use mkv::{MkvFile, MkvSink};
 pub use ogg::{OggFile, OggSink, opus_samples};
 pub use pipeline::{Frame, Output, Pipeline, Policy, Segment, SegmentKind};

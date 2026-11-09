@@ -38,6 +38,8 @@ struct Args {
     layer_plan: Vec<(u64, u8)>,
     /// 녹화 길이 정책(초) — 없으면 발언 정책(SDK:RULE-PLAT-REC-SPLIT)
     span_secs: Option<u64>,
+    /// 결과물을 HLS 로(SDK:RULE-PLAT-REC-HLS · 202611/20261110b)
+    hls: bool,
     raw: Option<PathBuf>,
     raw_part_ms: Option<u64>,
     raw_part_bytes: Option<u64>,
@@ -48,7 +50,7 @@ struct Args {
 }
 
 fn args() -> Args {
-    let mut a = Args { base: String::new(), room: String::new(), out: PathBuf::from("."), secs: None, hidden: false, user: "oxpeer-recorder".into(), api_key: "ox_k_demo".into(), api_secret: "ox_s_demo".into(), tls_root: None, video: false, spatial: None, layer_plan: Vec::new(), span_secs: None, raw: None, raw_part_ms: None, raw_part_bytes: None, raw_flush_ms: None, raw_tick_ms: None, linger_ms: None };
+    let mut a = Args { base: String::new(), room: String::new(), out: PathBuf::from("."), secs: None, hidden: false, user: "oxpeer-recorder".into(), api_key: "ox_k_demo".into(), api_secret: "ox_s_demo".into(), tls_root: None, video: false, spatial: None, layer_plan: Vec::new(), span_secs: None, hls: false, raw: None, raw_part_ms: None, raw_part_bytes: None, raw_flush_ms: None, raw_tick_ms: None, linger_ms: None };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         let mut v = || it.next().unwrap_or_default();
@@ -65,6 +67,10 @@ fn args() -> Args {
             "--video" => a.video = true,
             "--spatial" => a.spatial = v().parse().ok(),
             "--span-secs" => a.span_secs = v().parse().ok(),
+            "--hls" => {
+                a.hls = true;
+                a.video = true;
+            }
             "--raw" => a.raw = Some(PathBuf::from(v())),
             "--raw-part-ms" => a.raw_part_ms = v().parse().ok(),
             "--raw-part-bytes" => a.raw_part_bytes = v().parse().ok(),
@@ -78,7 +84,7 @@ fn args() -> Args {
         }
     }
     if a.base.is_empty() || a.room.is_empty() {
-        eprintln!("사용: recorder --base http://host:port/media --room <방> [--out 폴더] [--secs N] [--hidden] [--user id] [--video [--span-secs N] [--spatial N] [--layer-plan S:N,..]]");
+        eprintln!("사용: recorder --base http://host:port/media --room <방> [--out 폴더] [--secs N] [--hidden] [--user id] [--video [--span-secs N] [--spatial N] [--layer-plan S:N,..]] [--hls]");
         std::process::exit(2);
     }
     a

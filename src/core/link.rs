@@ -810,6 +810,7 @@ impl Core {
                     pli: fb.contains(&"nack pli"),
                     unit: self.units.get(tid).copied().unwrap_or(self.unit),
                     layer_gen: self.layer_gen.get(tid).copied().unwrap_or(0),
+                    key_gen: self.key_gen.get(tid).copied().unwrap_or(0),
                 };
                 if let Some(x) = m.rtx_ssrc {
                     routes.rtx.insert(x, m.ssrc);

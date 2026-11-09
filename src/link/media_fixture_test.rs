@@ -107,7 +107,7 @@ fn annexb(nals: &[Vec<u8>]) -> Vec<u8> {
 
 fn route(kind: &str, codec: &str) -> Route {
     let video = kind == "video";
-    Route { room: "r".into(), track_id: format!("t-{codec}"), user_id: Some("u".into()), kind: kind.into(), codec: codec.into(), mid: "1".into(), ssrc: 7, pt: 96, nack: video, pli: video, unit: Unit::Frame, layer_gen: 0 }
+    Route { room: "r".into(), track_id: format!("t-{codec}"), user_id: Some("u".into()), kind: kind.into(), codec: codec.into(), mid: "1".into(), ssrc: 7, pt: 96, nack: video, pli: video, unit: Unit::Frame, layer_gen: 0, key_gen: 0 }
 }
 
 /// 패킷 열(프레임마다 [페이로드]) → 정리층 — 7번째마다 이웃과 뒤바꾸고 · 50번째마다 빼서 6 패킷 뒤 RTX 로 되돌린다

@@ -4,6 +4,7 @@
 //!   rawtool frames <dir> <recording_id>            전체 파트를 이어 파이프라인으로 조립한 프레임
 //!   rawtool frames <dir> <recording_id> --part K   파트 K 하나만(파트 자족 — SDK:RULE-PLAT-REC-PART 머리 스냅숏)
 //!   rawtool frames <dir> <recording_id> --ref      대조군 — webrtc-media SampleBuilder + 디패킷타이저(설계 D15 · 기능 record-ref)
+//!   rawtool nals <dir> <recording_id>              H264 영상 프레임마다 NAL 종류(실측 M4 — SPS · PPS 가 키프레임 안에만 오나 · 202611/20261110b)
 //!
 //! 프레임 하나 = [줄 SSRC, RTP 시각, 키프레임, 길이, CRC32, 첫 레코드 순번, 끝 레코드 순번, 종류 a|v](대조군은 레코드 순번이 없어 0).
 
@@ -14,8 +15,8 @@ use serde_json::{Value, json};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() < 3 || args[0] != "frames" {
-        eprintln!("사용: rawtool frames <dir> <recording_id> [--part K | --ref]");
+    if args.len() < 3 || (args[0] != "frames" && args[0] != "nals") {
+        eprintln!("사용: rawtool frames <dir> <recording_id> [--part K | --ref] · rawtool nals <dir> <recording_id>");
         std::process::exit(2);
     }
     let dir = PathBuf::from(&args[1]);
@@ -31,6 +32,10 @@ fn main() {
     };
     let mut recs: Vec<Record> = Vec::new();
     src.run(|r| recs.push(r));
+    if args[0] == "nals" {
+        println!("{}", json!({ "parts": src.parts().len(), "frames": nal_frames(&recs) }));
+        return;
+    }
     let frames = if reference { reference_frames(&recs) } else { our_frames(&recs) };
     println!("{}", json!({ "parts": src.parts().len(), "records": recs.len(), "reference": reference, "frames": frames }));
 }
@@ -46,6 +51,25 @@ fn our_frames(recs: &[Record]) -> Vec<Value> {
                     continue;
                 }
                 out.push(json!([f.ssrc, f.rtp_ts, f.keyframe, f.data.len(), crc32fast::hash(&f.data), f.rec_first, f.rec_last, if f.kind == "video" { "v" } else { "a" }]));
+            }
+        }
+    }
+    out
+}
+
+/// H264 영상 프레임마다 [줄 SSRC, RTP 시각, 키프레임, [NAL 종류 …]] — Annex-B 시작 부호로 가른다
+fn nal_frames(recs: &[Record]) -> Vec<Value> {
+    let mut p = Pipeline::new(Policy::Span { time_ns: u64::MAX, bytes: u64::MAX });
+    let mut out = Vec::new();
+    for r in recs {
+        for o in p.push(r) {
+            if let Output::Frame(f) = o
+                && f.kind == "video"
+                && f.codec.eq_ignore_ascii_case("h264")
+            {
+                let d = &f.data;
+                let types: Vec<u8> = (0..d.len().saturating_sub(3)).filter(|&i| d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1).map(|i| d[i + 3] & 0x1f).collect();
+                out.push(json!([f.ssrc, f.rtp_ts, f.keyframe, types]));
             }
         }
     }

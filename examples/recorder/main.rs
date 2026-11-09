@@ -193,7 +193,7 @@ async fn main() {
     for o in pipe.finish() {
         let _ = sink.write(&o);
     }
-    let done: Vec<Value> = sink.files().iter().map(|f| json!({ "file": f.path, "speaker": f.user_id, "csrc": f.source, "packets": f.packets, "samples": f.samples, "first_seq": f.first_seq, "last_seq": f.last_seq, "segment": f.segment, "reason": f.reason })).collect();
+    let done: Vec<Value> = sink.files().iter().map(|f| json!({ "file": f.path, "speaker": f.user_id, "csrc": f.source, "packets": f.packets, "samples": f.samples, "first_seq": f.first_seq, "last_seq": f.last_seq, "segment": f.segment, "reason": f.reason, "filled": f.filled, "first_ts": f.first_ts, "end_ts": f.end_ts })).collect();
     let mut out = json!({
         "room": a.room,
         "utterances": done,

@@ -35,13 +35,16 @@ fn main() {
     println!("{}", json!({ "parts": src.parts().len(), "records": recs.len(), "reference": reference, "frames": frames }));
 }
 
-/// 우리 파이프라인 — 세그먼트와 상관없이 조립된 프레임 전부(출처 없는 프레임 포함)
+/// 우리 파이프라인 — 세그먼트와 상관없이 조립된 프레임 전부(출처 없는 프레임 포함) · ★메운 PLC 는 뺀다(조립이 아니라 정리층이 지은 것 — SDK:RULE-PLAT-REC-GAP · 202611/20261109f)
 fn our_frames(recs: &[Record]) -> Vec<Value> {
     let mut p = Pipeline::new(Policy::Span { time_ns: u64::MAX, bytes: u64::MAX });
     let mut out = Vec::new();
     for r in recs {
         for o in p.push(r) {
             if let Output::Frame(f) | Output::Orphan(f) = o {
+                if f.filled {
+                    continue;
+                }
                 out.push(json!([f.ssrc, f.rtp_ts, f.keyframe, f.data.len(), crc32fast::hash(&f.data), f.rec_first, f.rec_last, if f.kind == "video" { "v" } else { "a" }]));
             }
         }

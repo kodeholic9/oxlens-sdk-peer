@@ -49,6 +49,8 @@ pub struct Frame {
     pub rec_first: u32,
     pub rec_last: u32,
     pub data: Vec<u8>,
+    /// 메운 프레임(Opus PLC — SDK:RULE-PLAT-REC-GAP) — 받은 것이 아니다
+    pub filled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +77,9 @@ pub struct Segment {
     pub last_log_time: u64,
     pub frames: u64,
     pub bytes: u64,
-    /// 닫힌 까닭 — `source` · `no_source` · `span` · `track` · `end`
+    /// 메운 프레임 수(SDK:RULE-PLAT-REC-GAP)
+    pub filled: u64,
+    /// 닫힌 까닭 — `source` · `no_source` · `span` · `gap` · `track` · `end`
     pub reason: Option<&'static str>,
 }
 
@@ -125,10 +129,26 @@ pub struct Counts {
     pub broken: u64,
     /// 키프레임 전이라 버린 영상 프레임
     pub before_key: u64,
+    /// 메운 PLC 프레임(SDK:RULE-PLAT-REC-GAP)
+    pub filled: u64,
 }
+
+/// 음성 세그먼트의 꼬리 — 다음 프레임이 이어 붙을 RTP 시각 · 앞 TOC · 넘긴 나머지(표본)
+#[derive(Clone, Copy)]
+struct Tail {
+    end_ts: u32,
+    toc: u8,
+    carry: u64,
+    utc_end: Option<u64>,
+}
+
+/// 구멍 상한 기본(표본 — 5분 · Jitsi 기본과 같다)
+const GAP_MAX_SAMPLES: u64 = 5 * 60 * 48_000;
 
 pub struct Pipeline {
     policy: Policy,
+    gap_max: u64,
+    tails: HashMap<String, Tail>,
     rows: HashMap<u32, Row>,
     owners: HashMap<String, Option<String>>,
     sources: HashMap<u32, String>,
@@ -141,7 +161,13 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn new(policy: Policy) -> Pipeline {
-        Pipeline { policy, rows: HashMap::new(), owners: HashMap::new(), sources: HashMap::new(), lines: HashMap::new(), sr: HashMap::new(), open: BTreeMap::new(), next_id: 0, counts: Counts::default() }
+        Pipeline { policy, gap_max: GAP_MAX_SAMPLES, tails: HashMap::new(), rows: HashMap::new(), owners: HashMap::new(), sources: HashMap::new(), lines: HashMap::new(), sr: HashMap::new(), open: BTreeMap::new(), next_id: 0, counts: Counts::default() }
+    }
+
+    /// 구멍 상한(SDK:RULE-PLAT-REC-GAP — 넘으면 세그먼트를 새로 연다)
+    pub fn with_gap_max(mut self, d: std::time::Duration) -> Pipeline {
+        self.gap_max = (d.as_millis() as u64) * 48;
+        self
     }
 
     pub fn counts(&self) -> &Counts {
@@ -343,6 +369,7 @@ impl Pipeline {
             rec_first: a.rec_first,
             rec_last: a.rec_last,
             data: a.data,
+            filled: false,
         };
         self.split(frame, out);
     }
@@ -391,11 +418,29 @@ impl Pipeline {
                 last_log_time: f.log_time,
                 frames: 0,
                 bytes: 0,
+                filled: 0,
                 reason: None,
             };
+            self.tails.remove(&key);
             self.next_id += 1;
             out.push(Output::Segment(s.clone()));
             self.open.insert(key.clone(), s);
+        }
+        // 음성 구멍 — 같은 세그먼트 안에서 앞 프레임 끝보다 늦게 시작하면 PLC 로 메운다 · 상한을 넘으면 세그먼트를 새로 연다(SDK:RULE-PLAT-REC-GAP)
+        if f.kind == "audio" && f.codec.eq_ignore_ascii_case("opus") && !f.data.is_empty() {
+            if let Some(t) = self.tails.get(&key).copied() {
+                let hole = f.rtp_ts.wrapping_sub(t.end_ts) as i32;
+                if hole > 0 && hole as u64 > self.gap_max {
+                    self.close(&key, "gap", out);
+                    return self.split(f, out);
+                }
+                if hole > 0 {
+                    self.fill(&key, &f, t, hole as u64, out);
+                }
+            }
+            let len = super::ogg::opus_samples(&f.data);
+            let carry = self.tails.get(&key).map(|t| t.carry).unwrap_or(0);
+            self.tails.insert(key.clone(), Tail { end_ts: f.rtp_ts.wrapping_add(len as u32), toc: f.data[0], carry, utc_end: f.utc_ns.map(|u| u + len * 1_000_000_000 / 48_000) });
         }
         if let Some(s) = self.open.get_mut(&key) {
             s.frames += 1;
@@ -411,6 +456,38 @@ impl Pipeline {
             f.segment = Some(s.id);
         }
         out.push(Output::Frame(f));
+    }
+
+    /// 구멍 하나를 PLC 패킷으로(앞 TOC 의 config · code 0 · 빈 프레임) — 개수 = (구멍 + 넘긴 나머지) ÷ 앞 프레임 길이 · 나머지는 넘긴다
+    fn fill(&mut self, key: &str, f: &Frame, t: Tail, hole: u64, out: &mut Vec<Output>) {
+        let toc = t.toc & 0xFC;
+        let per = super::ogg::opus_samples(&[toc]).max(1);
+        let total = hole + t.carry;
+        let n = total / per;
+        if let Some(x) = self.tails.get_mut(key) {
+            x.carry = total % per;
+        }
+        let Some(seg) = self.open.get_mut(key) else { return };
+        for i in 0..n {
+            let ts = t.end_ts.wrapping_add((i * per) as u32);
+            seg.frames += 1;
+            seg.filled += 1;
+            seg.bytes += 1;
+            out.push(Output::Frame(Frame {
+                segment: Some(seg.id),
+                keyframe: true,
+                rtp_ts: ts,
+                utc_ns: t.utc_end.map(|u| u + i * per * 1_000_000_000 / 48_000),
+                seq_first: f.seq_first,
+                seq_last: f.seq_first,
+                rec_first: f.rec_first,
+                rec_last: f.rec_first,
+                data: vec![toc],
+                filled: true,
+                ..f.clone()
+            }));
+        }
+        self.counts.filled += n;
     }
 
     fn close(&mut self, key: &str, why: &'static str, out: &mut Vec<Output>) {

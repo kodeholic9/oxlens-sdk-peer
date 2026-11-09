@@ -23,6 +23,11 @@ pub struct OggFile {
     pub samples: u64,
     pub first_seq: Option<u16>,
     pub last_seq: Option<u16>,
+    /// 첫 프레임 RTP 시각 · 마지막 프레임 끝(RTP 시각 + 길이) — 메운 뒤 `samples` 와 이 폭이 같아야 한다(SDK:RULE-PLAT-REC-GAP)
+    pub first_ts: Option<u32>,
+    pub end_ts: Option<u32>,
+    /// 메운 PLC 프레임 수
+    pub filled: u64,
     /// 닫힌 까닭(세그먼트 사건)
     pub reason: Option<String>,
 }
@@ -56,7 +61,7 @@ impl OggSink {
                 let who = s.user_id.clone().unwrap_or_else(|| s.source.map(|c| format!("csrc{c}")).unwrap_or_else(|| "none".into()));
                 let path = self.dir.join(format!("{}-{:04}-{}.ogg", safe(&s.room), s.id, safe(&who)));
                 let w = OggOpus::create(&path, s.id as u32)?;
-                let file = OggFile { path, segment: s.id, track_id: s.track_id.clone(), user_id: s.user_id.clone(), source: s.source, packets: 0, samples: 0, first_seq: None, last_seq: None, reason: None };
+                let file = OggFile { path, segment: s.id, track_id: s.track_id.clone(), user_id: s.user_id.clone(), source: s.source, packets: 0, samples: 0, first_seq: None, last_seq: None, first_ts: None, end_ts: None, filled: 0, reason: None };
                 self.open.insert(s.id, Open { w, file });
             }
             Output::Segment(s) => {
@@ -73,8 +78,13 @@ impl OggSink {
                 if let Some(x) = f.segment.and_then(|id| self.open.get_mut(&id)) {
                     x.w.push(&f.data)?;
                     x.file.packets += 1;
-                    x.file.first_seq.get_or_insert(f.seq_first);
-                    x.file.last_seq = Some(f.seq_last);
+                    x.file.filled += u64::from(f.filled);
+                    if !f.filled {
+                        x.file.first_seq.get_or_insert(f.seq_first);
+                        x.file.last_seq = Some(f.seq_last);
+                    }
+                    x.file.first_ts.get_or_insert(f.rtp_ts);
+                    x.file.end_ts = Some(f.rtp_ts.wrapping_add(opus_samples(&f.data) as u32));
                 }
             }
             Output::Orphan(_) => {}

@@ -167,6 +167,8 @@ pub(crate) struct MediaSink {
     pub counters: Arc<Counters>,
     /// ★QA 스위치(`OXPEER_QA_DROP_VIDEO_EVERY`) — 받은 영상 원본 패킷 N 개마다 하나를 정리층 앞에서 버린다(망 손실 흉내 · RTX 는 안 버린다). 0 = 끔 · 2층 손실 시나리오의 시험 수단
     pub qa_drop_every: u64,
+    /// ★QA 스위치(`OXPEER_QA_DROP_AUDIO_EVERY`) — 받은 음성 원본 N 개마다 하나를 정리층 앞에서 버린다(녹음 구멍 메우기 시험 — context 202611/20261109f) · `qa_dropped` 에 함께 센다
+    pub qa_drop_audio_every: u64,
     pub qa_dropped: Arc<AtomicU64>,
     /// 보내는 트랙(발행 ssrc → RTP 상태) — 송신 시계가 쥐고 발행 연결의 NACK 이 빌린다
     pub senders: Arc<RwLock<HashMap<u32, Arc<Mutex<SendTrack>>>>>,
@@ -535,6 +537,13 @@ fn on_rtp(pkt: &[u8], rx: &Arc<OnceLock<Mutex<Context>>>, sink: &MediaSink, seen
     } else {
         if seen.insert(h.ssrc) {
             say.send(Fact::FirstRtp(h.ssrc));
+        }
+        if sink.qa_drop_audio_every > 0 && r.kind == "audio" {
+            *qa_n += 1;
+            if (*qa_n).is_multiple_of(sink.qa_drop_audio_every) {
+                sink.qa_dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
         if sink.qa_drop_every > 0 && r.kind == "video" {
             *qa_n += 1;

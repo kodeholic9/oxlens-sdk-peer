@@ -452,3 +452,56 @@ async fn late_subscriber_gets_current_state_first() {
     }
     assert_eq!(pl.counts().unrouted, 0);
 }
+
+// ── 3단계 — 음성 구멍 PLC(SDK:RULE-PLAT-REC-GAP) ──
+
+fn opus_stream(seqs_ts: &[(u16, u32)], toc: u8) -> Vec<Record> {
+    let mut v = vec![rec(1, 0, Channel::Track, tracks("r"))];
+    for (i, (seq, ts)) in seqs_ts.iter().enumerate() {
+        v.push(rec(2 + i as u32, (i as u64 + 1) * 20_000_000, Channel::Rtp(100), pkt(*seq, *ts, true, Some(7), &[toc, 9, 9])));
+    }
+    v
+}
+
+#[test]
+fn audio_hole_is_filled_with_plc_and_remainder_carries() {
+    // 20ms 프레임(960) · seq 3 · 4 를 잃음(구멍 1,920) · 그다음 구멍 1,000(= 960 하나 + 40 넘김) · 그다음 920(+40 = 960 하나)
+    let out = run_pipe(Policy::Utterance, &opus_stream(&[(1, 0), (2, 960), (5, 3_840), (6, 5_800), (7, 7_680)], 0x78));
+    let frames: Vec<(u32, bool, usize)> = out.iter().filter_map(|o| if let Output::Frame(f) = o { Some((f.rtp_ts, f.filled, f.data.len())) } else { None }).collect();
+    assert_eq!(frames, vec![(0, false, 3), (960, false, 3), (1_920, true, 1), (2_880, true, 1), (3_840, false, 3), (4_800, true, 1), (5_800, false, 3), (6_760, true, 1), (7_680, false, 3)]);
+    let plc: Vec<u8> = out.iter().filter_map(|o| if let Output::Frame(f) = o { f.filled.then(|| f.data[0]) } else { None }).collect();
+    assert!(plc.iter().all(|t| *t == 0x78 & 0xFC), "앞 TOC 의 config · code 0");
+    let closed = out.iter().find_map(|o| if let Output::Segment(s) = o { (s.event == SegmentKind::Closed).then_some(s.filled) } else { None });
+    assert_eq!(closed, Some(4));
+}
+
+#[test]
+fn hole_over_cap_opens_new_segment_without_fill() {
+    let mut pl = Pipeline::new(Policy::Utterance).with_gap_max(Duration::from_millis(100));
+    let mut out = Vec::new();
+    for r in opus_stream(&[(1, 0), (2, 960), (3, 48_000)], 0x78) {
+        out.extend(pl.push(&r));
+    }
+    out.extend(pl.finish());
+    let closes: Vec<Option<&str>> = out.iter().filter_map(|o| if let Output::Segment(s) = o { (s.event == SegmentKind::Closed).then_some(s.reason) } else { None }).collect();
+    assert_eq!(closes, vec![Some("gap"), Some("end")]);
+    assert!(!out.iter().any(|o| matches!(o, Output::Frame(f) if f.filled)));
+}
+
+#[test]
+fn video_is_never_filled() {
+    let out = run_pipe(Policy::Utterance, &stream());
+    assert!(!out.iter().any(|o| matches!(o, Output::Frame(f) if f.filled && f.kind == "video")));
+}
+
+#[test]
+fn ogg_with_filled_frames_spans_rtp_time() {
+    let d = tmp("oggfill");
+    let mut sink = OggSink::new(&d).unwrap();
+    for o in run_pipe(Policy::Utterance, &opus_stream(&[(1, 0), (2, 960), (5, 3_840)], 0x78)) {
+        sink.write(&o).unwrap();
+    }
+    let f = &sink.files()[0];
+    assert_eq!((f.packets, f.filled), (5, 2));
+    assert_eq!(u64::from(f.end_ts.unwrap() - f.first_ts.unwrap()), f.samples, "메운 뒤 표본 수 = RTP 폭");
+}

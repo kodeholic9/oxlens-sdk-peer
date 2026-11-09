@@ -3,7 +3,7 @@
 //! 분기(줄 → 트랙 · CSRC → 출처) → 조립(차례가 선 패킷 · `gap` 은 깨진 프레임 · 영상은 키프레임부터) → 시간축(SR → UTC) → 분할 정책.
 //! ★시스템 시계를 읽지 않는다 — 시간은 레코드의 `log_time` 과 RTP · SR 뿐이다. 그래서 라이브 레코드열과 파일 레코드열이 같으면 출력도 같다.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -131,6 +131,8 @@ pub struct Counts {
     pub before_key: u64,
     /// 메운 PLC 프레임(SDK:RULE-PLAT-REC-GAP)
     pub filled: u64,
+    /// 목록에서 빠진 개인 트랙으로 판정된 늦은 프레임(SDK:RULE-PLAT-REC-SPLIT 트랙이 사라짐) — 세그먼트에 넣지 않았다
+    pub late: u64,
 }
 
 /// 음성 세그먼트의 꼬리 — 다음 프레임이 이어 붙을 RTP 시각 · 앞 TOC · 넘긴 나머지(표본)
@@ -152,6 +154,11 @@ pub struct Pipeline {
     rows: HashMap<u32, Row>,
     owners: HashMap<String, Option<String>>,
     sources: HashMap<u32, String>,
+    /// 출처 번호 → 개인 트랙(SDK:RULE-PLAT-REC-PIPE 분기 — 프레임의 트랙 = 출처 트랙)
+    src_tracks: HashMap<u32, String>,
+    /// 방마다 목록에 있는 개인 트랙 · 목록에서 빠진 개인 트랙
+    listed: HashMap<String, BTreeSet<String>>,
+    departed: HashSet<String>,
     lines: HashMap<u32, Line>,
     sr: HashMap<u32, (u64, u32)>,
     open: BTreeMap<String, Segment>,
@@ -161,7 +168,7 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn new(policy: Policy) -> Pipeline {
-        Pipeline { policy, gap_max: GAP_MAX_SAMPLES, tails: HashMap::new(), rows: HashMap::new(), owners: HashMap::new(), sources: HashMap::new(), lines: HashMap::new(), sr: HashMap::new(), open: BTreeMap::new(), next_id: 0, counts: Counts::default() }
+        Pipeline { policy, gap_max: GAP_MAX_SAMPLES, tails: HashMap::new(), rows: HashMap::new(), owners: HashMap::new(), sources: HashMap::new(), src_tracks: HashMap::new(), listed: HashMap::new(), departed: HashSet::new(), lines: HashMap::new(), sr: HashMap::new(), open: BTreeMap::new(), next_id: 0, counts: Counts::default() }
     }
 
     /// 구멍 상한(SDK:RULE-PLAT-REC-GAP — 넘으면 세그먼트를 새로 연다)
@@ -224,12 +231,24 @@ impl Pipeline {
     fn track(&mut self, data: &[u8], out: &mut Vec<Output>) {
         let Ok(v) = serde_json::from_slice::<Value>(data) else { return };
         let Some(room) = v["room"].as_str() else { return };
+        let mut personal: BTreeSet<String> = BTreeSet::new();
         for t in v["tracks"].as_array().into_iter().flatten() {
             let Some(tid) = t["track_id"].as_str() else { continue };
             self.owners.insert(tid.to_string(), t["user_id"].as_str().map(str::to_string));
             if let (Some(c), Some(u)) = (t["csrc"].as_u64(), t["user_id"].as_str()) {
                 self.sources.insert(c as u32, u.to_string());
+                self.src_tracks.insert(c as u32, tid.to_string());
             }
+            if t["user_id"].as_str().is_some() {
+                personal.insert(tid.to_string());
+                self.departed.remove(tid);
+            }
+        }
+        // 목록에서 빠진 개인 트랙 — 세그먼트를 닫고 늦은 프레임을 막는다(SDK:RULE-PLAT-REC-SPLIT 트랙이 사라짐)
+        let before = self.listed.insert(room.to_string(), personal.clone()).unwrap_or_default();
+        for tid in before.difference(&personal) {
+            self.close(&format!("track/{tid}"), "track", out);
+            self.departed.insert(tid.clone());
         }
         let mut now: HashMap<u32, Row> = HashMap::new();
         for (k, x) in v["rows"].as_object().into_iter().flatten() {
@@ -245,15 +264,21 @@ impl Pipeline {
             };
             now.insert(ssrc, row);
         }
-        // 그 방의 줄 — 빠진 줄 · 트랙이 바뀐 줄은 조립을 버리고 세그먼트를 닫는다
+        // 그 방의 줄 — 빠진 줄 · 트랙이 바뀐 줄은 조립을 버린다 · ★줄이 바뀐 것만으로는 세그먼트를 닫지 않는다 — 무전 슬롯은 그 트랙을 실은 줄이 없어질 때 닫는다
         let mut gone: Vec<u32> = self.rows.iter().filter(|(k, r)| r.room == room && now.get(k) != Some(r)).map(|(k, _)| *k).collect();
         gone.sort_unstable();
+        let carried: HashSet<&str> = now.values().map(|r| r.track_id.as_str()).collect();
+        let mut slots: BTreeSet<String> = BTreeSet::new();
         for k in gone {
             if let Some(old) = self.rows.remove(&k) {
                 self.lines.remove(&k);
-                let key = self.seg_key(k, &old.track_id);
-                self.close(&key, "track", out);
+                if self.owners.get(&old.track_id).cloned().flatten().is_none() && !carried.contains(old.track_id.as_str()) {
+                    slots.insert(old.track_id);
+                }
             }
+        }
+        for tid in slots {
+            self.close(&format!("track/{tid}"), "track", out);
         }
         for (k, r) in now {
             self.rows.entry(k).or_insert(r);
@@ -327,6 +352,12 @@ impl Pipeline {
 
     fn finish_frame(&mut self, ssrc: u32, row: &Row, a: Asm, out: &mut Vec<Output>) {
         let video = row.kind == "video";
+        // 분기 — 프레임의 트랙 = 출처 트랙(개인) · 아니면 줄 트랙(SDK:RULE-PLAT-REC-PIPE) · 목록에서 빠진 트랙의 늦은 프레임은 센다(키프레임 대기보다 먼저)
+        let track_id = a.source.and_then(|c| self.src_tracks.get(&c).cloned()).unwrap_or_else(|| row.track_id.clone());
+        if self.departed.contains(&track_id) {
+            self.counts.late += 1;
+            return;
+        }
         let Some(line) = self.lines.get_mut(&ssrc) else { return };
         if a.broken {
             self.counts.broken += 1;
@@ -353,8 +384,8 @@ impl Pipeline {
         let frame = Frame {
             segment: None,
             room: row.room.clone(),
-            track_id: row.track_id.clone(),
-            owner: self.owners.get(&row.track_id).cloned().flatten(),
+            owner: self.owners.get(&track_id).cloned().flatten(),
+            track_id,
             kind: row.kind.clone(),
             codec: row.codec.clone(),
             ssrc,
@@ -374,15 +405,9 @@ impl Pipeline {
         self.split(frame, out);
     }
 
-    fn seg_key(&self, ssrc: u32, track_id: &str) -> String {
-        match self.policy {
-            Policy::Utterance => format!("row/{ssrc}"),
-            Policy::Span { .. } => format!("track/{track_id}"),
-        }
-    }
-
     fn split(&mut self, mut f: Frame, out: &mut Vec<Output>) {
-        let key = self.seg_key(f.ssrc, &f.track_id);
+        // ★열쇠 = 트랙 — 두 정책 같다(SDK:RULE-PLAT-REC-SPLIT)
+        let key = format!("track/{}", f.track_id);
         match self.policy {
             Policy::Utterance => {
                 let Some(src) = f.source else {
@@ -402,6 +427,11 @@ impl Pipeline {
             }
         }
         if !self.open.contains_key(&key) {
+            // ★영상 세그먼트는 키프레임에서만 연다(SDK:RULE-PLAT-REC-SPLIT)
+            if f.kind == "video" && !f.keyframe {
+                self.counts.before_key += 1;
+                return;
+            }
             let s = Segment {
                 event: SegmentKind::Opened,
                 id: self.next_id,

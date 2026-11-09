@@ -8,12 +8,14 @@
 
 mod file;
 mod live;
+mod mkv;
 mod ogg;
 mod pipeline;
 
 pub use file::{FileSource, PartScan, scan_part};
 pub(crate) use live::Shared;
 pub use live::Records;
+pub use mkv::{MkvFile, MkvSink};
 pub use ogg::{OggFile, OggSink, opus_samples};
 pub use pipeline::{Frame, Output, Pipeline, Policy, Segment, SegmentKind};
 

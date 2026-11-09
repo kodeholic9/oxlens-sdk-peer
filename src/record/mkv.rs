@@ -1,16 +1,20 @@
 // author: kodeholic (powered by Claude)
-//! Matroska 파일 하나에 트랙 하나(20261107a B4) — SDK 가 조립한 코덱 프레임을 그대로 담는다(다시 인코딩하지 않는다).
+//! 내장 결과물 — Matroska(SDK:RULE-PLAT-REC-MKV · 202611/20261110a — 예제 녹화기 20261107a B4 에서 옮김). ★세그먼트 하나 = 파일 하나 · 트랙 하나.
+//! ★프레임(지점 ②)과 세그먼트 사건(지점 ③)만 쓴다(SDK:RULE-PLAT-REC-API). 받은 코덱 프레임을 그대로 담는다(다시 인코딩하지 않는다).
 //! VP8 은 그대로 · H264 는 Annex-B 를 길이 앞붙임(avcC)으로 바꾼다(Matroska `V_MPEG4/ISO/AVC`) · Opus 는 그대로(`A_OPUS`).
-//! 블록 시각은 RTP 시각 차(그 코덱 시계)로 센다 — SR 이 늦게 와도 뒤로 가지 않는다. 파일 시작 벽시계(DateUTC)는 첫 SR 동기 프레임에서
-//! 거꾸로 셈해 닫을 때 고쳐 쓴다(동기 프레임이 없으면 첫 프레임을 받은 시각).
+//! 블록 시각은 RTP 시각 차(그 코덱 시계)로 센다 — SR 이 늦게 와도 뒤로 가지 않는다 · 세그먼트 안에서 줄이 바뀌면 두 프레임의 `log_time` 차로 잇는다.
+//! 파일 시작 벽시계(DateUTC)는 첫 UTC 있는 프레임에서 거꾸로 셈해 닫을 때 고쳐 쓴다(UTC 있는 프레임이 없으면 첫 프레임의 `log_time`).
+//! ★결정론(SDK:RULE-PLAT-REC-PIPE) — 시스템 시계를 읽지 않는다 · 파일 이름 · 트랙 번호는 세그먼트에서 셈한다.
 //! Segment · Cluster 는 크기 모르는 꼴(라이브 Matroska)로 열어 쓰고 ★닫을 때 고쳐 쓴다 — 클러스터는 다음 클러스터를 열 때 크기를,
 //! 파일은 닫을 때 Segment 크기 · Duration · Cues(키프레임 클러스터 찾기 표) · SeekHead(Info · Tracks · Cues 자리)를. 도중에 죽어도 라이브 꼴로 읽힌다.
 //! (20261107 재생기 실측 — 크기 모르는 꼴만으로는 ffprobe 길이가 N/A 였다 · 시간 이동은 ffmpeg 가 파일을 훑어 됐다 — Cues 는 훑지 않는 재생기 몫.)
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+
+use super::pipeline::{Output, SegmentKind};
 
 const ID_EBML: u32 = 0x1A45_DFA3;
 const ID_SEGMENT: u32 = 0x1853_8067;
@@ -30,14 +34,14 @@ const CLUSTER_SPAN_MS: u64 = 30_000;
 const AUDIO_CLUSTER_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Codec {
+enum Codec {
     Vp8,
     H264,
     Opus,
 }
 
 impl Codec {
-    pub fn of(name: &str) -> Option<Codec> {
+    fn of(name: &str) -> Option<Codec> {
         match name.to_ascii_lowercase().as_str() {
             "vp8" => Some(Codec::Vp8),
             "h264" => Some(Codec::H264),
@@ -105,7 +109,7 @@ fn void(n: usize) -> Vec<u8> {
 }
 
 /// Annex-B → NAL 목록
-pub fn nals(b: &[u8]) -> Vec<&[u8]> {
+fn nals(b: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut starts = Vec::new();
     let mut i = 0;
@@ -299,7 +303,7 @@ fn length_prefixed(b: &[u8]) -> Vec<u8> {
     v
 }
 
-pub struct Mkv {
+struct Mkv {
     f: File,
     codec: Codec,
     date_at: u64,
@@ -320,18 +324,19 @@ pub struct Mkv {
     unwrapped: u64,
     last_ts: u32,
     cluster_at: Option<u64>,
-    start_wall: Option<SystemTime>,
-    pub frames: u64,
-    pub keyframes: u64,
-    pub synced: u64,
-    pub first_rtp: Option<u32>,
-    pub last_rtp: u32,
-    pub last_ms: u64,
+    /// 파일 시작 벽시계(유닉스 ns)
+    start_ns: Option<u64>,
+    frames: u64,
+    keyframes: u64,
+    synced: u64,
+    first_rtp: Option<u32>,
+    last_rtp: u32,
+    last_ms: u64,
 }
 
 impl Mkv {
     /// 첫 프레임(영상은 키프레임)을 보고 연다 — 머리(코덱 사적 자료 · 화면 크기)가 그 프레임에서 나온다
-    pub fn create(path: &Path, codec: Codec, first: &[u8], uid: u64) -> io::Result<Mkv> {
+    fn create(path: &Path, codec: Codec, first: &[u8], uid: u64) -> io::Result<Mkv> {
         let mut f = File::create(path)?;
         let ebml = [uint(0x4286, 1), uint(0x42F7, 1), uint(0x42F2, 4), uint(0x42F3, 8), text(0x4282, "matroska"), uint(0x4287, 4), uint(0x4285, 2)].concat();
         f.write_all(&el(ID_EBML, &ebml))?;
@@ -404,7 +409,7 @@ impl Mkv {
             unwrapped: 0,
             last_ts: 0,
             cluster_at: None,
-            start_wall: None,
+            start_ns: None,
             frames: 0,
             keyframes: 0,
             synced: 0,
@@ -414,8 +419,8 @@ impl Mkv {
         })
     }
 
-    /// 프레임 하나 — RTP 시각 · 키프레임 · 벽시계(SR 로 이은 것이면 synced)
-    pub fn push(&mut self, ts: u32, key: bool, data: &[u8], wall: SystemTime, synced: bool) -> io::Result<()> {
+    /// 프레임 하나 — RTP 시각 · 키프레임 · UTC(SR 로 이은 것 — 없으면 `None`) · 레코드 시각
+    fn push(&mut self, ts: u32, key: bool, data: &[u8], utc_ns: Option<u64>, log_time: u64) -> io::Result<()> {
         let clock = self.codec.clock();
         match self.first_ts {
             None => {
@@ -430,9 +435,12 @@ impl Mkv {
         self.last_ts = ts;
         self.last_rtp = ts;
         let ms = self.unwrapped * 1_000 / clock;
-        // 시작 벽시계 = 이 프레임 벽시계 − 지금까지 흐른 RTP 시간 — 동기된 것이 오면 그것으로 고친다
-        if self.start_wall.is_none() || (synced && self.synced == 0) {
-            self.start_wall = Some(wall - std::time::Duration::from_millis(ms));
+        // 시작 벽시계 = 이 프레임 시각 − 지금까지 흐른 RTP 시간 — UTC 있는 첫 프레임이 오면 그것으로 고친다(없으면 첫 프레임의 레코드 시각)
+        let synced = utc_ns.is_some();
+        if self.start_ns.is_none() || (synced && self.synced == 0) {
+            let at = utc_ns.unwrap_or(log_time);
+            // 블록 시각(ms 내림)과 같은 경과를 뺀다 — DateUTC + 블록 시각 = 그 프레임 시각
+            self.start_ns = Some(at.saturating_sub(ms * 1_000_000));
         }
         if synced {
             self.synced += 1;
@@ -474,12 +482,12 @@ impl Mkv {
         Ok(())
     }
 
-    /// 다음 프레임(RTP 시각 `ts`)을 마지막 프레임에서 `gap` 뒤로 잇는다 — 트랙이 시각 기준이 다른 줄로 옮겨 왔을 때(RTP 시각 차가 뜻이 없다)
-    pub fn rebase(&mut self, ts: u32, gap: std::time::Duration) {
+    /// 다음 프레임(RTP 시각 `ts`)을 마지막 프레임에서 `gap_ns` 뒤로 잇는다 — 트랙이 시각 기준이 다른 줄로 옮겨 왔을 때(RTP 시각 차가 뜻이 없다)
+    fn rebase(&mut self, ts: u32, gap_ns: u64) {
         if self.first_ts.is_none() {
             return;
         }
-        let ticks = (gap.as_secs_f64() * self.codec.clock() as f64).round() as u32;
+        let ticks = (u128::from(gap_ns) * u128::from(self.codec.clock()) / 1_000_000_000) as u32;
         self.last_ts = ts.wrapping_sub(ticks.max(1));
     }
 
@@ -495,7 +503,7 @@ impl Mkv {
     }
 
     /// 닫는다 — DateUTC 를 고쳐 쓰고 파일 시작 벽시계(유닉스 ms)를 돌려준다
-    pub fn finish(mut self) -> io::Result<Option<u64>> {
+    fn finish(mut self) -> io::Result<Option<u64>> {
         self.close_cluster()?;
         // Cues — 클러스터마다 한 점(영상은 클러스터가 키프레임에서 시작한다)
         let cues_at = self.f.stream_position()?;
@@ -517,17 +525,170 @@ impl Mkv {
         self.f.write_all(&room)?;
         self.f.seek(SeekFrom::Start(self.duration_at))?;
         self.f.write_all(&((self.last_ticks + self.last_gap) as f64 * 1_000.0 / self.codec.clock() as f64).to_be_bytes())?;
-        let start = self.start_wall.and_then(|w| w.duration_since(UNIX_EPOCH).ok());
-        if let Some(s) = start {
-            let ns = (s.as_nanos() as i128 - i128::from(MKV_EPOCH) * 1_000_000_000) as i64;
+        if let Some(s) = self.start_ns {
+            let ns = (i128::from(s) - i128::from(MKV_EPOCH) * 1_000_000_000) as i64;
             self.f.seek(SeekFrom::Start(self.date_at))?;
             self.f.write_all(&ns.to_be_bytes())?;
         }
         self.f.flush()?;
-        Ok(start.map(|s| s.as_millis() as u64))
+        Ok(self.start_ns.map(|s| s / 1_000_000))
     }
 }
 
+/// 닫힌 Matroska 파일 하나
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MkvFile {
+    pub path: PathBuf,
+    pub segment: u64,
+    pub room: String,
+    pub track_id: String,
+    pub kind: String,
+    pub codec: String,
+    /// 개인 트랙 주인 — 무전 슬롯은 없다
+    pub owner: Option<String>,
+    /// 출처 사용자(개인 트랙 = 주인 · 무전 슬롯 = 화자)
+    pub user_id: Option<String>,
+    pub source: Option<u32>,
+    pub frames: u64,
+    pub keyframes: u64,
+    /// UTC 있는 프레임 수(SR 로 이은 것)
+    pub synced: u64,
+    /// 메운 PLC 프레임 수(SDK:RULE-PLAT-REC-GAP)
+    pub filled: u64,
+    pub first_rtp: Option<u32>,
+    pub last_rtp: Option<u32>,
+    pub duration_ms: u64,
+    /// 파일 시작 벽시계(DateUTC · 유닉스 ms)
+    pub start_ms: Option<u64>,
+    /// 세그먼트 안에서 줄이 바뀐 횟수(`log_time` 차로 이었다)
+    pub rebased: u64,
+    /// 닫힌 까닭(세그먼트 사건)
+    pub reason: Option<String>,
+}
+
+struct Open {
+    m: Option<Mkv>,
+    codec: Codec,
+    file: MkvFile,
+    ssrc: u32,
+    last_log: u64,
+}
+
+/// 세그먼트마다 Matroska 하나(VP8 · H264 · Opus 세그먼트 — 나머지 코덱은 세고 지나친다)
+pub struct MkvSink {
+    dir: PathBuf,
+    open: BTreeMap<u64, Open>,
+    done: Vec<MkvFile>,
+    unknown: u64,
+}
+
+impl MkvSink {
+    pub fn new(dir: impl Into<PathBuf>) -> io::Result<MkvSink> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        Ok(MkvSink { dir, open: BTreeMap::new(), done: Vec::new(), unknown: 0 })
+    }
+
+    /// 파이프라인 출력 하나
+    pub fn write(&mut self, o: &Output) -> io::Result<()> {
+        match o {
+            Output::Segment(s) if s.event == SegmentKind::Opened => {
+                let Some(codec) = Codec::of(&s.codec) else {
+                    self.unknown += 1;
+                    return Ok(());
+                };
+                let who = s.user_id.clone().or_else(|| s.owner.clone()).unwrap_or_else(|| "none".into());
+                let path = self.dir.join(format!("{}-{:04}-{}-{}.mkv", safe(&s.room), s.id, safe(&who), safe(&s.kind)));
+                let file = MkvFile {
+                    path,
+                    segment: s.id,
+                    room: s.room.clone(),
+                    track_id: s.track_id.clone(),
+                    kind: s.kind.clone(),
+                    codec: s.codec.clone(),
+                    owner: s.owner.clone(),
+                    user_id: s.user_id.clone(),
+                    source: s.source,
+                    frames: 0,
+                    keyframes: 0,
+                    synced: 0,
+                    filled: 0,
+                    first_rtp: None,
+                    last_rtp: None,
+                    duration_ms: 0,
+                    start_ms: None,
+                    rebased: 0,
+                    reason: None,
+                };
+                self.open.insert(s.id, Open { m: None, codec, file, ssrc: 0, last_log: 0 });
+            }
+            Output::Segment(s) => {
+                if let Some(mut x) = self.open.remove(&s.id) {
+                    x.file.reason = s.reason.map(str::to_string);
+                    if x.file.user_id.is_none() {
+                        x.file.user_id = s.user_id.clone();
+                    }
+                    if let Some(m) = x.m.take() {
+                        x.file.frames = m.frames;
+                        x.file.keyframes = m.keyframes;
+                        x.file.synced = m.synced;
+                        x.file.first_rtp = m.first_rtp;
+                        x.file.last_rtp = Some(m.last_rtp);
+                        x.file.duration_ms = m.last_ms;
+                        x.file.start_ms = m.finish()?;
+                        self.done.push(x.file);
+                    }
+                }
+            }
+            Output::Frame(f) => {
+                let Some(x) = f.segment.and_then(|id| self.open.get_mut(&id)) else { return Ok(()) };
+                match x.m.as_mut() {
+                    None => x.m = Some(Mkv::create(&x.file.path, x.codec, &f.data, x.file.segment + 1)?),
+                    Some(m) if x.ssrc != f.ssrc => {
+                        m.rebase(f.rtp_ts, f.log_time.saturating_sub(x.last_log));
+                        x.file.rebased += 1;
+                    }
+                    Some(_) => {}
+                }
+                x.ssrc = f.ssrc;
+                x.last_log = f.log_time;
+                x.file.filled += u64::from(f.filled);
+                if x.file.user_id.is_none() {
+                    x.file.user_id = f.user_id.clone();
+                }
+                if let Some(m) = x.m.as_mut() {
+                    m.push(f.rtp_ts, f.keyframe, &f.data, f.utc_ns, f.log_time)?;
+                }
+            }
+            Output::Orphan(_) => {}
+        }
+        Ok(())
+    }
+
+    /// 닫힌 파일(닫힌 차례)
+    pub fn files(&self) -> &[MkvFile] {
+        &self.done
+    }
+
+    /// 지금 열린 파일 수
+    pub fn open_files(&self) -> usize {
+        self.open.values().filter(|x| x.m.is_some()).count()
+    }
+
+    /// 코덱을 몰라 지나친 세그먼트 수
+    pub fn unknown(&self) -> u64 {
+        self.unknown
+    }
+
+    /// 그 트랙의 열린 파일이 마지막으로 담은 RTP 시각
+    pub fn last_rtp(&self, track_id: &str) -> Option<u32> {
+        self.open.values().find(|x| x.file.track_id == track_id).and_then(|x| x.m.as_ref()).map(|m| m.last_rtp)
+    }
+}
+
+fn safe(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,9 +728,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("a.mkv");
         let mut m = Mkv::create(&p, Codec::Opus, &[0xf8], 7).unwrap();
-        let t0 = UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
-        m.push(1000, true, &[0xf8, 1], t0, false).unwrap();
-        m.push(1000 + 960, true, &[0xf8, 2], t0, true).unwrap();
+        let t0 = 1_800_000_000_000_000_000u64;
+        m.push(1000, true, &[0xf8, 1], None, 5).unwrap();
+        m.push(1000 + 960, true, &[0xf8, 2], Some(t0), 6).unwrap();
         assert_eq!(m.last_ms, 20);
         let start = m.finish().unwrap().unwrap();
         // 동기 프레임(20ms 지점)의 벽시계에서 거꾸로 — 시작 = t0 − 20ms
@@ -600,13 +761,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oxpeer-mkv-rb-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut m = Mkv::create(&dir.join("a.mkv"), Codec::Opus, &[0xf8], 1).unwrap();
-        m.push(1_000, true, &[0xf8], UNIX_EPOCH, false).unwrap();
-        m.push(1_960, true, &[0xf8], UNIX_EPOCH, false).unwrap();
+        m.push(1_000, true, &[0xf8], None, 0).unwrap();
+        m.push(1_960, true, &[0xf8], None, 0).unwrap();
         // 다른 줄 — RTP 시각 기준이 전혀 다르다(뒤로 · 크게). 받은 시각으로 500ms 뒤에 잇는다
-        m.rebase(4_000_000_000, std::time::Duration::from_millis(500));
-        m.push(4_000_000_000, true, &[0xf8], UNIX_EPOCH, false).unwrap();
+        m.rebase(4_000_000_000, 500_000_000);
+        m.push(4_000_000_000, true, &[0xf8], None, 0).unwrap();
         assert_eq!(m.last_ms, 20 + 500);
-        m.push(4_000_000_960, true, &[0xf8], UNIX_EPOCH, false).unwrap();
+        m.push(4_000_000_960, true, &[0xf8], None, 0).unwrap();
         assert_eq!(m.last_ms, 540);
         m.finish().unwrap();
         std::fs::remove_dir_all(&dir).ok();
@@ -620,10 +781,9 @@ mod tests {
         let p = dir.join("v.mkv");
         let key = [0x10, 0x02, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x02, 0xe0, 0x01];
         let mut m = Mkv::create(&p, Codec::Vp8, &key, 1).unwrap();
-        let t0 = UNIX_EPOCH;
         for i in 0..90u32 {
             let k = i % 30 == 0;
-            m.push(i * 3000, k, if k { &key } else { &[0x01, 0x00] }, t0, false).unwrap();
+            m.push(i * 3000, k, if k { &key } else { &[0x01, 0x00] }, None, 0).unwrap();
         }
         m.finish().unwrap();
         let b = std::fs::read(&p).unwrap();

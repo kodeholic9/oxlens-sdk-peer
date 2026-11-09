@@ -3,23 +3,23 @@
 //! 기본(녹음) — ★발언 한 건마다 Ogg Opus 파일 하나. 발언 경계는 ★패킷의 출처(CSRC — SDK:RULE-PLAT-SERVER 「출처 표지」)가 정한다 —
 //!   출처가 바뀌면 새 파일 · 출처 없는 패킷(서버가 지은 예열 · 해제 침묵)은 경계 밖이고 열린 파일을 닫는다. 화자 사건과 도착 시각을 맞대지 않는다.
 //!   무전 슬롯 오디오(PTT)만 담는다(개인 트랙은 센다).
-//! `--video`(녹화 · 20261107a) — ★트랙마다 Matroska 파일 하나(영상 · 음성 모두 · SDK 가 조립한 프레임 · 영상은 키프레임부터). 무전 슬롯은 발언 한 건 = 파일 하나.
+//! `--video`(녹화 · 20261107a → 202611/20261110a) — ★녹음과 같은 파이프라인 · 세그먼트마다 Matroska 파일 하나(영상 · 음성 모두 · 영상은 키프레임부터).
+//!   개인 트랙은 녹화 내내 파일 하나 · 무전 슬롯은 발언 한 건 = 파일 하나 · `--span-secs N` 이면 트랙마다 N 초 길이 정책.
 //!   `--spatial N` 은 영상 트랙의 층 상한(기본은 최고 단) · `--layer-plan 4:0,8:1` 은 입장 뒤 그 초에 상한을 바꾼다.
 //! `--raw DIR`(녹음 원시 기록 · context 202611/20261109c) — 받는 줄 전부를 MCAP 파트(`<user>-NNNN.mcap`)로 함께 적는다(SDK:RULE-PLAT-REC-TAP).
 //!   손잡이 `--raw-part-ms` · `--raw-part-bytes` · `--raw-flush-ms` · `--raw-tick-ms`(기본은 `RecordConfig::new`).
 //!
-//!   cargo run --example recorder -- --base http://127.0.0.1:1974/media --room ch-1 --out ./rec [--secs 30] [--hidden] [--user rec-1] [--video [--spatial N] [--layer-plan S:N,..]]
+//!   cargo run --example recorder -- --base http://127.0.0.1:1974/media --room ch-1 --out ./rec [--secs 30] [--hidden] [--user rec-1] [--video [--span-secs N] [--spatial N] [--layer-plan S:N,..]]
 //!
 //! 끝나면 표준 출력에 한 줄 JSON(파일마다 화자 · 수 · 경계 밖 수 · 정리층 계수 · 복구 사실)을 쓴다 — 2층 시험이 이것과 파일을 읽는다.
 
-mod mkv;
 mod video;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use oxpeer::record::{Channel, FileSource, OggSink, Output, Pipeline, Policy, Record, RecordConfig};
-use oxpeer::{Client, Config, Event, TokenReq, Unit};
+use oxpeer::{Client, Config, Event, TokenReq};
 use serde_json::{Value, json};
 
 struct Args {
@@ -36,6 +36,8 @@ struct Args {
     video: bool,
     spatial: Option<u8>,
     layer_plan: Vec<(u64, u8)>,
+    /// 녹화 길이 정책(초) — 없으면 발언 정책(SDK:RULE-PLAT-REC-SPLIT)
+    span_secs: Option<u64>,
     raw: Option<PathBuf>,
     raw_part_ms: Option<u64>,
     raw_part_bytes: Option<u64>,
@@ -46,7 +48,7 @@ struct Args {
 }
 
 fn args() -> Args {
-    let mut a = Args { base: String::new(), room: String::new(), out: PathBuf::from("."), secs: None, hidden: false, user: "oxpeer-recorder".into(), api_key: "ox_k_demo".into(), api_secret: "ox_s_demo".into(), tls_root: None, video: false, spatial: None, layer_plan: Vec::new(), raw: None, raw_part_ms: None, raw_part_bytes: None, raw_flush_ms: None, raw_tick_ms: None, linger_ms: None };
+    let mut a = Args { base: String::new(), room: String::new(), out: PathBuf::from("."), secs: None, hidden: false, user: "oxpeer-recorder".into(), api_key: "ox_k_demo".into(), api_secret: "ox_s_demo".into(), tls_root: None, video: false, spatial: None, layer_plan: Vec::new(), span_secs: None, raw: None, raw_part_ms: None, raw_part_bytes: None, raw_flush_ms: None, raw_tick_ms: None, linger_ms: None };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         let mut v = || it.next().unwrap_or_default();
@@ -62,6 +64,7 @@ fn args() -> Args {
             "--api-secret" => a.api_secret = v(),
             "--video" => a.video = true,
             "--spatial" => a.spatial = v().parse().ok(),
+            "--span-secs" => a.span_secs = v().parse().ok(),
             "--raw" => a.raw = Some(PathBuf::from(v())),
             "--raw-part-ms" => a.raw_part_ms = v().parse().ok(),
             "--raw-part-bytes" => a.raw_part_bytes = v().parse().ok(),
@@ -75,7 +78,7 @@ fn args() -> Args {
         }
     }
     if a.base.is_empty() || a.room.is_empty() {
-        eprintln!("사용: recorder --base http://host:port/media --room <방> [--out 폴더] [--secs N] [--hidden] [--user id] [--video [--spatial N] [--layer-plan S:N,..]]");
+        eprintln!("사용: recorder --base http://host:port/media --room <방> [--out 폴더] [--secs N] [--hidden] [--user id] [--video [--span-secs N] [--spatial N] [--layer-plan S:N,..]]");
         std::process::exit(2);
     }
     a
@@ -96,9 +99,6 @@ async fn main() {
     };
     let mut cfg = Config::new(&a.base, token);
     cfg.tls_root_pem = root;
-    if a.video {
-        cfg.unit = Unit::Frame;
-    }
     if let Some(dir) = &a.raw {
         let mut rc = RecordConfig::new(dir, &a.user);
         if let Some(ms) = a.raw_part_ms {
@@ -114,11 +114,11 @@ async fn main() {
             rc.tick = Duration::from_millis(ms);
         }
         cfg.record = Some(rc);
-    } else if !a.video {
-        // 녹음 갈래는 늘 레코드 흐름 위에서 짓는다(SDK:RULE-PLAT-REC-API) — 원시 파트 없이 라이브 통만
+    } else {
+        // 녹음 · 녹화 갈래는 늘 레코드 흐름 위에서 짓는다(SDK:RULE-PLAT-REC-API) — 원시 파트 없이 라이브 통만
         cfg.record = Some(RecordConfig::live(&a.user));
     }
-    let (client, mut events, mut media, frames) = match Client::open(cfg).await {
+    let (client, mut events, mut media, _frames) = match Client::open(cfg).await {
         Ok(x) => x,
         Err(e) => {
             eprintln!("접속 실패: {e}");
@@ -133,7 +133,7 @@ async fn main() {
     }
     eprintln!("[recorder] {} 에 들어왔다 — 발언을 기다린다", a.room);
     if a.video {
-        let out = video::run(&a, client, events, frames).await;
+        let out = video::run(&a, client, events, media, records).await;
         println!("{out}");
         return;
     }

@@ -1,52 +1,21 @@
 // author: kodeholic (powered by Claude)
-//! 녹화 갈래(`--video` · 20261107a B4 · B5) — 받는 트랙마다 Matroska 파일 하나. SDK 가 조립한 프레임(영상은 키프레임부터 · 깨진 프레임 없음)을 그대로 담는다.
-//! 개인 트랙은 녹화 내내 파일 하나 · 무전 슬롯은 발언 한 건 = 파일 하나(녹음과 같은 경계 — ★프레임의 출처 · SDK:RULE-PLAT-SERVER 「출처 표지」).
-//! 슬롯 파일은 출처가 바뀌면 닫고 새로 연다 — 영상은 새 출처의 첫 키프레임부터. 출처 없는 프레임(서버가 지은 침묵)은 경계 밖이다.
+//! 녹화 갈래(`--video` · 20261107a B4 · B5 → ★202611/20261110a 레코드 흐름 위로) — 녹음 갈래와 같은 파이프라인(SDK:RULE-PLAT-REC-PIPE) · 결과물만 Matroska(`MkvSink` — SDK:RULE-PLAT-REC-MKV).
+//! 정책 기본 = 발언(SDK:RULE-PLAT-REC-SPLIT) — 개인 트랙은 출처가 안 바뀌어 녹화 내내 파일 하나 · 무전 슬롯은 발언 한 건 = 파일 하나 · 영상은 키프레임부터.
+//!   `--span-secs N` 이면 길이 정책(트랙마다 N 초 뒤 영상은 첫 키프레임 · 음성은 아무 프레임에서 새 파일).
 //! 층은 앱이 고른다(B3) — 시뮬캐스트 트랙은 `--spatial` 이 없으면 최고 단을 상한으로 · `--layer-plan` 이 있으면 그 초에 바꾼다.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use oxpeer::{Client, Event, Events, Frames, Layer, MediaFrame, TrackEntry};
+use oxpeer::record::{FileSource, MkvSink, Output, Pipeline, Policy, Record, Records};
+use oxpeer::{Client, Event, Events, Layer, Media, TrackEntry};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::mkv::{Codec, Mkv};
-use crate::{Args, Flow};
-
-struct Rec {
-    /// 지금 이 트랙을 싣는 다운링크 ssrc(줄) · 마지막 프레임을 받은 때 — 트랙이 다른 줄로 옮겨 가면 시각축을 받은 시각으로 다시 잇는다
-    ssrc: u32,
-    last_at: Instant,
-    rebased: u64,
-    /// 슬롯 파일의 출처 번호(CSRC) — 바뀌면 그 파일을 닫는다
-    csrc: Option<u32>,
-    file: PathBuf,
-    track_id: String,
-    kind: String,
-    codec: String,
-    who: String,
-    slot: bool,
-    m: Mkv,
-}
-
-fn safe(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
-}
+use crate::{Args, Flow, records_summary};
 
 fn unix_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
-
-fn close(r: Rec, done: &mut Vec<Value>) {
-    let (frames, keyframes, synced, first_rtp, last_rtp, dur, rebased) = (r.m.frames, r.m.keyframes, r.m.synced, r.m.first_rtp, r.m.last_rtp, r.m.last_ms, r.rebased);
-    let start = r.m.finish().ok().flatten();
-    done.push(json!({
-        "file": r.file, "track_id": r.track_id, "kind": r.kind, "codec": r.codec, "who": r.who, "slot": r.slot,
-        "frames": frames, "keyframes": keyframes, "synced": synced, "first_rtp": first_rtp, "last_rtp": last_rtp,
-        "duration_ms": dur, "start_wall_ms": start, "rebased": rebased,
-    }));
 }
 
 /// 시뮬캐스트 · SVC 트랙의 최고 공간 단(`L{S}T{T}` 의 S − 1)
@@ -70,7 +39,73 @@ fn ask_layer(client: &Client, tx: &mpsc::UnboundedSender<Value>, track: String, 
     });
 }
 
-pub async fn run(a: &Args, client: Client, mut events: Events, mut frames: Frames) -> Value {
+pub fn policy(a: &Args) -> Policy {
+    match a.span_secs {
+        Some(s) => Policy::Span { time_ns: s * 1_000_000_000, bytes: u64::MAX },
+        None => Policy::Utterance,
+    }
+}
+
+/// 녹화 갈래의 셈 — 그 방 프레임만 결과물로 · 출처 없는 프레임 수 · 트랙마다 첫 프레임이 실린 때(시작 뒤 ms — 커버리지)
+#[derive(Default)]
+pub struct Tally {
+    orphan: u64,
+    loaded_at: BTreeMap<String, u64>,
+}
+
+impl Tally {
+    pub fn feed(&mut self, room: &str, pipe: &mut Pipeline, sink: &mut MkvSink, r: &Record, since: Option<Instant>) {
+        for o in pipe.push(r) {
+            self.out(room, sink, &o, since);
+        }
+    }
+
+    pub fn out(&mut self, room: &str, sink: &mut MkvSink, o: &Output, since: Option<Instant>) {
+        match o {
+            Output::Frame(f) if f.room == room => {
+                if let Some(t) = since {
+                    self.loaded_at.entry(f.track_id.clone()).or_insert(t.elapsed().as_millis() as u64);
+                }
+            }
+            Output::Orphan(f) if f.room == room => self.orphan += 1,
+            Output::Segment(s) if s.room != room => return,
+            Output::Frame(_) | Output::Orphan(_) => return,
+            Output::Segment(_) => {}
+        }
+        if let Err(e) = sink.write(o) {
+            eprintln!("[recorder] 파일 쓰기 실패: {e}");
+        }
+    }
+}
+
+fn files(sink: &MkvSink) -> Vec<Value> {
+    sink.files()
+        .iter()
+        .map(|f| {
+            json!({
+                "file": f.path, "segment": f.segment, "track_id": f.track_id, "kind": f.kind, "codec": f.codec, "who": f.user_id, "slot": f.owner.is_none(),
+                "frames": f.frames, "keyframes": f.keyframes, "synced": f.synced, "filled": f.filled, "first_rtp": f.first_rtp, "last_rtp": f.last_rtp,
+                "duration_ms": f.duration_ms, "start_wall_ms": f.start_ms, "rebased": f.rebased, "reason": f.reason,
+            })
+        })
+        .collect()
+}
+
+/// 원시 파트로 다시 짓기 — 라이브와 같은 파이프라인 · 같은 결과물(파일 이름이 같다 — SDK:RULE-PLAT-REC-PIPE)
+pub fn rebuild(a: &Args, out: &std::path::Path) -> Value {
+    let Some(dir) = &a.raw else { return Value::Null };
+    let Ok(mut src) = FileSource::open(dir, &a.user) else { return json!({ "error": "원시 파트를 못 열었다" }) };
+    let Ok(mut sink) = MkvSink::new(out) else { return json!({ "error": "다시 짓기 폴더" }) };
+    let mut pipe = Pipeline::new(policy(a));
+    let mut tally = Tally::default();
+    src.run(|r| tally.feed(&a.room, &mut pipe, &mut sink, &r, None));
+    for o in pipe.finish() {
+        tally.out(&a.room, &mut sink, &o, None);
+    }
+    json!({ "dir": out, "parts": src.parts().len(), "files": files(&sink).iter().map(|f| json!({ "file": f["file"], "segment": f["segment"], "frames": f["frames"] })).collect::<Vec<_>>(), "records": records_summary(&pipe, false) })
+}
+
+pub async fn run(a: &Args, client: Client, mut events: Events, mut media: Media, mut records: Records) -> Value {
     let stop = async {
         match a.secs {
             Some(s) => tokio::time::sleep(Duration::from_secs(s)).await,
@@ -81,14 +116,12 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut frames: Frame
     };
     tokio::pin!(stop);
     let started = Instant::now();
-    let mut recs: BTreeMap<String, Rec> = BTreeMap::new();
-    let mut done: Vec<Value> = Vec::new();
-    let mut n = 0u32;
-    let (mut orphan_frames, mut until_key, mut unknown_codec) = (0u64, 0u64, 0u64);
+    let mut pipe = Pipeline::new(policy(a));
+    let mut sink = MkvSink::new(&a.out).expect("출력 폴더");
+    let mut tally = Tally::default();
     let mut video: BTreeMap<String, TrackEntry> = BTreeMap::new();
     // 커버리지(20261107b Q4) — 영상 트랙이 방 목록에 처음 보인 때 · 첫 프레임이 실린 때(시작 뒤 ms). 줄 상한 밖이면 실린 때가 늦거나 없다
     let mut listed_at: BTreeMap<String, u64> = BTreeMap::new();
-    let mut loaded_at: BTreeMap<String, u64> = BTreeMap::new();
     let mut asked: HashSet<String> = HashSet::new();
     let mut plan = a.layer_plan.clone();
     plan.sort();
@@ -99,6 +132,7 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut frames: Frame
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut flow = Flow::default();
     let mut seen_events: Vec<String> = Vec::new();
+    let mut ended = false;
     loop {
         tokio::select! {
             _ = &mut stop => break,
@@ -108,7 +142,7 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut frames: Frame
                     cap = Some(s);
                     for (id, t) in &video {
                         if layered(t) {
-                            ask_layer(&client, &ltx, id.clone(), s, recs.get(id).map(|r| r.m.last_rtp));
+                            ask_layer(&client, &ltx, id.clone(), s, sink.last_rtp(id));
                         }
                     }
                     plan_at += 1;
@@ -127,104 +161,63 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut frames: Frame
                                 && asked.insert(t.track_id.clone())
                                 && let Some(s) = cap.or_else(|| top_spatial(t))
                             {
-                                ask_layer(&client, &ltx, t.track_id.clone(), s, recs.get(&t.track_id).map(|r| r.m.last_rtp));
+                                ask_layer(&client, &ltx, t.track_id.clone(), s, sink.last_rtp(&t.track_id));
                             }
                         }
                     }
                     _ => {
                         if flow.on(&e, &a.room) {
+                            ended = true;
                             break;
                         }
                     }
                 }
                 seen_events.push(format!("{e:?}").chars().take(160).collect());
             }
-            f = frames.next() => {
-                let Some(f) = f else { break };
-                on_frame(a, f, &mut recs, &mut done, &mut n, &mut orphan_frames, &mut until_key, &mut unknown_codec);
-                for k in recs.keys() {
-                    loaded_at.entry(k.clone()).or_insert(started.elapsed().as_millis() as u64);
-                }
+            // 미디어 통은 비워 둔다(이 갈래는 레코드 흐름으로 짓는다 — 통이 차 버리면 계수가 오른다)
+            p = media.next() => if p.is_none() { break },
+            r = records.next() => {
+                let Some(r) = r else { break };
+                tally.feed(&a.room, &mut pipe, &mut sink, &r, Some(started));
             }
         }
-    }
-    for (_, r) in std::mem::take(&mut recs) {
-        close(r, &mut done);
     }
     while let Ok(v) = lrx.try_recv() {
         layer_calls.push(v);
     }
     let stats = client.stats().await;
     client.close().await;
+    // Client 를 놓아야 SDK 루프가 끝나고 기록기가 닫힌다 — 통에 남은 레코드를 다 짓는다(라이브 = 파일 — 같은 레코드열)
+    drop(client);
+    if !ended {
+        while let Some(r) = records.next().await {
+            tally.feed(&a.room, &mut pipe, &mut sink, &r, Some(started));
+        }
+    }
+    for o in pipe.finish() {
+        tally.out(&a.room, &mut sink, &o, Some(started));
+    }
+    let c = pipe.counts().clone();
     let mut out = json!({
         "room": a.room,
-        "files": done,
-        "orphan_frames": orphan_frames,
-        "skipped_until_key": until_key,
-        "unknown_codec": unknown_codec,
+        "files": files(&sink),
+        "orphan_frames": tally.orphan,
+        "skipped_until_key": c.before_key,
+        "late_frames": c.late,
+        "unknown_codec": sink.unknown(),
         "layer_calls": layer_calls,
         "events": seen_events,
+        "records": records_summary(&pipe, records.degraded()),
         "coverage": video.iter().filter(|(_, t)| t.user_id.is_some()).map(|(id, t)| json!({
-            "track_id": id, "user_id": t.user_id, "listed_ms": listed_at.get(id), "loaded_ms": loaded_at.get(id),
+            "track_id": id, "user_id": t.user_id, "listed_ms": listed_at.get(id), "loaded_ms": tally.loaded_at.get(id),
         })).collect::<Vec<_>>(),
-        "not_recorded": video.iter().filter(|(id, t)| t.user_id.is_some() && !loaded_at.contains_key(*id)).map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+        "not_recorded": video.iter().filter(|(id, t)| t.user_id.is_some() && !tally.loaded_at.contains_key(*id)).map(|(id, _)| id.clone()).collect::<Vec<_>>(),
     });
+    if a.raw.is_some() {
+        out["rebuild"] = rebuild(a, &a.out.join("rebuild"));
+    }
     flow.fill(&mut out, &stats);
+    // 조립은 파이프라인 몫이다 — 깨진 프레임은 파이프라인 계수(SDK 프레임 통은 쓰지 않는다)
+    out["frames_broken"] = json!(stats.frames_broken + c.broken);
     out
-}
-
-#[allow(clippy::too_many_arguments)]
-fn on_frame(a: &Args, f: MediaFrame, recs: &mut BTreeMap<String, Rec>, done: &mut Vec<Value>, n: &mut u32, orphan: &mut u64, until_key: &mut u64, unknown: &mut u64) {
-    if f.room != a.room {
-        return;
-    }
-    let Some(codec) = Codec::of(&f.codec) else {
-        *unknown += 1;
-        return;
-    };
-    let slot = f.user_id.is_none();
-    // 파일 열쇠 — 개인 트랙은 ★출처의 `track_id`(줄의 지금 트랙이 아니라 · 재배정 직후 늦은 옛 트랙 패킷도 제 파일로) · 슬롯은 슬롯 트랙
-    let key = if slot { f.track_id.clone() } else { f.source.as_ref().and_then(|s| s.track_id.clone()).unwrap_or_else(|| f.track_id.clone()) };
-    if slot {
-        let Some(src) = f.source.as_ref() else {
-            if let Some(r) = recs.remove(&key) {
-                close(r, done);
-            }
-            *orphan += 1;
-            return;
-        };
-        if recs.get(&key).is_some_and(|r| r.csrc != Some(src.csrc))
-            && let Some(r) = recs.remove(&key)
-        {
-            close(r, done);
-        }
-    }
-    if !recs.contains_key(&key) {
-        if f.kind == "video" && !f.keyframe {
-            *until_key += 1;
-            return;
-        }
-        *n += 1;
-        let who = if slot { f.source.as_ref().and_then(|s| s.user_id.clone()).unwrap_or_default() } else { f.user_id.clone().unwrap_or_default() };
-        let file = a.out.join(format!("{}-{:03}-{}-{}.mkv", safe(&a.room), n, safe(&who), f.kind));
-        match Mkv::create(&file, codec, &f.data, u64::from(*n)) {
-            Ok(m) => {
-                recs.insert(key.clone(), Rec { ssrc: f.ssrc, last_at: f.received_at, rebased: 0, csrc: f.source.as_ref().map(|s| s.csrc), file, track_id: key.clone(), kind: f.kind.clone(), codec: f.codec.clone(), who, slot, m });
-            }
-            Err(e) => {
-                eprintln!("파일을 못 만들었다 {}: {e}", file.display());
-                return;
-            }
-        }
-    }
-    if let Some(r) = recs.get_mut(&key) {
-        // ★줄마다 RTP 시각 기준이 다르다(연:RULE-SUB-FILL 재배정 — 줄의 SSRC · seq · ts 는 줄 것) — 다른 줄로 옮겨 온 첫 프레임은 RTP 시각 차 대신 받은 시각 차로 잇는다
-        if r.ssrc != f.ssrc {
-            r.m.rebase(f.timestamp, f.received_at.saturating_duration_since(r.last_at));
-            r.ssrc = f.ssrc;
-            r.rebased += 1;
-        }
-        r.last_at = f.received_at;
-        let _ = r.m.push(f.timestamp, f.keyframe, &f.data, f.wallclock, f.synced);
-    }
 }

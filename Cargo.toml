@@ -72,6 +72,11 @@ name = "agent"
 path = "examples/agent/main.rs"
 
 [[example]]
+name = "mkvcheck"
+path = "examples/mkvcheck.rs"
+required-features = ["record"]
+
+[[example]]
 name = "rawtool"
 path = "examples/rawtool.rs"
 required-features = ["record"]

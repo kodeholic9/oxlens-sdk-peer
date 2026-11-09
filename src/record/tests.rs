@@ -505,3 +505,161 @@ fn ogg_with_filled_frames_spans_rtp_time() {
     assert_eq!((f.packets, f.filled), (5, 2));
     assert_eq!(u64::from(f.end_ts.unwrap() - f.first_ts.unwrap()), f.samples, "메운 뒤 표본 수 = RTP 폭");
 }
+
+// ── 4단계(202611/20261110a) — 분기 = 출처 트랙 · 열쇠 = 트랙 · 영상은 키프레임에서 연다 · Matroska 결과물 ──
+
+fn track_list(room: &str, tracks: serde_json::Value, rows: serde_json::Value) -> Vec<u8> {
+    serde_json::json!({ "room": room, "tracks": tracks, "rows": rows }).to_string().into_bytes()
+}
+
+const KEY: &[u8] = &[0x10, 0x00, 0x9d, 0x01, 0x2a];
+const DELTA: &[u8] = &[0x10, 0x01, 7];
+
+fn vrow(tid: &str) -> serde_json::Value {
+    serde_json::json!({ "track_id": tid, "kind": "video", "codec": "VP8", "pt": 96 })
+}
+
+fn segs(out: &[Output]) -> Vec<(SegmentKind, u64, String, Option<&'static str>)> {
+    out.iter()
+        .filter_map(|o| match o {
+            Output::Segment(s) => Some((s.event, s.id, s.track_id.clone(), s.reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn late_packet_of_departed_track_is_not_mixed_into_new_track() {
+    let ms = 1_000_000u64;
+    let u1 = serde_json::json!({ "track_id": "cam-u1", "kind": "video", "user_id": "u1", "csrc": 9 });
+    let u2 = serde_json::json!({ "track_id": "cam-u2", "kind": "video", "user_id": "u2", "csrc": 10 });
+    let recs = [
+        rec(1, 0, Channel::Track, track_list("r", serde_json::json!([u1]), serde_json::json!({ "200": vrow("cam-u1") }))),
+        rec(2, ms, Channel::Rtp(200), pkt(1, 3000, true, Some(9), KEY)),
+        // 재배정 — 줄 200 이 u2 로 · u1 은 목록에서 빠짐
+        rec(3, 2 * ms, Channel::Track, track_list("r", serde_json::json!([u2]), serde_json::json!({ "200": vrow("cam-u2") }))),
+        rec(4, 3 * ms, Channel::Rtp(200), pkt(2, 6000, true, Some(9), DELTA)),
+        rec(5, 4 * ms, Channel::Rtp(200), pkt(3, 9000, true, Some(10), KEY)),
+    ];
+    let mut pl = Pipeline::new(Policy::Utterance);
+    let mut out: Vec<Output> = recs.iter().flat_map(|r| pl.push(r)).collect();
+    out.extend(pl.finish());
+    let frames: Vec<(String, u32)> = out.iter().filter_map(|o| if let Output::Frame(f) = o { Some((f.track_id.clone(), f.rtp_ts)) } else { None }).collect();
+    assert_eq!(frames, vec![("cam-u1".into(), 3000), ("cam-u2".into(), 9000)], "늦은 u1 패킷은 u2 에 섞이지 않는다");
+    assert_eq!(pl.counts().late, 1);
+    assert_eq!(segs(&out)[1], (SegmentKind::Closed, 0, "cam-u1".into(), Some("track")), "목록에서 빠질 때 닫는다");
+}
+
+#[test]
+fn track_moving_rows_stays_one_segment() {
+    let ms = 1_000_000u64;
+    let u1 = serde_json::json!([{ "track_id": "cam-u1", "kind": "video", "user_id": "u1", "csrc": 9 }]);
+    let recs = [
+        rec(1, 0, Channel::Track, track_list("r", u1.clone(), serde_json::json!({ "200": vrow("cam-u1") }))),
+        rec(2, ms, Channel::Rtp(200), pkt(1, 3000, true, Some(9), KEY)),
+        rec(3, 2 * ms, Channel::Track, track_list("r", u1, serde_json::json!({ "300": vrow("cam-u1") }))),
+        rec(4, 40 * ms, Channel::Rtp(300), pkt(77, 500_000, true, Some(9), KEY)),
+    ];
+    for p in [Policy::Utterance, Policy::Span { time_ns: u64::MAX, bytes: u64::MAX }] {
+        let out = run_pipe(p, &recs);
+        assert_eq!(segs(&out), vec![(SegmentKind::Opened, 0, "cam-u1".into(), None), (SegmentKind::Closed, 0, "cam-u1".into(), Some("end"))], "{p:?}");
+    }
+}
+
+#[test]
+fn slot_video_segment_opens_only_at_keyframe_of_new_source() {
+    let ms = 1_000_000u64;
+    let recs = [
+        rec(1, 0, Channel::Track, track_list("r", serde_json::json!([{ "track_id": "slot-v", "kind": "video" }]), serde_json::json!({ "400": vrow("slot-v") }))),
+        rec(2, ms, Channel::Rtp(400), pkt(1, 3000, true, Some(7), KEY)),
+        rec(3, 2 * ms, Channel::Rtp(400), pkt(2, 6000, true, Some(7), DELTA)),
+        rec(4, 3 * ms, Channel::Rtp(400), pkt(3, 9000, true, Some(8), DELTA)),
+        rec(5, 4 * ms, Channel::Rtp(400), pkt(4, 12000, true, Some(8), KEY)),
+    ];
+    let mut pl = Pipeline::new(Policy::Utterance);
+    let mut out: Vec<Output> = recs.iter().flat_map(|r| pl.push(r)).collect();
+    out.extend(pl.finish());
+    let s = segs(&out);
+    assert_eq!(s[1], (SegmentKind::Closed, 0, "slot-v".into(), Some("source")));
+    assert_eq!(s[2], (SegmentKind::Opened, 1, "slot-v".into(), None));
+    let first_of_1 = out.iter().find_map(|o| if let Output::Frame(f) = o && f.segment == Some(1) { Some((f.rtp_ts, f.keyframe)) } else { None });
+    assert_eq!(first_of_1, Some((12000, true)), "새 화자의 첫 키프레임부터");
+    assert_eq!(pl.counts().before_key, 1);
+}
+
+/// 같은 레코드열 → 같은 Matroska 바이트 · 줄이 바뀐 세그먼트는 `log_time` 차로 잇는다 · UTC 없으면 첫 프레임 레코드 시각
+fn mkv_build(recs: &[Record], dir: &Path) -> Vec<MkvFile> {
+    let mut pl = Pipeline::new(Policy::Utterance);
+    let mut sink = MkvSink::new(dir).unwrap();
+    for r in recs {
+        for o in pl.push(r) {
+            sink.write(&o).unwrap();
+        }
+    }
+    for o in pl.finish() {
+        sink.write(&o).unwrap();
+    }
+    sink.files().to_vec()
+}
+
+#[test]
+fn mkv_sink_is_deterministic_and_rebases_across_rows() {
+    let ms = 1_000_000u64;
+    let t0 = 1_800_000_000_000_000_000u64;
+    let u1 = serde_json::json!([{ "track_id": "cam-u1", "kind": "video", "user_id": "u1", "csrc": 9 }]);
+    let recs = [
+        rec(1, t0, Channel::Track, track_list("r", u1.clone(), serde_json::json!({ "200": vrow("cam-u1") }))),
+        rec(2, t0 + ms, Channel::Rtp(200), pkt(1, 3000, true, Some(9), KEY)),
+        rec(3, t0 + 34 * ms, Channel::Rtp(200), pkt(2, 6000, true, Some(9), DELTA)),
+        rec(4, t0 + 40 * ms, Channel::Track, track_list("r", u1, serde_json::json!({ "300": vrow("cam-u1") }))),
+        rec(5, t0 + 534 * ms, Channel::Rtp(300), pkt(9, 4_000_000_000, true, Some(9), KEY)),
+    ];
+    let (a, b) = (tmp("mkv-a"), tmp("mkv-b"));
+    let fa = mkv_build(&recs, &a);
+    let fb = mkv_build(&recs, &b);
+    assert_eq!(fa.len(), 1);
+    assert_eq!(std::fs::read(&fa[0].path).unwrap(), std::fs::read(&fb[0].path).unwrap(), "같은 레코드열이면 같은 바이트");
+    assert_eq!(fa[0].path.file_name().unwrap(), "r-0000-u1-video.mkv");
+    assert_eq!((fa[0].frames, fa[0].keyframes, fa[0].rebased, fa[0].synced), (3, 2, 1, 0));
+    assert_eq!(fa[0].duration_ms, 33 + 500, "줄을 옮긴 뒤는 레코드 시각 차(500ms)로 잇는다");
+    assert_eq!(fa[0].start_ms, Some((t0 + ms) / 1_000_000), "UTC 가 없으면 첫 프레임 레코드 시각");
+    std::fs::remove_dir_all(&a).ok();
+    std::fs::remove_dir_all(&b).ok();
+}
+
+#[test]
+fn mkv_start_is_back_computed_from_first_synced_frame() {
+    let ms = 1_000_000u64;
+    let u1 = serde_json::json!([{ "track_id": "cam-u1", "kind": "video", "user_id": "u1", "csrc": 9 }]);
+    // SR — NTP 초 3_000_000_000(1900 기준) ↔ RTP 9000. 첫 프레임(3000)은 SR 전이라 UTC 없음 · 셋째(9000)가 첫 동기
+    let ntp = 3_000_000_000u64 << 32;
+    let recs = [
+        rec(1, 0, Channel::Track, track_list("r", u1, serde_json::json!({ "200": vrow("cam-u1") }))),
+        rec(2, ms, Channel::Rtp(200), pkt(1, 3000, true, Some(9), KEY)),
+        rec(3, 2 * ms, Channel::Rtp(200), pkt(2, 6000, true, Some(9), DELTA)),
+        rec(4, 3 * ms, Channel::Sr, format!(r#"{{"ssrc":200,"ntp":{ntp},"rtp":9000}}"#).into_bytes()),
+        rec(5, 4 * ms, Channel::Rtp(200), pkt(3, 9000, true, Some(9), DELTA)),
+    ];
+    let d = tmp("mkv-sr");
+    let f = mkv_build(&recs, &d);
+    let utc_ms = (3_000_000_000u64 - 2_208_988_800) * 1_000;
+    assert_eq!(f[0].start_ms, Some(utc_ms - 66), "첫 동기 프레임 UTC − 그때까지 흐른 블록 시각(6000 틱 = 66.6ms)");
+    assert_eq!(f[0].synced, 1);
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn mkv_rtp_time_wrap_keeps_blocks_moving_forward() {
+    let ms = 1_000_000u64;
+    let u1 = serde_json::json!([{ "track_id": "cam-u1", "kind": "video", "user_id": "u1", "csrc": 9 }]);
+    let mut recs = vec![rec(1, 0, Channel::Track, track_list("r", u1, serde_json::json!({ "200": vrow("cam-u1") })))];
+    let start = u32::MAX - 3 * 3000 + 1;
+    for i in 0..8u32 {
+        recs.push(rec(2 + i, u64::from(i + 1) * 33 * ms, Channel::Rtp(200), pkt(i as u16, start.wrapping_add(i * 3000), true, Some(9), if i % 4 == 0 { KEY } else { DELTA })));
+    }
+    let d = tmp("mkv-wrap");
+    let f = mkv_build(&recs, &d);
+    assert_eq!((f[0].frames, f[0].first_rtp, f[0].last_rtp), (8, Some(start), Some(start.wrapping_add(7 * 3000))));
+    assert_eq!(f[0].duration_ms, 7 * 3000 / 90, "넘침을 지나도 앞으로만 간다");
+    std::fs::remove_dir_all(&d).ok();
+}

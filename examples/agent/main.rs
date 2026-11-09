@@ -137,6 +137,25 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // 전이 통(SDK:RULE-DIAG-EVENTS `transition`) — 걸음 수 · 받지 않는 사건 수 · 라벨 가짓수를 요약에 싣는다(20261109)
+    let diag = std::sync::Arc::new(std::sync::Mutex::new((0u64, 0u64, std::collections::BTreeSet::<String>::new())));
+    {
+        let mut tr = client.transitions();
+        let d = diag.clone();
+        tokio::spawn(async move {
+            while let Some(t) = tr.next().await {
+                if let Ok(mut g) = d.lock() {
+                    g.0 += 1;
+                    if t.impossible {
+                        g.1 += 1;
+                    }
+                    if let Some(l) = t.label {
+                        g.2.insert(l);
+                    }
+                }
+            }
+        });
+    }
     if let Err(e) = client.connect().await {
         eprintln!("접속 실패: {e}");
         std::process::exit(1);
@@ -179,6 +198,9 @@ async fn main() {
     }
     let st = client.stats().await;
     if let Some(o) = out.as_object_mut() {
+        if let Ok(g) = diag.lock() {
+            o.insert("transitions".into(), json!({ "lines": g.0, "impossible": g.1, "labels": g.2.len() }));
+        }
         o.insert("stats".into(), json!({ "frames_sent": st.frames_sent, "frames_gated": st.frames_gated, "rtx_sent": st.rtx_sent, "remb_bps": st.remb_bps, "qa_send_dropped": st.qa_send_dropped, "media_dropped": st.media_dropped, "target_bps": st.target_bps, "send_loss_permille": st.send_loss_permille }));
     }
     client.close().await;

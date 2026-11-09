@@ -86,6 +86,9 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut frames: Frame
     let mut n = 0u32;
     let (mut orphan_frames, mut until_key, mut unknown_codec) = (0u64, 0u64, 0u64);
     let mut video: BTreeMap<String, TrackEntry> = BTreeMap::new();
+    // 커버리지(20261107b Q4) — 영상 트랙이 방 목록에 처음 보인 때 · 첫 프레임이 실린 때(시작 뒤 ms). 줄 상한 밖이면 실린 때가 늦거나 없다
+    let mut listed_at: BTreeMap<String, u64> = BTreeMap::new();
+    let mut loaded_at: BTreeMap<String, u64> = BTreeMap::new();
     let mut asked: HashSet<String> = HashSet::new();
     let mut plan = a.layer_plan.clone();
     plan.sort();
@@ -118,6 +121,7 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut frames: Frame
                     Event::Tracks { room, tracks } if *room == a.room => {
                         for t in tracks.iter().filter(|t| t.kind == oxpeer::Kind::Video) {
                             video.insert(t.track_id.clone(), t.clone());
+                            listed_at.entry(t.track_id.clone()).or_insert(started.elapsed().as_millis() as u64);
                             // 층 상한 — 앱이 준 값 · 계획의 지금 값 · 없으면 그 트랙의 최고 단(B3)
                             if layered(t)
                                 && asked.insert(t.track_id.clone())
@@ -138,6 +142,9 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut frames: Frame
             f = frames.next() => {
                 let Some(f) = f else { break };
                 on_frame(a, f, &mut recs, &mut done, &mut n, &mut orphan_frames, &mut until_key, &mut unknown_codec);
+                for k in recs.keys() {
+                    loaded_at.entry(k.clone()).or_insert(started.elapsed().as_millis() as u64);
+                }
             }
         }
     }
@@ -157,6 +164,10 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut frames: Frame
         "unknown_codec": unknown_codec,
         "layer_calls": layer_calls,
         "events": seen_events,
+        "coverage": video.iter().filter(|(_, t)| t.user_id.is_some()).map(|(id, t)| json!({
+            "track_id": id, "user_id": t.user_id, "listed_ms": listed_at.get(id), "loaded_ms": loaded_at.get(id),
+        })).collect::<Vec<_>>(),
+        "not_recorded": video.iter().filter(|(id, t)| t.user_id.is_some() && !loaded_at.contains_key(*id)).map(|(id, _)| id.clone()).collect::<Vec<_>>(),
     });
     flow.fill(&mut out, &stats);
     out

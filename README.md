@@ -24,6 +24,7 @@ client.join("ch-1").await?;                 // 듣기(select:false)로 들어간
 // media.next()  — MediaPacket{room, track_id, kind, codec, sequence, timestamp, payload …}(단위 Packet 인 트랙)
 // frames.next() — MediaFrame{room, track_id, kind, codec, timestamp, keyframe, data, wallclock, synced …}(단위 Frame 인 트랙)
 client.set_layer("t…", oxpeer::Layer { spatial: Some(0), ..Default::default() }).await?;   // 층 상한(실제 선택은 서버)
+let mut tr = client.transitions();          // 전이 통(진단) — 생성 상태기의 걸음 · 받지 않는 사건(impossible) 전량(SDK:RULE-DIAG-EVENTS) · 앱 사건 통과 따로
 
 // 말하기(에이전트 — 20261107c) — 발언 방으로 들어가 발행 · 무전이면 누르고 허가 사이에 넣는다
 client.join_speaking("ch-1").await?;                                                         // select:true 입장(발언 방)

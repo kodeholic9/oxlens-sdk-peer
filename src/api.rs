@@ -288,6 +288,37 @@ impl Events {
     }
 }
 
+/// 전이 기록 한 줄 — 생성 상태기의 걸음 하나 · 받지 않는 사건이면 `impossible` (SDK:RULE-DIAG-EVENTS `transition` · SDK:IMPL-LINK-PROJECTION)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transition {
+    /// 유닉스 ms
+    pub at_ms: u64,
+    /// 영역 — SES · ROOM · AFF · LINK · SUB · PUB · TRK · FLR
+    pub area: String,
+    /// 그 영역의 인스턴스 열쇠(방 · 서버 · 트랙 …)
+    pub key: String,
+    pub from: String,
+    /// 받지 않는 사건이면 없다
+    pub to: Option<String>,
+    /// 규격의 경우 라벨(`SUB.C.WANT.nego_ok` 따위) · 받지 않는 사건이면 없다
+    pub label: Option<String>,
+    /// 까닭 — 입구 이름
+    pub cause: String,
+    /// 그 상태에서 받지 않는 사건이었다(조용히 버리지 않고 알린다)
+    pub impossible: bool,
+}
+
+/// 전이 통 — `Client::transitions` 로 연다(앱 사건 통과 따로 · 여는 쪽만 받는다)
+pub struct Transitions {
+    rx: mpsc::UnboundedReceiver<Transition>,
+}
+
+impl Transitions {
+    pub async fn next(&mut self) -> Option<Transition> {
+        self.rx.recv().await
+    }
+}
+
 /// 미디어 통 — 받은 RTP(복호한 것) · 단위가 `Packet` 인 트랙
 pub struct Media {
     rx: mpsc::Receiver<MediaPacket>,
@@ -428,6 +459,13 @@ impl Client {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::SetLayer(track_id.to_string(), layer, tx))?;
         rx.await.map_err(|_| Error::closed("CLOSED"))?
+    }
+
+    /// 전이 기록을 받는 통을 연다 — 연 뒤의 걸음 전량(SDK:RULE-DIAG-EVENTS `transition`). 여러 번 열 수 있다
+    pub fn transitions(&self) -> Transitions {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let _ = self.send(Cmd::Diag(tx));
+        Transitions { rx }
     }
 
     pub async fn stats(&self) -> Stats {

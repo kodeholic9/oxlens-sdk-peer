@@ -25,7 +25,7 @@ impl LinkAction {
 }
 
 /// 위 입구 중 SDK 가 넣는 것(입구 표) — 위 입구 이름 그대로(Rust 판 함수는 snake_case)
-pub const FED: &[&str] = &["iceDisc", "iceBack", "waitOver", "linkEvent", "hbRes", "restartRes", "applyTimeout", "applied", "assocLost", "dcClosed", "reopened", "rebuilt", "negoRes", "mlineEvent", "closeAll", "roomLeft", "repair", "epochChanged", "pubLost", "renego", "tableCarried", "serverIce"];
+pub const FED: &[&str] = &["iceDisc", "iceBack", "waitOver", "linkEvent", "online", "hbRes", "restartRes", "applyTimeout", "applied", "assocLost", "dcClosed", "reopened", "rebuilt", "negoRes", "mlineEvent", "closeAll", "roomLeft", "repair", "epochChanged", "pubLost", "renego", "tableCarried", "serverIce"];
 /// 위 입구 중 넣지 않는 것(입구 표 셋째 칸 · 판정표에 사유)
 pub const NOT_FED: &[&str] = &[];
 

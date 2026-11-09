@@ -1,5 +1,5 @@
 // ★생성 파일 — gen/axis_client.mts 가 원천(context/spec/protocol · areas/link/behavior)에서 짓는다. 손으로 고치지 않는다.
-// IR sha256 2483d3bca9e87f67 · 영역 LINK 클라 상태기 Rust 판 — 같은 생성기의 TS 판과 한 뿌리(같은 입구 · 같은 경우 · 같은 라벨).
+// IR sha256 a20f88b2b4a7be13 · 영역 LINK 클라 상태기 Rust 판 — 같은 생성기의 TS 판과 한 뿌리(같은 입구 · 같은 경우 · 같은 라벨).
 // 집행은 부르는 쪽 몫이다 — out(보낼 것) · fx(이 영역의 효과) · seams(다른 영역 입구로 — 받는 곳은 위가 정했다) · start(새로 걸 타이머). armed() 밖의 타이머는 멈춘다.
 // 모형 자리(트랙 · 배정표 사본의 열쇠)는 문자열이다 — 실제 값을 넣는 법은 결합이 정한다(SDK:RULE-MOD-BINDING-VALUES).
 #![allow(dead_code, unused_variables, unused_mut, unused_parens, non_camel_case_types, clippy::all)]
@@ -410,6 +410,14 @@ pub fn link_event(s: &St, m: &LinkEventMsg) -> Step {
     done(s, s.clone(), "LINK.C.any.link_event_absorbed", vec![], vec![], vec![], vec![])
 }
 
+/// 브라우저 `online` 사건 — 망이 바뀌었다(옛 TCP 가 반쯤 열린 채 남는다 · WS 도 죽었을 수 있다) (바깥: 브라우저 online 사건 — 망이 바뀌었다)
+pub fn online(s: &St) -> Step {
+    if s.ls == LinkSt::OK {
+        return done(s, St { ls: LinkSt::CHECK, sync: false, ..s.clone() }, "LINK.C.OK.online", vec![Tx::Heartbeat], vec![], vec![], vec![]);
+    }
+    done(s, s.clone(), "LINK.C.any.online_absorbed", vec![], vec![], vec![], vec![])
+}
+
 /// WS 점검의 HEARTBEAT 응답 — 무엇이든 받았다(WS 가 산다) (받음: HEARTBEAT)
 pub fn hb_res(s: &St, m: &HbResMsg) -> Step {
     if s.ls == LinkSt::CHECK {
@@ -625,6 +633,7 @@ pub fn call_json(entry: &str, s: &St, a: &[serde_json::Value]) -> Result<Option<
         "iceBack" => ice_back(s),
         "waitOver" => Some(wait_over(s, arg::<bool>(a, 0)?, arg::<bool>(a, 1)?)),
         "linkEvent" => Some(link_event(s, &arg::<LinkEventMsg>(a, 0)?)),
+        "online" => Some(online(s)),
         "hbRes" => Some(hb_res(s, &arg::<HbResMsg>(a, 0)?)),
         "restartRes" => Some(restart_res(s, &arg::<RestartResMsg>(a, 0)?)),
         "applyTimeout" => apply_timeout(s),

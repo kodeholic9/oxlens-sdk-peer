@@ -43,6 +43,7 @@ pub(crate) enum Cmd {
     Leave(String, oneshot::Sender<Result<(), Error>>),
     Close(oneshot::Sender<()>),
     Stats(oneshot::Sender<Stats>),
+    Diag(mpsc::UnboundedSender<crate::api::Transition>),
     SetUnit(String, Unit),
     SetLayer(String, Layer, oneshot::Sender<Result<(), Error>>),
     /// 말하는 쪽(20261107c)
@@ -190,6 +191,7 @@ pub(crate) struct Core {
     pub(crate) materials: Interner,
     pub(crate) timers: Timers,
     pub(crate) ev: mpsc::UnboundedSender<Event>,
+    pub(crate) diag: std::sync::Mutex<Vec<mpsc::UnboundedSender<crate::api::Transition>>>,
     pub(crate) sock_tx: mpsc::UnboundedSender<SockIn>,
     pub(crate) fact_tx: mpsc::UnboundedSender<LinkFact>,
     pub(crate) http_tx: mpsc::UnboundedSender<HttpDone>,
@@ -290,6 +292,7 @@ pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::
         ended: Vec::new(),
         link_gen: 0,
         trace: std::env::var_os("OXPEER_TRACE").is_some(),
+        diag: std::sync::Mutex::new(Vec::new()),
         pubs: BTreeMap::new(),
         pub_seq: 0,
         pub_mids: HashMap::new(),
@@ -344,13 +347,34 @@ impl Core {
         if self.trace {
             eprintln!("[oxpeer] {layer} {key} {from}→{to} {label} ({cause})");
         }
+        self.diag_send(layer, key, from, Some(to), Some(label), cause);
     }
 
-    /// 받지 않는 사건 — 조용히 무시하지 않는다(SDK:IMPL-LINK-PROJECTION 받지 않는 사건)
+    /// 받지 않는 사건 — 조용히 무시하지 않는다(SDK:IMPL-LINK-PROJECTION 받지 않는 사건) · 전이 통에도 `impossible` 로 낸다
     pub(crate) fn impossible(&self, layer: &str, key: &str, from: &str, entry: &str) {
         if self.trace {
             eprintln!("[oxpeer] {layer} {key} {from} — 입구 {entry} 를 받지 않는다");
         }
+        self.diag_send(layer, key, from, None, None, entry);
+    }
+
+    fn diag_send(&self, area: &str, key: &str, from: &str, to: Option<&str>, label: Option<&str>, cause: &str) {
+        let Ok(mut subs) = self.diag.lock() else { return };
+        if subs.is_empty() {
+            return;
+        }
+        let at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        let t = crate::api::Transition {
+            at_ms,
+            area: area.to_string(),
+            key: key.to_string(),
+            from: from.to_string(),
+            to: to.map(str::to_string),
+            label: label.map(str::to_string),
+            cause: cause.to_string(),
+            impossible: to.is_none(),
+        };
+        subs.retain(|s| s.send(t.clone()).is_ok());
     }
 
     pub(crate) fn emit(&self, e: Event) {
@@ -401,6 +425,11 @@ impl Core {
             Cmd::Close(tx) => {
                 self.close_for_app();
                 let _ = tx.send(());
+            }
+            Cmd::Diag(tx) => {
+                if let Ok(mut g) = self.diag.lock() {
+                    g.push(tx);
+                }
             }
             Cmd::Stats(tx) => {
                 let c = &self.sink.counters;

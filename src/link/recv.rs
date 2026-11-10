@@ -61,7 +61,7 @@ pub struct MediaFrame {
     pub wallclock: SystemTime,
     pub synced: bool,
     pub received_at: Instant,
-    /// 이 프레임의 발행 출처(조각마다 같아야 한다 — 갈리면 깨진 프레임) · 없으면 서버가 지은 것
+    /// 이 프레임의 발행 출처(조각마다 같아야 한다 — 갈리면 깨진 프레임) · 없으면 출처 없음
     pub source: Option<Source>,
 }
 

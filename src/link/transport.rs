@@ -153,7 +153,7 @@ pub struct MediaPacket {
     pub marker: bool,
     pub payload: Bytes,
     pub received_at: Instant,
-    /// 이 패킷의 발행 출처 — 없으면 서버가 지은 패킷(예열 · 해제 침묵)
+    /// 이 패킷의 발행 출처 — 없으면 서버가 지은 패킷(대역 probe 패딩) · 표지를 끈 연결
     pub source: Option<Source>,
 }
 

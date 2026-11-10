@@ -1,7 +1,7 @@
 // author: kodeholic (powered by Claude)
 //! 예제 에이전트(context 202611/20261107c C9) — 서버사이드 SDK(oxpeer)로 방에 봇 참가자(`participant_type:2`)로 들어가 ★말한다.
 //! `echo`(기본) — 무전방 되울림: 화자의 발언(무전 슬롯 오디오)을 받아 두었다가 그가 놓으면 발언권을 눌러 허가 사이에 그대로 되돌려 말하고 놓는다.
-//!   받기 · 누르기 · 말하기(반이중 발행 · 송신 시계) · 놓기를 한 판에 다 지난다. 서버 침묵 프레임(`f8 ff fe`)은 화자 소리가 아니라 담지 않는다.
+//!   받기 · 누르기 · 말하기(반이중 발행 · 송신 시계) · 놓기를 한 판에 다 지난다. 출처가 없는 패킷은 담지 않는다.
 //! `beacon` — 전이중 발행 시험판: 표지 프레임(오디오 20ms · 영상 30fps · 2층 봇과 같은 본문 꼴 — 보낸 표지 · 번호)을 낸다. 키프레임 요청(PLI)이 오면 다음 영상 프레임을 키프레임으로.
 //!   ★표지 프레임은 코덱 본문이 아니다(서버는 본문을 읽지 않는다) — 2층 시험이 「보낸 것 = 받은 것」을 견주는 재료다.
 //!   `--simulcast` 면 영상 업링크 둘(층 표지 `l` · `h` — 층마다 따로 센다) · 목표 비트레이트 사건(`TargetBitrate`)을 요약에 적는다.
@@ -262,7 +262,7 @@ async fn echo(client: &Client, events: &mut oxpeer::Events, media: &mut oxpeer::
             }
             p = media.next() => {
                 let Some(p) = p else { break };
-                // 무전 슬롯 오디오(주인 없음)만 · 남이 말하는 동안만 · ★출처가 남인 패킷만(출처 없음 = 서버가 지은 침묵 · 예열)
+                // 무전 슬롯 오디오(주인 없음)만 · 남이 말하는 동안만 · ★출처가 남인 패킷만(출처 없음은 담지 않는다)
                 let from = p.source.as_ref().and_then(|s| s.user_id.clone());
                 if p.room == room && p.kind == "audio" && p.user_id.is_none() && speaker.is_some() && p.source.is_some() && from.as_deref() != Some(me) {
                     if let Some(u) = from {

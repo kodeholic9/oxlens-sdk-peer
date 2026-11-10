@@ -35,7 +35,7 @@ pub struct Frame {
     pub codec: String,
     /// 줄(다운링크) SSRC
     pub ssrc: u32,
-    /// 출처 번호(CSRC) · 그 주인 — 없으면 서버가 지은 프레임
+    /// 출처 번호(CSRC) · 그 주인 — 없으면 출처 없는 프레임(표지를 끈 연결 · 서버는 미디어 프레임을 짓지 않는다 — 20261111)
     pub source: Option<u32>,
     pub user_id: Option<String>,
     pub keyframe: bool,
@@ -87,7 +87,7 @@ pub struct Segment {
 pub enum Output {
     Frame(Frame),
     Segment(Segment),
-    /// 발언 정책이 담지 않은 출처 없는 프레임(서버가 지은 침묵)
+    /// 발언 정책이 담지 않은 출처 없는 프레임
     Orphan(Frame),
 }
 

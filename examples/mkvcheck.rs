@@ -43,9 +43,27 @@ fn seg(id: u64, kind: &str, codec: &str, event: SegmentKind) -> Segment {
     }
 }
 
-/// H264 + Opus 를 RTP 시각(초) 순으로 섞어 HLS 로 — 두 트랙 같은 UTC 원점
+/// H264 + Opus 를 RTP 시각(초) 순으로 섞어 한 사람의 결과물로 — HLS(`hls/`) · Matroska 한 파일(`av.mkv` — SDK:RULE-PLAT-REC-MKV 사람마다 영상 · 음성 · 202611/20261110e)
 fn hls(dir: &std::path::Path) {
-    let mut sink = HlsSink::new(dir.join("hls"), HlsConfig::default()).expect("폴더");
+    av(dir, Sink::Hls(HlsSink::new(dir.join("hls"), HlsConfig::default()).expect("폴더")));
+    av(dir, Sink::Mkv(MkvSink::new(dir.join("av")).expect("폴더")));
+}
+
+enum Sink {
+    Hls(HlsSink),
+    Mkv(MkvSink),
+}
+
+impl Sink {
+    fn write(&mut self, o: &Output) {
+        match self {
+            Sink::Hls(s) => s.write(o).expect("HLS"),
+            Sink::Mkv(s) => s.write(o).expect("MKV"),
+        }
+    }
+}
+
+fn av(dir: &std::path::Path, mut sink: Sink) {
     let tracks = [("h264", "video", 90_000u64, 1u64), ("opus", "audio", 48_000, 2)];
     let mut all: Vec<(u64, usize, bool, u32, Vec<u8>)> = Vec::new();
     for (k, (name, _, clock, _)) in tracks.iter().enumerate() {
@@ -57,7 +75,7 @@ fn hls(dir: &std::path::Path) {
     }
     all.sort_by_key(|x| (x.0, x.1));
     for (name, kind, _, id) in tracks {
-        sink.write(&Output::Segment(seg(id, kind, name, SegmentKind::Opened))).expect("열기");
+        sink.write(&Output::Segment(seg(id, kind, name, SegmentKind::Opened)));
     }
     let base = 1_800_000_000_000_000_000u64;
     for (at, k, key, ts, data) in all {
@@ -83,14 +101,25 @@ fn hls(dir: &std::path::Path) {
             data,
             filled: false,
         };
-        sink.write(&Output::Frame(f)).expect("프레임");
+        sink.write(&Output::Frame(f));
     }
     for (name, kind, _, id) in tracks {
-        sink.write(&Output::Segment(seg(id, kind, name, SegmentKind::Closed))).expect("닫기");
+        sink.write(&Output::Segment(seg(id, kind, name, SegmentKind::Closed)));
     }
-    sink.finish().expect("끝");
-    for st in sink.streams() {
-        println!("{} 조각 {} · init {} · 넘음 {} · 끊김 {}", st.event_playlist.display(), st.segments.len(), st.inits.len(), st.over_target, st.segments.iter().filter(|x| x.discontinuity).count());
+    match &mut sink {
+        Sink::Hls(s) => {
+            s.finish().expect("끝");
+            for st in s.streams() {
+                println!("{} 조각 {} · init {} · 넘음 {} · 끊김 {}", st.event_playlist.display(), st.segments.len(), st.inits.len(), st.over_target, st.segments.iter().filter(|x| x.discontinuity).count());
+            }
+        }
+        Sink::Mkv(s) => {
+            s.finish().expect("끝");
+            let f = s.files().last().expect("파일");
+            let out = dir.join("av.mkv");
+            std::fs::rename(&f.path, &out).expect("이름");
+            println!("{} 트랙 {:?} · 기준 {}", out.display(), f.tracks.iter().map(|t| (t.kind.as_str(), t.frames)).collect::<Vec<_>>(), f.base);
+        }
     }
 }
 

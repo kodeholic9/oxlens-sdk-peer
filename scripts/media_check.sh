@@ -40,6 +40,16 @@ for f in vp8 h264 opus; do
     [ "$(echo "$sizes" | wc -w)" -ge 2 ] || { echo "   ✗ 해상도 바뀜이 디코드에 안 보인다"; fail=1; }
   fi
 done
+# Matroska 사람마다 영상 · 음성 한 파일(202611/20261110e) — 같은 표본(H264 해상도 바뀜 + Opus)을 MkvSink 한 묶음으로 → 두 스트림 · 끝까지 디코드
+m="$D/av.mkv"
+echo "== av.mkv"
+ffprobe -v error -show_entries stream=codec_name,width,height,sample_rate -of compact "$m"
+err=$(ffmpeg -v error -i "$m" -f null - 2>&1 || true)
+v=$(ffprobe -v error -count_frames -select_streams v -show_entries stream=nb_read_frames -of csv=p=0 "$m")
+a=$(ffprobe -v error -count_frames -select_streams a -show_entries stream=nb_read_frames -of csv=p=0 "$m")
+echo "   영상 $v · 음성 $a · 오류 줄 $(printf '%s' "$err" | grep -c . || true)"
+[ -n "$err" ] && { echo "$err" | head -3; fail=1; }
+[ "${v:-0}" -eq 120 ] && [ "${a:-0}" -eq 101 ] || { echo "   ✗ 한 파일에 영상 120 · 음성 101 이 아니다"; fail=1; }
 # HLS(202611/20261110b) — 같은 표본(H264 해상도 바뀜 + Opus)을 HlsSink 로 지은 조각을 ★조각마다 그 조각의 init 을 붙여 끝까지 디코드한다.
 #   ★ffmpeg HLS 읽개는 재생 목록 중간의 EXT-X-MAP 교체(끊김 뒤 새 init)를 따라가지 않아 뒤 조각을 앞 init 으로 풀다 오류를 낸다(20261110 실측) —
 #   끊김을 건너는 재생은 3층 브라우저가 판정한다. 여기는 파일 자체(init + 조각)가 디코드되는지만.

@@ -17,7 +17,7 @@ pub use file::{FileSource, PartScan, scan_part};
 pub(crate) use live::Shared;
 pub use live::Records;
 pub use hls::{HlsConfig, HlsSegment, HlsSink, HlsStream};
-pub use mkv::{MkvFile, MkvSink};
+pub use mkv::{MkvConfig, MkvFile, MkvSink, MkvTrack};
 pub use ogg::{OggFile, OggSink, opus_samples};
 pub use pipeline::{Frame, Output, Pipeline, Policy, Segment, SegmentKind};
 

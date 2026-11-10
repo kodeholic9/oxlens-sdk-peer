@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use oxpeer::record::{FileSource, HlsConfig, HlsSink, MkvSink, Output, Pipeline, Policy, Record, Records};
+use oxpeer::record::{FileSource, HlsConfig, HlsSink, MkvConfig, MkvSink, Output, Pipeline, Policy, Record, Records};
 use oxpeer::{Client, Event, Events, Layer, Media, TrackEntry};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -40,7 +40,7 @@ fn ask_layer(client: &Client, tx: &mpsc::UnboundedSender<Value>, track: String, 
     });
 }
 
-/// 결과물 — Matroska(세그먼트마다 파일) · HLS(묶음마다 스트림)
+/// 결과물 — Matroska(사람마다 · 방 슬롯마다 영상 · 음성 한 파일 — 202611/20261110e) · HLS(묶음마다 스트림)
 pub enum Out {
     Mkv(MkvSink),
     Hls(HlsSink),
@@ -48,7 +48,11 @@ pub enum Out {
 
 impl Out {
     fn open(a: &Args, dir: &std::path::Path) -> std::io::Result<Out> {
-        Ok(if a.hls { Out::Hls(HlsSink::new(dir, HlsConfig::default())?) } else { Out::Mkv(MkvSink::new(dir)?) })
+        Ok(if a.hls {
+            Out::Hls(HlsSink::new(dir, HlsConfig::default())?)
+        } else {
+            Out::Mkv(MkvSink::with(dir, MkvConfig { span: a.span_secs.map(Duration::from_secs), ..MkvConfig::default() })?)
+        })
     }
 
     fn write(&mut self, o: &Output) -> std::io::Result<()> {
@@ -66,10 +70,27 @@ impl Out {
     }
 
     fn finish(&mut self) {
-        if let Out::Hls(s) = self
-            && let Err(e) = s.finish()
-        {
-            eprintln!("[recorder] HLS 마무리 실패: {e}");
+        let r = match self {
+            Out::Mkv(s) => s.finish(),
+            Out::Hls(s) => s.finish(),
+        };
+        if let Err(e) = r {
+            eprintln!("[recorder] 결과물 마무리 실패: {e}");
+        }
+    }
+
+    /// 결과물이 낸 키프레임 요청(조각 · 파일 경계 1초 전) — 앱이 SDK 에 넘긴다(결과물 바이트와 무관)
+    fn take_keyframe_requests(&mut self) -> Vec<String> {
+        match self {
+            Out::Mkv(s) => s.take_keyframe_requests(),
+            Out::Hls(s) => s.take_keyframe_requests(),
+        }
+    }
+
+    fn before_key(&self) -> u64 {
+        match self {
+            Out::Mkv(s) => s.before_key(),
+            Out::Hls(_) => 0,
         }
     }
 
@@ -109,13 +130,11 @@ fn hls_files(s: &HlsSink) -> Vec<String> {
 }
 
 pub fn policy(a: &Args) -> Policy {
-    if a.hls {
+    // HLS · Matroska 길이 정책은 결과물 안에서 자른다(영상 · 음성을 같은 시각에서) — 파이프라인은 잇는 길이 정책
+    if a.hls || a.span_secs.is_some() {
         return Policy::Span { time_ns: u64::MAX, bytes: u64::MAX };
     }
-    match a.span_secs {
-        Some(s) => Policy::Span { time_ns: s * 1_000_000_000, bytes: u64::MAX },
-        None => Policy::Utterance,
-    }
+    Policy::Utterance
 }
 
 /// 녹화 갈래의 셈 — 그 방 프레임만 결과물로 · 출처 없는 프레임 수 · 트랙마다 첫 프레임이 실린 때(시작 뒤 ms — 커버리지)
@@ -155,9 +174,12 @@ fn files(sink: &MkvSink) -> Vec<Value> {
         .iter()
         .map(|f| {
             json!({
-                "file": f.path, "segment": f.segment, "track_id": f.track_id, "kind": f.kind, "codec": f.codec, "who": f.user_id, "slot": f.owner.is_none(),
-                "frames": f.frames, "keyframes": f.keyframes, "synced": f.synced, "filled": f.filled, "first_rtp": f.first_rtp, "last_rtp": f.last_rtp,
-                "duration_ms": f.duration_ms, "start_wall_ms": f.start_ms, "rebased": f.rebased, "reason": f.reason,
+                "file": f.path, "group": f.group, "index": f.index, "who": f.user_id, "owner": f.owner, "slot": f.owner.is_none(), "source": f.source,
+                "base": f.base, "date": f.date, "date_track": f.date_track, "start_wall_ms": f.start_ms, "duration_ms": f.duration_ms, "reason": f.reason,
+                "tracks": f.tracks.iter().map(|t| json!({
+                    "kind": t.kind, "track_id": t.track_id, "codec": t.codec, "num": t.num, "frames": t.frames, "keyframes": t.keyframes,
+                    "synced": t.synced, "filled": t.filled, "first_rtp": t.first_rtp, "last_rtp": t.last_rtp, "first_ms": t.first_ms, "rebased": t.rebased,
+                })).collect::<Vec<_>>(),
             })
         })
         .collect()
@@ -226,10 +248,8 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut media: Media,
                     plan_at += 1;
                 }
                 // HLS 조각 경계 — 결과물이 낸 키프레임 요청을 SDK 에 넘긴다(SDK:RULE-PLAT-REC-HLS · 결과물 바이트와 무관)
-                if let Out::Hls(s) = &mut sink {
-                    for t in s.take_keyframe_requests() {
-                        let _ = client.request_keyframe(t);
-                    }
+                for t in sink.take_keyframe_requests() {
+                    let _ = client.request_keyframe(t);
                 }
             }
             Some(v) = lrx.recv() => layer_calls.push(v),
@@ -296,7 +316,7 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut media: Media,
     let mut out = json!({
         "room": a.room,
         "orphan_frames": tally.orphan,
-        "skipped_until_key": c.before_key,
+        "skipped_until_key": c.before_key + sink.before_key(),
         "late_frames": c.late,
         "layer_calls": layer_calls,
         "events": seen_events,

@@ -619,10 +619,11 @@ fn mkv_sink_is_deterministic_and_rebases_across_rows() {
     let fb = mkv_build(&recs, &b);
     assert_eq!(fa.len(), 1);
     assert_eq!(std::fs::read(&fa[0].path).unwrap(), std::fs::read(&fb[0].path).unwrap(), "같은 레코드열이면 같은 바이트");
-    assert_eq!(fa[0].path.file_name().unwrap(), "r-0000-u1-video.mkv");
-    assert_eq!((fa[0].frames, fa[0].keyframes, fa[0].rebased, fa[0].synced), (3, 2, 1, 0));
-    assert_eq!(fa[0].duration_ms, 33 + 500, "줄을 옮긴 뒤는 레코드 시각 차(500ms)로 잇는다");
-    assert_eq!(fa[0].start_ms, Some((t0 + ms) / 1_000_000), "UTC 가 없으면 첫 프레임 레코드 시각");
+    assert_eq!(fa[0].path.file_name().unwrap(), "r-u1-0000.mkv", "묶음(방 · 주인) · 파일 차례");
+    let v = &fa[0].tracks[0];
+    assert_eq!((v.kind.as_str(), v.frames, v.keyframes, v.rebased, v.synced), ("video", 3, 2, 1, 0));
+    assert_eq!(fa[0].duration_ms, 33 + 500 + 33, "줄을 옮긴 뒤는 레코드 시각 차(500ms)로 잇는다 — 길이 = 마지막 블록 + 한 프레임");
+    assert_eq!((fa[0].start_ms, fa[0].base), ((t0 + ms) / 1_000_000, "log_time"), "UTC 가 없으면 첫 프레임 레코드 시각");
     std::fs::remove_dir_all(&a).ok();
     std::fs::remove_dir_all(&b).ok();
 }
@@ -643,8 +644,8 @@ fn mkv_start_is_back_computed_from_first_synced_frame() {
     let d = tmp("mkv-sr");
     let f = mkv_build(&recs, &d);
     let utc_ms = (3_000_000_000u64 - 2_208_988_800) * 1_000;
-    assert_eq!(f[0].start_ms, Some(utc_ms - 66), "첫 동기 프레임 UTC − 그때까지 흐른 블록 시각(6000 틱 = 66.6ms)");
-    assert_eq!(f[0].synced, 1);
+    assert_eq!((f[0].start_ms, f[0].base), ((utc_ms * 1_000_000 - 66_666_666) / 1_000_000, "utc"), "첫 동기 프레임 UTC − 그때까지 흐른 RTP 경과(6000 틱 = 66.67ms · DateUTC 는 ns 로 적는다)");
+    assert_eq!(f[0].tracks[0].synced, 1);
     std::fs::remove_dir_all(&d).ok();
 }
 
@@ -659,8 +660,9 @@ fn mkv_rtp_time_wrap_keeps_blocks_moving_forward() {
     }
     let d = tmp("mkv-wrap");
     let f = mkv_build(&recs, &d);
-    assert_eq!((f[0].frames, f[0].first_rtp, f[0].last_rtp), (8, Some(start), Some(start.wrapping_add(7 * 3000))));
-    assert_eq!(f[0].duration_ms, 7 * 3000 / 90, "넘침을 지나도 앞으로만 간다");
+    let v = &f[0].tracks[0];
+    assert_eq!((v.frames, v.first_rtp, v.last_rtp), (8, Some(start), Some(start.wrapping_add(7 * 3000))));
+    assert_eq!(f[0].duration_ms, (7 * 3000 + 3000) / 90, "넘침을 지나도 앞으로만 간다 — 길이 = 마지막 블록 + 한 프레임");
     std::fs::remove_dir_all(&d).ok();
 }
 
@@ -1032,4 +1034,173 @@ fn pipeline_stages_and_sinks_never_read_the_system_clock() {
         seen += 1;
     }
     assert_eq!(seen, 6);
+}
+
+// ── #4(202611/20261110e) — Matroska 사람마다 영상 · 음성 한 파일 ──
+
+fn mkv_av_build(recs: &[Record], dir: &Path, policy: Policy, cfg: MkvConfig) -> (Vec<MkvFile>, Vec<String>) {
+    let mut pl = Pipeline::new(policy);
+    let mut sink = MkvSink::with(dir, cfg).unwrap();
+    let mut asked = Vec::new();
+    for r in recs {
+        for o in pl.push(r) {
+            sink.write(&o).unwrap();
+        }
+        asked.extend(sink.take_keyframe_requests());
+    }
+    for o in pl.finish() {
+        sink.write(&o).unwrap();
+    }
+    sink.finish().unwrap();
+    (sink.files().to_vec(), asked)
+}
+
+#[test]
+fn mkv_person_gets_one_file_with_video_and_audio_on_one_timeline() {
+    let d = tmp("mkv-av");
+    let (fs, _) = mkv_av_build(&av_stream(6, 1000, None), &d, Policy::Utterance, MkvConfig::default());
+    assert_eq!(fs.len(), 1, "사람 하나 = 파일 하나");
+    let f = &fs[0];
+    assert_eq!(f.path.file_name().unwrap(), "r-u1-0000.mkv");
+    assert_eq!(f.tracks.iter().map(|t| t.kind.as_str()).collect::<Vec<_>>(), vec!["video", "audio"]);
+    assert_eq!(f.base, "utc", "두 트랙 모두 SR — 한 시각축");
+    let (v, a) = (&f.tracks[0], &f.tracks[1]);
+    assert!(v.frames > 170 && a.frames > 290, "영상 {} · 음성 {}", v.frames, a.frames);
+    // 같은 순간(0초)에 시작한 두 트랙 — 파일 원점에서 첫 블록까지가 같다(RTP 경과 · SR 기준)
+    assert!(v.first_ms.abs_diff(a.first_ms) <= 1, "영상 첫 블록 {} · 음성 첫 블록 {}", v.first_ms, a.first_ms);
+    let b = std::fs::read(&f.path).unwrap();
+    assert!(b.windows(15).any(|w| w == b"V_MPEG4/ISO/AVC") && b.windows(6).any(|w| w == b"A_OPUS"));
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn mkv_span_cuts_both_tracks_at_video_keyframe_and_requests_key() {
+    let d = tmp("mkv-span");
+    let cfg = MkvConfig { span: Some(Duration::from_secs(4)), ..MkvConfig::default() };
+    let (fs, asked) = mkv_av_build(&av_stream(11, 1000, None), &d, Policy::Span { time_ns: u64::MAX, bytes: u64::MAX }, cfg);
+    assert_eq!(fs.len(), 3, "4초 지난 첫 키(1초마다)에서 — 0 ~ 4 · 4 ~ 8 · 8 ~ 11");
+    assert!(fs[..2].iter().all(|f| f.reason.as_deref() == Some("span")) && fs.iter().all(|f| f.tracks.len() == 2));
+    assert_eq!(asked.len(), 3, "파일마다 T − 1초에 한 번");
+    // ★트랙마다 이어진다 — 앞 파일의 그 트랙 끝(시작 벽시계 + 첫 블록 + 프레임 수 × 길이) = 다음 파일의 그 트랙 시작. 빈틈 · 겹침 없음
+    //   (파일 원점은 앞 파일 음성 끝 — 영상은 자른 키프레임에서 시작해 원점에서 조금 뒤)
+    for w in fs.windows(2) {
+        for (i, per_ms) in [(0usize, 1000.0 / 30.0), (1, 20.0)] {
+            let (a, b) = (&w[0].tracks[i], &w[1].tracks[i]);
+            let end = w[0].start_ms as f64 + a.first_ms as f64 + a.frames as f64 * per_ms;
+            let next = (w[1].start_ms + b.first_ms) as f64;
+            assert!((end - next).abs() <= 2.0, "{} 트랙 앞 끝 {end:.1} · 다음 시작 {next:.1}", a.kind);
+        }
+    }
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn mkv_span_with_audio_clock_behind_video_places_every_block_on_its_sr_time() {
+    // ★보내는 쪽 음성 시계가 영상보다 3% 느리다 — 음성 RTP 는 프레임마다 960 그대로인데 20.6ms 마다 온다(2층 장시간 판 실측: 봇 음성은 초당 49프레임 · 분당 1.4초 · 202611/20261110e).
+    //   SR 은 그 시계대로 RTP ↔ 벽시계를 잇는다. 자른 키프레임 뒤에 오는 음성은 그 키보다 이른 시각이다 — 이어지는 파일을 키 하나로 열면 그 음성이 원점 앞으로 떨어져 0 에 눌렸다.
+    let t0 = 1_800_000_000_000_000_000u64;
+    let sr_a = 500 * 48 * 97 / 100;
+    let mut recs = av_stream(13, 1000, None);
+    for r in &mut recs {
+        match r.channel {
+            Channel::Rtp(100) => r.log_time = t0 + (r.log_time - t0) / 97 * 100,
+            Channel::Sr if r.data.starts_with(br#"{"ssrc":100,"#) => {
+                r.data = String::from_utf8(r.data.clone()).unwrap().replace(&format!(r#""rtp":{}"#, 500 * 48), &format!(r#""rtp":{sr_a}"#)).into_bytes();
+            }
+            _ => {}
+        }
+    }
+    recs.sort_by_key(|r| (r.log_time, r.sequence));
+    for (i, r) in recs.iter_mut().enumerate() {
+        r.sequence = i as u32 + 1;
+    }
+    let d = tmp("mkv-span-drift");
+    let cfg = MkvConfig { span: Some(Duration::from_secs(4)), ..MkvConfig::default() };
+    let (fs, _) = mkv_av_build(&recs, &d, Policy::Span { time_ns: u64::MAX, bytes: u64::MAX }, cfg);
+    assert!(fs.len() >= 3 && fs.iter().all(|f| f.base == "utc" && f.tracks.len() == 2));
+    let t0_ms = (t0 / 1_000_000) as f64;
+    for f in &fs {
+        for t in &f.tracks {
+            let (clock, sr_rtp) = if t.kind == "video" { (90.0, 1000.0 + 500.0 * 90.0) } else { (48.0, f64::from(sr_a)) };
+            let want = t0_ms + 500.0 + (f64::from(t.first_rtp.unwrap()) - sr_rtp) / clock;
+            let got = (f.start_ms + t.first_ms) as f64;
+            assert!((got - want).abs() <= 1.5, "{} {} 첫 블록 {got} · SR 로 셈한 {want:.1}", f.path.display(), t.kind);
+        }
+    }
+    let sent = recs.iter().filter(|r| r.channel == Channel::Rtp(100)).count() as u64;
+    assert_eq!(fs.iter().map(|f| f.tracks[1].frames).sum::<u64>(), sent, "음성은 빠짐없이 어느 한 파일에(채움 없음 — 음성 RTP 는 이어진다)");
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn mkv_av_log_time_file_patched_by_late_sr_names_its_anchor_track() {
+    // SR 이 여는 보류(2초) 뒤에 온다 — 파일은 log_time 기준으로 열리고 · 닫을 때 영상 트랙 두 기준 차로 DateUTC 를 고쳐 쓴다.
+    //   ★한 파일 DateUTC 는 한 값 — 그 닻 트랙만 UTC 와 맞는다(2층 장시간 판 첫 SR 파일 음성 60ms · 202611/20261110e). 요약이 닻을 적는다
+    let t0 = 1_800_000_000_000_000_000u64;
+    let mut recs = av_stream(5, 1000, None);
+    for r in &mut recs {
+        if r.channel == Channel::Sr {
+            r.log_time = t0 + 3_000_000_000;
+        }
+    }
+    recs.sort_by_key(|r| (r.log_time, r.sequence));
+    let d = tmp("mkv-late-sr");
+    let (fs, _) = mkv_av_build(&recs, &d, Policy::Utterance, MkvConfig::default());
+    assert_eq!(fs.len(), 1);
+    let f = &fs[0];
+    assert_eq!((f.base, f.date, f.date_track), ("log_time", "utc", Some("video")));
+    let v = &f.tracks[0];
+    let want = (t0 / 1_000_000) as f64 + 500.0 + (f64::from(v.first_rtp.unwrap()) - (1000.0 + 500.0 * 90.0)) / 90.0;
+    assert!(((f.start_ms + v.first_ms) as f64 - want).abs() <= 1.5, "닻(영상) 첫 블록 = SR 시각");
+    let (fu, _) = mkv_av_build(&av_stream(5, 1000, None), &d, Policy::Utterance, MkvConfig::default());
+    assert_eq!((fu[0].base, fu[0].date_track), ("utc", None), "utc 기준 파일은 닻이 없다 — 모든 트랙이 SR 시각");
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn mkv_slot_utterance_is_one_file_per_speaker_with_both_kinds() {
+    // 무전 슬롯 — 화자 A(출처 7) 영상 · 음성 → 화자 B(출처 8). 출처가 바뀐 첫 프레임에서 새 파일 · 그 파일 영상은 B 의 첫 키프레임부터
+    let ms = 1_000_000u64;
+    let tracks = serde_json::json!([{ "track_id": "slot-a", "kind": "audio" }, { "track_id": "slot-v", "kind": "video" }]);
+    let rows = serde_json::json!({ "100": { "track_id": "slot-a", "kind": "audio", "codec": "opus", "pt": 111 }, "200": vrow("slot-v") });
+    // ★같은 화자라도 음성 · 영상 CSRC 가 다르다(실제 — 2층에서 잡힌 결함) · 화자 사용자는 Floor Taken 의 출처 번호로 안다
+    let mut recs = vec![rec(1, 0, Channel::Track, track_list("r", tracks, rows))];
+    recs.push(rec(2, 0, Channel::Floor, br#"{"room":"r","event":"taken","user_id":"A","sources":[7,17],"seq":1}"#.to_vec()));
+    recs.push(rec(3, 0, Channel::Floor, br#"{"room":"r","event":"taken","user_id":"B","sources":[8,18],"seq":2}"#.to_vec()));
+    let mut n = 4u32;
+    let (mut aseq, mut vseq) = (0u16, 0u16);
+    for (src, t0) in [(7u32, 0u32), (8, 3000)] {
+        for i in 0..100u32 {
+            let t = t0 + i * 20;
+            recs.push(rec(n, u64::from(t) * ms, Channel::Rtp(100), pkt(aseq, t * 48, true, Some(src), &[0x78, i as u8])));
+            n += 1;
+            aseq = aseq.wrapping_add(1);
+            if i % 2 == 1 {
+                // 영상은 40ms 마다 · 새 화자의 첫 영상은 델타 둘 뒤 키(키프레임 기다림)
+                let vi = i / 2;
+                let key = vi == 2 || vi == 30;
+                recs.push(rec(n, u64::from(t) * ms, Channel::Rtp(200), pkt(vseq, t * 90, true, Some(src + 10), if key { KEY } else { DELTA })));
+                n += 1;
+                vseq = vseq.wrapping_add(1);
+            }
+        }
+    }
+    let d = tmp("mkv-slot");
+    let (fs, _) = mkv_av_build(&recs, &d, Policy::Utterance, MkvConfig::default());
+    assert_eq!(fs.iter().map(|f| f.source).collect::<Vec<_>>(), vec![Some(7), Some(8)], "발언 하나 = 파일 하나");
+    assert!(fs.iter().all(|f| f.tracks.len() == 2), "파일마다 영상 · 음성");
+    assert_eq!(fs[1].tracks.iter().find(|t| t.kind == "audio").unwrap().frames, 100, "B 의 음성은 첫 프레임부터 B 파일");
+    assert_eq!(fs[0].reason.as_deref(), Some("source"));
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn mkv_av_is_deterministic_for_same_records() {
+    let (a, b) = (tmp("mkv-av-d1"), tmp("mkv-av-d2"));
+    let recs = av_stream(5, 1000, None);
+    let (fa, _) = mkv_av_build(&recs, &a, Policy::Utterance, MkvConfig::default());
+    let (fb, _) = mkv_av_build(&recs, &b, Policy::Utterance, MkvConfig::default());
+    assert_eq!(std::fs::read(&fa[0].path).unwrap(), std::fs::read(&fb[0].path).unwrap());
+    std::fs::remove_dir_all(&a).ok();
+    std::fs::remove_dir_all(&b).ok();
 }

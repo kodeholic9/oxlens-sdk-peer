@@ -65,6 +65,8 @@ pub struct HlsStream {
     pub tracks: Vec<(String, String, String)>,
     /// 키프레임을 요청한 횟수
     pub keyframe_requests: u64,
+    /// 같은 시각의 새 층 프레임으로 바꿔 낀 영상 견본 수(시뮬캐스트 층 바꿈 — 서버가 같은 그림을 층만 바꿔 다시 보낸다)
+    pub replaced: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,6 +254,7 @@ impl HlsSink {
                 refused: None,
                 tracks: Vec::new(),
                 keyframe_requests: 0,
+                replaced: 0,
             },
             ended: false,
         });
@@ -352,6 +355,14 @@ impl HlsSink {
                 t.first_log = f.log_time;
             }
             let ticks = t.advance(f.rtp_ts);
+            // ★같은 순간의 그림이 층만 바뀌어 다시 오면(시뮬캐스트 층 바꿈 — 서버가 새 층 키프레임을 앞 프레임 바로 뒤 시각으로 잇는다 · 2층 실측 +90 틱 = 1ms)
+            //   앞 견본을 버리고 새 키프레임으로 바꿔 낀다 — 판정은 「한 프레임 간격의 절반보다 가까이 붙은 키프레임」.
+            //   두지 않으면 견본 하나짜리 1ms 조각이 생긴다(2층 peer_record_hls_simulcast 실측 20261110 seg-00001 0.001초 — 202611/20261110d T4)
+            let gap = t.buf.len().checked_sub(2).map(|i| t.buf[i + 1].ticks.saturating_sub(t.buf[i].ticks)).unwrap_or(if t.last_dur > 0 { t.last_dur } else { 3000 });
+            if kind == Kind::Video && f.keyframe && t.buf.last().is_some_and(|s| ticks.saturating_sub(s.ticks) * 2 < gap) {
+                t.buf.pop();
+                g.out.replaced += 1;
+            }
             if t.first_utc.is_none()
                 && let Some(u) = f.utc_ns
             {

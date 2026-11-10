@@ -36,6 +36,8 @@ struct Args {
     video: bool,
     spatial: Option<u8>,
     layer_plan: Vec<(u64, u8)>,
+    /// 영상 줄 우선순위(`--priority <user_id>=<n>` · 여러 번) — 줄 상한을 넘는 방에서 누구를 늘 받을지 앱이 고른다(연:RULE-SUB-FILL video 「고르는 이 = 클라」 · 202611/20261110d T5)
+    priority: Vec<(String, u8)>,
     /// 녹화 길이 정책(초) — 없으면 발언 정책(SDK:RULE-PLAT-REC-SPLIT)
     span_secs: Option<u64>,
     /// 결과물을 HLS 로(SDK:RULE-PLAT-REC-HLS · 202611/20261110b)
@@ -50,7 +52,7 @@ struct Args {
 }
 
 fn args() -> Args {
-    let mut a = Args { base: String::new(), room: String::new(), out: PathBuf::from("."), secs: None, hidden: false, user: "oxpeer-recorder".into(), api_key: "ox_k_demo".into(), api_secret: "ox_s_demo".into(), tls_root: None, video: false, spatial: None, layer_plan: Vec::new(), span_secs: None, hls: false, raw: None, raw_part_ms: None, raw_part_bytes: None, raw_flush_ms: None, raw_tick_ms: None, linger_ms: None };
+    let mut a = Args { base: String::new(), room: String::new(), out: PathBuf::from("."), secs: None, hidden: false, user: "oxpeer-recorder".into(), api_key: "ox_k_demo".into(), api_secret: "ox_s_demo".into(), tls_root: None, video: false, spatial: None, layer_plan: Vec::new(), priority: Vec::new(), span_secs: None, hls: false, raw: None, raw_part_ms: None, raw_part_bytes: None, raw_flush_ms: None, raw_tick_ms: None, linger_ms: None };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         let mut v = || it.next().unwrap_or_default();
@@ -67,6 +69,13 @@ fn args() -> Args {
             "--video" => a.video = true,
             "--spatial" => a.spatial = v().parse().ok(),
             "--span-secs" => a.span_secs = v().parse().ok(),
+            "--priority" => {
+                if let Some((u, n)) = v().rsplit_once('=')
+                    && let Ok(n) = n.parse()
+                {
+                    a.priority.push((u.to_string(), n));
+                }
+            }
             "--hls" => {
                 a.hls = true;
                 a.video = true;

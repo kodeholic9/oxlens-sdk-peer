@@ -1063,6 +1063,27 @@ mod tests {
     }
 
     #[test]
+    fn record_exit_and_gap_cross_seq_wrap() {
+        // 설계 20261109b §10-3 「seq 넘침도 같은 방식」(202611/20261110d T2) — 65534 · (65535 · 0 잃음) · 1 → 출구 차례 65534 · 1 · 빈 번호 사건 하나가 넘침을 가로지른다
+        let c = Arc::new(Counters::default());
+        let mut r = Recv::new(9, c.clone());
+        r.record = true;
+        let rt = route("video", "VP8", Unit::Packet);
+        let t0 = Instant::now();
+        let w = SystemTime::now();
+        let mut o = r.on_rtp(&rt, raw(65534, 0, true, &[0x10, 0x00]), t0, w);
+        o.extend(r.on_rtp(&rt, raw(1, 9000, true, &VP8_DELTA), t0, w));
+        let mut t = t0;
+        for _ in 0..15 {
+            o.extend(r.tick(t).0);
+            t += NACK_INTERVAL;
+        }
+        assert_eq!(raw_seqs(&o), vec![65534, 1]);
+        assert_eq!(gaps(&o), vec![Gap { ssrc: 1111, from: 65535, to: 0, count: 2, reason: "nack_exhausted" }], "넘침을 가로지른 빈 번호는 범위 하나(스트림 재설정이 아니다)");
+        assert_eq!(c.lost.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn parses_sender_report() {
         let mut b = head(0, 200, 6);
         b.extend_from_slice(&1111u32.to_be_bytes());

@@ -929,3 +929,88 @@ fn hls_audio_decode_time_is_cumulative_across_segments_despite_plc_remainder() {
     }
     std::fs::remove_dir_all(&d).ok();
 }
+
+
+// ── 시험 단계 T2(202611/20261110d) — RTP seq 넘침(설계 §10-3 「seq 넘침도 같은 방식」) ──
+
+#[test]
+fn pipeline_assembles_video_frame_across_seq_wrap_and_ogg_keeps_range() {
+    let ms = 1_000_000u64;
+    let u1 = serde_json::json!([{ "track_id": "cam-u1", "kind": "video", "user_id": "u1", "csrc": 9 }]);
+    let mut recs = vec![rec(1, 0, Channel::Track, track_list("r", u1, serde_json::json!({ "200": vrow("cam-u1") })))];
+    // 키프레임 한 장이 조각 셋 — seq 65535 · 0 · 1(marker) · 다음 델타 2
+    recs.push(rec(2, ms, Channel::Rtp(200), pkt(65535, 3000, false, Some(9), &[0x10, 0x00, 0x9d, 1])));
+    recs.push(rec(3, ms, Channel::Rtp(200), pkt(0, 3000, false, Some(9), &[0x00, 2])));
+    recs.push(rec(4, ms, Channel::Rtp(200), pkt(1, 3000, true, Some(9), &[0x00, 3])));
+    recs.push(rec(5, 2 * ms, Channel::Rtp(200), pkt(2, 6000, true, Some(9), DELTA)));
+    let mut pl = Pipeline::new(Policy::Utterance);
+    let out: Vec<Output> = recs.iter().flat_map(|r| pl.push(r)).collect();
+    let fr: Vec<(u16, u16, bool, Vec<u8>)> = out.iter().filter_map(|o| if let Output::Frame(f) = o { Some((f.seq_first, f.seq_last, f.keyframe, f.data.clone())) } else { None }).collect();
+    assert_eq!(fr[0], (65535, 1, true, vec![0x00, 0x9d, 1, 2, 3]), "넘침을 가로지른 조각 셋이 한 프레임");
+    assert_eq!((fr[1].0, fr[1].1), (2, 2));
+    assert_eq!(pl.counts().broken, 0);
+
+    // 발언 파일(Ogg) — seq 범위가 넘침을 가로질러도 첫 · 끝이 그대로
+    let tracks = serde_json::json!([{ "track_id": "slot-a", "kind": "audio" }]);
+    let rows = serde_json::json!({ "100": { "track_id": "slot-a", "kind": "audio", "codec": "opus", "pt": 111 } });
+    let mut a = vec![rec(1, 0, Channel::Track, track_list("r", tracks, rows))];
+    for (i, sq) in [65533u16, 65534, 65535, 0, 1, 2].into_iter().enumerate() {
+        a.push(rec(2 + i as u32, i as u64 * 20 * ms, Channel::Rtp(100), pkt(sq, i as u32 * 960, true, Some(7), &[0x78, i as u8])));
+    }
+    let d = tmp("seq-wrap-ogg");
+    let mut pl = Pipeline::new(Policy::Utterance);
+    let mut sink = OggSink::new(&d).unwrap();
+    for r in &a {
+        for o in pl.push(r) {
+            sink.write(&o).unwrap();
+        }
+    }
+    for o in pl.finish() {
+        sink.write(&o).unwrap();
+    }
+    let f = &sink.files()[0];
+    assert_eq!((f.packets, f.first_seq, f.last_seq, f.filled), (6, Some(65533), Some(2), 0));
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn hls_same_time_frame_on_layer_switch_replaces_previous_sample() {
+    // 시뮬캐스트 층 바꿈 — 4초 지점 h 키프레임(T 로 자르는 프레임) 바로 뒤(+90 틱 = 1ms · 2층 실측)에 l 키프레임(다른 SPS)이 온다.
+    // 같은 순간의 그림이니 앞 견본을 바꿔 끼워 1ms 조각이 없어야 한다(2층 peer_record_hls_simulcast 실측 20261110 — seg-00001 0.001초)
+    let ms = 1_000_000u64;
+    let tracks = serde_json::json!([{ "track_id": "cam-u1", "kind": "video", "user_id": "u1", "csrc": 9 }]);
+    let rows = serde_json::json!({ "200": { "track_id": "cam-u1", "kind": "video", "codec": "H264", "pt": 102 } });
+    for off in [0u32, 90] {
+        let mut recs = vec![rec(1, 0, Channel::Track, track_list("r", tracks.clone(), rows.clone()))];
+        let (mut n, mut seq) = (2u32, 0u16);
+        let mut put = |recs: &mut Vec<Record>, ts: u32, i: u32, sps: Option<&[u8]>| {
+            let idr = [0x65, 0x88, i as u8];
+            let delta = [0x41, 0x9a, i as u8];
+            let nal: Vec<&[u8]> = match sps {
+                Some(s) => vec![s, PPS, &idr],
+                None => vec![&delta],
+            };
+            for (k, x) in nal.iter().enumerate() {
+                recs.push(rec(n, u64::from(i) * 33 * ms, Channel::Rtp(200), pkt(seq, ts, k + 1 == nal.len(), Some(9), x)));
+                n += 1;
+                seq = seq.wrapping_add(1);
+            }
+        };
+        let mut base = 0u32;
+        for i in 0..240u32 {
+            let key = i.is_multiple_of(30);
+            if i == 120 {
+                put(&mut recs, i * 3000, i, Some(SPS_A));
+                base = off;
+            }
+            put(&mut recs, i * 3000 + base, i, if key { Some(if i < 120 { SPS_A } else { SPS_B }) } else { None });
+        }
+        let d = tmp(&format!("hls-dup-{off}"));
+        let (st, _) = hls_build(&recs, &d);
+        let s = &st[0];
+        assert_eq!(s.replaced, 1, "+{off} 틱 — 같은 순간 앞 견본을 바꿔 꼈다");
+        assert!(s.segments.iter().all(|x| x.duration > 0.5), "+{off} 틱 — 견본 하나짜리 조각이 없다 {:?}", s.segments.iter().map(|x| x.duration).collect::<Vec<_>>());
+        assert_eq!((s.inits.len(), s.segments.iter().filter(|x| x.discontinuity).count()), (2, 1));
+        std::fs::remove_dir_all(&d).ok();
+    }
+}

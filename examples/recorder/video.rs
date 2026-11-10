@@ -84,7 +84,7 @@ impl Out {
                 let name = |p: &std::path::Path| p.display().to_string();
                 out["hls"] = json!(s.streams().iter().map(|st| json!({
                     "key": st.key, "dir": name(&st.dir), "room": st.room, "owner": st.owner, "base": st.base, "refused": st.refused,
-                    "over_target": st.over_target, "keyframe_requests": st.keyframe_requests,
+                    "over_target": st.over_target, "keyframe_requests": st.keyframe_requests, "replaced": st.replaced,
                     "tracks": st.tracks, "inits": st.inits.iter().map(|p| name(p)).collect::<Vec<_>>(),
                     "event": name(&st.event_playlist), "live": name(&st.live_playlist),
                     "segments": st.segments.iter().map(|x| json!({ "file": name(&x.file), "init": name(&x.init), "discontinuity": x.discontinuity, "duration": x.duration })).collect::<Vec<_>>(),
@@ -200,6 +200,7 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut media: Media,
     // 커버리지(20261107b Q4) — 영상 트랙이 방 목록에 처음 보인 때 · 첫 프레임이 실린 때(시작 뒤 ms). 줄 상한 밖이면 실린 때가 늦거나 없다
     let mut listed_at: BTreeMap<String, u64> = BTreeMap::new();
     let mut asked: HashSet<String> = HashSet::new();
+    let mut prioritized: HashSet<String> = HashSet::new();
     let mut plan = a.layer_plan.clone();
     plan.sort();
     let mut plan_at = 0usize;
@@ -245,6 +246,16 @@ pub async fn run(a: &Args, client: Client, mut events: Events, mut media: Media,
                                 && let Some(s) = cap.or_else(|| top_spatial(t))
                             {
                                 ask_layer(&client, &ltx, t.track_id.clone(), s, sink.last_rtp(&t.track_id));
+                            }
+                            // 줄 우선순위 — 앱이 고른 사람의 영상은 줄 상한을 넘는 방에서도 늘 받는다(연:RULE-SUB-FILL)
+                            if let Some((_, n)) = a.priority.iter().find(|(u, _)| t.user_id.as_deref() == Some(u.as_str()))
+                                && prioritized.insert(t.track_id.clone())
+                            {
+                                let (c, tx, id, n) = (client.clone(), ltx.clone(), t.track_id.clone(), *n);
+                                tokio::spawn(async move {
+                                    let r = c.set_layer(&id, Layer { priority: Some(n), ..Layer::default() }).await;
+                                    let _ = tx.send(json!({ "at_ms": unix_ms(), "track_id": id, "priority": n, "ok": r.is_ok(), "error": r.err().map(|e| e.to_string()) }));
+                                });
                             }
                         }
                     }

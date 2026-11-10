@@ -720,6 +720,9 @@ mod tests {
         // 1280x720 baseline SPS(지수 골롬으로 지은 것 — 80 x 45 매크로블록 · 자르기 없음)
         let sps = [0x67, 0x42, 0xc0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xe4];
         assert_eq!(h264_dims(&sps), Some((1280, 720)));
+        // 2층 봇 H264 시뮬캐스트 층 SPS(oxe2epy `rtp_tx.h264_sps` — 자르기 있음 · 202611/20261110d) — 쓰는 쪽과 읽는 쪽 교차 대조
+        assert_eq!(h264_dims(&[0x67, 0x42, 0xc0, 0x1f, 0xda, 0x02, 0x80, 0xbd, 0xe5, 0x40]), Some((640, 360)));
+        assert_eq!(h264_dims(&[0x67, 0x42, 0xc0, 0x1f, 0xda, 0x05, 0x06, 0x5e, 0x74]), Some((320, 180)));
     }
 
     #[test]

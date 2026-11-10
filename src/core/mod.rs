@@ -260,6 +260,7 @@ pub(crate) fn spawn(cfg: Config, ev: mpsc::UnboundedSender<Event>, media: mpsc::
         frames_dropped: Arc::new(AtomicU64::new(0)),
         counters: Arc::default(),
         qa_drop_every: std::env::var("OXPEER_QA_DROP_VIDEO_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+        qa_drop_until: std::env::var("OXPEER_QA_DROP_VIDEO_UNTIL_MS").ok().and_then(|v| v.parse().ok()).map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms)),
         qa_drop_audio_every: std::env::var("OXPEER_QA_DROP_AUDIO_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
         qa_dropped: Arc::new(AtomicU64::new(0)),
         senders: Arc::default(),

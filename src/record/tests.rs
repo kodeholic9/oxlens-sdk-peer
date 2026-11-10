@@ -1014,3 +1014,22 @@ fn hls_same_time_frame_on_layer_switch_replaces_previous_sample() {
         std::fs::remove_dir_all(&d).ok();
     }
 }
+
+// ── 김대리 검토 #13(202611/20261110e) — 단계 안 시스템 시계 금지(SDK:RULE-PLAT-REC-PIPE 「★시계 금지」 · 설계 D7)를 기계로 ──
+
+#[test]
+fn pipeline_stages_and_sinks_never_read_the_system_clock() {
+    // 기록기(`mod.rs`)만 `log_time` 닻으로 시계를 읽는다. 단계 · 결과물 · 꼬리 읽기 · 파일 읽기는 레코드의 시각만 쓴다 — 「라이브 = 파일」의 전제
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/record");
+    let mut seen = 0;
+    for f in ["pipeline.rs", "ogg.rs", "mkv.rs", "hls.rs", "live.rs", "file.rs"] {
+        let src = std::fs::read_to_string(dir.join(f)).unwrap();
+        // 시험 모듈(`#[cfg(test)]` 뒤)은 검사 밖 — 본문만
+        let body = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        for bad in ["Instant::now", "SystemTime::now", "SystemTime", "UNIX_EPOCH", "chrono::"] {
+            assert!(!body.contains(bad), "{f} 가 시스템 시계({bad})를 쓴다 — 단계 안 시계 금지(D7)");
+        }
+        seen += 1;
+    }
+    assert_eq!(seen, 6);
+}

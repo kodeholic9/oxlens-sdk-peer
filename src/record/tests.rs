@@ -843,6 +843,11 @@ const PPS: &[u8] = &[0x68, 0xce, 0x3c, 0x80];
 
 /// 사람 u1 — 영상(H264 · 줄 200 · CSRC 9) · 음성(Opus · 줄 100 · CSRC 10) · 같은 시계에서 `secs` 초 · 영상 키 1초마다 · SR 은 0.5초에(둘 다)
 fn av_stream(secs: u32, start_v: u32, sps_switch_at: Option<u32>) -> Vec<Record> {
+    av_stream_gop(secs, start_v, sps_switch_at, 30)
+}
+
+/// `gop` 프레임마다 키프레임(33ms 간격 — 30 이면 약 1초)
+fn av_stream_gop(secs: u32, start_v: u32, sps_switch_at: Option<u32>, gop: u32) -> Vec<Record> {
     let ms = 1_000_000u64;
     let t0 = 1_800_000_000_000_000_000u64;
     let tracks = serde_json::json!([
@@ -870,7 +875,7 @@ fn av_stream(secs: u32, start_v: u32, sps_switch_at: Option<u32>) -> Vec<Record>
         }
         if tv <= ta {
             let i = tv / 33;
-            let key = i.is_multiple_of(30);
+            let key = i.is_multiple_of(gop);
             let ts = start_v.wrapping_add(i * 3000);
             let sps = if sps_switch_at.is_some_and(|s| tv >= s) { SPS_B } else { SPS_A };
             let (idr, delta) = ([0x65, 0x88, 0x84, i as u8], [0x41, 0x9a, i as u8]);
@@ -952,6 +957,42 @@ fn read_moof(b: &[u8]) -> Vec<MoofTraf> {
         }
     }
     out
+}
+
+#[test]
+fn hls_segment_over_target_is_counted_and_logged_as_diag_warn() {
+    let d = tmp("hls-over");
+    let spool = d.join("spool");
+    std::fs::create_dir_all(&spool).unwrap();
+    let log = crate::log::LogConfig { socket: Some(d.join("no-such.sock")), spool_dir: Some(spool.clone()), node: "t".into(), ..crate::log::LogConfig::default() };
+    let mut pl = Pipeline::new(Policy::Span { time_ns: u64::MAX, bytes: u64::MAX });
+    let mut sink = HlsSink::new(d.join("hls"), HlsConfig { log: Some(log), ..HlsConfig::default() }).unwrap();
+    for r in &av_stream_gop(12, 1000, None, 240) {
+        for o in pl.push(r) {
+            sink.write(&o).unwrap();
+        }
+    }
+    for o in pl.finish() {
+        sink.write(&o).unwrap();
+    }
+    sink.finish().unwrap();
+    let s = &sink.streams()[0];
+    let over: Vec<usize> = s.segments.iter().enumerate().filter(|(_, x)| x.duration.round() as u64 > 6).map(|(i, _)| i).collect();
+    assert_eq!(s.over_target, over.len() as u64);
+    assert!(!over.is_empty(), "키프레임이 8초마다라 첫 조각이 ⌈1.5 × 4⌉ = 6초를 넘는다: {:?}", s.segments.iter().map(|x| x.duration).collect::<Vec<_>>());
+    let file = spool.join("t.peer.spool.log");
+    let mut lines = Vec::new();
+    for _ in 0..200 {
+        lines = std::fs::read_to_string(&file).unwrap_or_default().lines().filter(|l| l.contains("over target")).map(str::to_string).collect();
+        if lines.len() == over.len() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(lines.len(), over.len(), "넘은 조각마다 한 줄");
+    let l = &lines[0];
+    assert!(l.contains("kind=diag") && l.contains("spec=SD-RULE-PLAT-REC-HLS"), "{l}");
+    assert!(l.contains(&format!("in.segment={}", over[0])) && l.contains("in.target_s=6"), "{l}");
 }
 
 #[test]

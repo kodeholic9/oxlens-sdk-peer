@@ -49,7 +49,7 @@ pub enum Out {
 impl Out {
     fn open(a: &Args, dir: &std::path::Path) -> std::io::Result<Out> {
         Ok(if a.hls {
-            Out::Hls(HlsSink::new(dir, HlsConfig::default())?)
+            Out::Hls(HlsSink::new(dir, HlsConfig { log: Some(oxpeer::log::LogConfig::default()), ..HlsConfig::default() })?)
         } else {
             Out::Mkv(MkvSink::with(dir, MkvConfig { span: a.span_secs.map(Duration::from_secs), ..MkvConfig::default() })?)
         })

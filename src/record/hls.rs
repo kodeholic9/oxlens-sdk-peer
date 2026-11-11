@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::mkv::{avcc, h264_dims, nals};
@@ -23,11 +24,13 @@ pub struct HlsConfig {
     pub target: Duration,
     /// `live.m3u8` 조각 창(기본 6)
     pub window: usize,
+    /// 운영 로그 — 주면 이 결과물이 로거를 갖고 `TARGETDURATION` 을 넘은 조각마다 `diag`(warn) 한 줄을 낸다 · 없으면 세기만(`over_target`)
+    pub log: Option<crate::log::LogConfig>,
 }
 
 impl Default for HlsConfig {
     fn default() -> HlsConfig {
-        HlsConfig { target: Duration::from_secs(4), window: 6 }
+        HlsConfig { target: Duration::from_secs(4), window: 6, log: None }
     }
 }
 
@@ -177,13 +180,15 @@ pub struct HlsSink {
     segs: HashMap<u64, (String, Kind)>,
     wants: Vec<String>,
     done: Vec<HlsStream>,
+    log: Option<Arc<crate::log::Logger>>,
 }
 
 impl HlsSink {
     pub fn new(dir: impl Into<PathBuf>, cfg: HlsConfig) -> io::Result<HlsSink> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
-        Ok(HlsSink { dir, cfg, groups: BTreeMap::new(), segs: HashMap::new(), wants: Vec::new(), done: Vec::new() })
+        let log = cfg.log.clone().map(crate::log::Logger::start);
+        Ok(HlsSink { dir, cfg, groups: BTreeMap::new(), segs: HashMap::new(), wants: Vec::new(), done: Vec::new(), log })
     }
 
     /// `TARGETDURATION`(초) = ⌈1.5 T⌉
@@ -272,7 +277,7 @@ impl HlsSink {
         }
         // 이미 쓴 묶음에 트랙이 들거나 다시 열리면 — 지금까지를 조각으로 내고 끊김
         if g.init.is_some() {
-            flush(g, &self.cfg, target, None)?;
+            flush(g, &self.cfg, self.log.as_deref(), target, None)?;
             g.reinit = true;
         }
         let t = Trk::new(&s.track_id, s.id);
@@ -302,7 +307,7 @@ impl HlsSink {
         if !same {
             return Ok(());
         }
-        flush(g, &self.cfg, target, None)?;
+        flush(g, &self.cfg, self.log.as_deref(), target, None)?;
         match kind {
             Kind::Video => g.video = None,
             Kind::Audio => g.audio = None,
@@ -379,7 +384,7 @@ impl HlsSink {
             let start = g.seg_start.map(|(_, t)| t).unwrap_or(ticks);
             let elapsed = ticks.saturating_sub(start);
             if (sample_key && elapsed >= tgt_ticks(lead)) || changed {
-                flush(g, &self.cfg, target, Some((lead, ticks)))?;
+                flush(g, &self.cfg, self.log.as_deref(), target, Some((lead, ticks)))?;
                 if changed {
                     g.reinit = true;
                 }
@@ -419,7 +424,7 @@ impl HlsSink {
         for k in keys {
             if let Some(mut g) = self.groups.remove(&k) {
                 if g.out.refused.is_none() {
-                    flush(&mut g, &self.cfg, target, None)?;
+                    flush(&mut g, &self.cfg, self.log.as_deref(), target, None)?;
                     g.ended = true;
                     playlists(&mut g, &self.cfg, target)?;
                 }
@@ -431,7 +436,7 @@ impl HlsSink {
 }
 
 /// 버퍼를 조각 하나로 쓴다 — `next` = 다음 조각을 여는 이끄는 트랙의 틱(없으면 마지막 샘플 끝까지)
-fn flush(g: &mut Group, cfg: &HlsConfig, target: u64, next: Option<(Kind, u64)>) -> io::Result<()> {
+fn flush(g: &mut Group, cfg: &HlsConfig, log: Option<&crate::log::Logger>, target: u64, next: Option<(Kind, u64)>) -> io::Result<()> {
     let has = g.video.as_ref().is_some_and(|t| !t.buf.is_empty()) || g.audio.as_ref().is_some_and(|t| !t.buf.is_empty());
     if !has {
         g.seg_start = next;
@@ -542,6 +547,18 @@ fn flush(g: &mut Group, cfg: &HlsConfig, target: u64, next: Option<(Kind, u64)>)
     let duration = lead_dur as f64 / 1_000_000.0;
     if duration.round() as u64 > target {
         g.out.over_target += 1;
+        if let Some(l) = log {
+            l.emit(
+                crate::log::Line::new(crate::log::Kind::Diag)
+                    .level(crate::log::Level::Warn)
+                    .spec("SD-RULE-PLAT-REC-HLS")
+                    .key("in.stream", &g.out.key)
+                    .key("in.segment", n)
+                    .key("in.duration_ms", lead_dur / 1_000)
+                    .key("in.target_s", target)
+                    .msg("hls segment over target duration - video keyframe came late"),
+            );
+        }
     }
     g.out.segments.push(HlsSegment { file, init: g.init.clone().unwrap_or_default(), discontinuity: std::mem::take(&mut g.disc_next), duration });
     g.seg_start = next;

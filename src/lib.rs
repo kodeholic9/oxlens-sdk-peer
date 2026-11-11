@@ -32,6 +32,6 @@ mod wire;
 #[cfg(all(test, feature = "serde"))]
 mod vectors_test;
 
-pub use api::{Client, Config, Duplex, Event, Events, Frames, Health, Kind, Layer, LinkInfo, LinkState, LocalTrack, Media, MediaFrame, MediaPacket, MemberInfo, OutFrame, Permission, PttInfo, RoomView, SessionInfo, SessionState, Snapshot, Source, Stats, TokenReq, TrackEntry, TrackEntryType, TrackSpec, Transition, Transitions, Unit};
+pub use api::{floor, Client, Config, Duplex, Event, Events, FloorCause, Frames, Health, Kind, Layer, LinkInfo, LinkState, LocalTrack, Media, MediaFrame, MediaPacket, MemberInfo, OutFrame, Permission, PttInfo, RoomView, SessionInfo, SessionState, Snapshot, Source, Stats, TokenReq, TrackEntry, TrackEntryType, TrackSpec, Transition, Transitions, Unit};
 pub use error::{Category, Error};
 pub use token::{issue_token, issue_token_with_root};

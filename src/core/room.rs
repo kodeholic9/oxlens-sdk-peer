@@ -63,6 +63,11 @@ pub(crate) struct Room {
     layer_next: Option<oneshot::Sender<Result<(), Error>>>,
     layer_waiters: BTreeMap<u64, oneshot::Sender<Result<(), Error>>>,
     layer_seq: u64,
+    /// 발언권 표면 거울(SDK:IMPL-FLR-EXPOSE) — 받은 거절 · 회수 사유는 효과가 날 때 `last_*` 로 옮긴다
+    pub(crate) ptt_rx: Option<(bool, crate::api::FloorCause)>,
+    pub(crate) last_deny: Option<crate::api::FloorCause>,
+    pub(crate) last_revoke: Option<crate::api::FloorCause>,
+    pub(crate) queue_position: Option<u8>,
 }
 
 impl Room {
@@ -98,6 +103,10 @@ impl Room {
             forced_cause: "kick".into(),
             closed: false,
             layers: BTreeMap::new(),
+            ptt_rx: None,
+            last_deny: None,
+            last_revoke: None,
+            queue_position: None,
             layer_next: None,
             layer_waiters: BTreeMap::new(),
             layer_seq: 0,
@@ -1038,8 +1047,10 @@ impl Core {
                 _ => {}
             }
         }
-        // 누름 쪽 사건(20261107c) — 허가 · 거절 · 대기 · 회수 · 상태(시한 · 믿음)
-        let cs = self.rooms.get(id).map(|r| r.flr.cs.as_str().to_string()).unwrap_or_default();
+        // 누름 쪽 사건(20261107c) — 허가 · 거절 · 대기 · 회수 · 상태(시한 · 믿음) · 사유 · 허가 시간 · 순번(SDK:IMPL-FLR-EXPOSE)
+        if let Some(r) = self.rooms.get_mut(id) {
+            ptt_settle(r, &plan.events);
+        }
         for e in &plan.events {
             let what = match e {
                 pb::PttEvent::Granted => "granted",
@@ -1049,7 +1060,8 @@ impl Core {
                 pb::PttEvent::State => "state",
                 _ => continue,
             };
-            self.emit(Event::Ptt { room: id.to_string(), event: what.to_string(), state: cs.clone() });
+            let Some(ptt) = self.rooms.get(id).map(ptt_info) else { continue };
+            self.emit(Event::Ptt { room: id.to_string(), event: what.to_string(), ptt });
         }
         // 효과 표 — 화자 · 믿음(듣기 몫) · 재생은 서버사이드 대상 아님(SDK:RULE-PLAT-SERVER)
         for f in fx {
@@ -1099,7 +1111,54 @@ impl Core {
                 self.rebuild_routes();
             }
         }
+        if let Some(r) = self.rooms.get_mut(&room) {
+            ptt_rx(r, &rx);
+        }
         self.floor_enter(&room, "receive", |s| Some(fc::receive(s, &rx)), "DC");
+    }
+}
+
+/// 받은 발언권 메시지에서 표면이 쓸 것 — 거절 · 회수 사유는 효과가 날 때까지 들고 · 순번은 곧 적는다
+pub(crate) fn ptt_rx(r: &mut Room, rx: &fc::Rx) {
+    let cause = |c: i64, t: &Option<String>| crate::api::FloorCause { cause: u16::try_from(c).unwrap_or(u16::MAX), text: t.clone() };
+    r.ptt_rx = match rx {
+        fc::Rx::Revoke(m) => Some((true, cause(m.cause, &m.reason))),
+        fc::Rx::Deny(m) => Some((false, cause(m.cause, &m.reason))),
+        _ => None,
+    };
+    if let fc::Rx::Qinfo(m) = rx {
+        r.queue_position = u8::try_from(m.info.position).ok();
+    }
+}
+
+/// 위 걸음이 낸 효과로 사유를 옮긴다 — `denied` 면 그 거절 사유 · `revoked` 면 그 회수 사유(받지 않은 메시지의 사유는 버린다)
+pub(crate) fn ptt_settle(r: &mut Room, events: &[pb::PttEvent]) {
+    let rx = r.ptt_rx.take();
+    for e in events {
+        match (e, &rx) {
+            (pb::PttEvent::Denied, Some((false, c))) => r.last_deny = Some(c.clone()),
+            (pb::PttEvent::Revoked, Some((true, c))) => r.last_revoke = Some(c.clone()),
+            _ => {}
+        }
+    }
+    if r.flr.cs != fc::CState::QUEUED {
+        r.queue_position = None;
+    }
+}
+
+/// 발언권 표면 값(SDK:IMPL-FLR-EXPOSE 거울) — 사건 · 스냅숏이 같은 것을 낸다
+pub(crate) fn ptt_info(r: &Room) -> crate::api::PttInfo {
+    // 큐 승계 허가는 의지 표시(승계 시한)까지 `QUEUED` 에 남는다(연:RULE-FLR-PROC-GRANTED) — 그 창도 허가를 쥔 것으로 본다
+    let held = r.flr.cs == fc::CState::PERM || (r.flr.cs == fc::CState::QUEUED && r.flr.sub == fc::CSub::GRANTED);
+    let waiting = r.flr.cs == fc::CState::QUEUED || r.flr.cs == fc::CState::PREQ;
+    crate::api::PttInfo {
+        state: r.flr.cs.as_str().to_string(),
+        trusted: r.flr.sub.as_str() != "WAIT",
+        remaining_sec: (held && r.flr.grant > 0).then(|| u32::try_from(r.flr.grant).unwrap_or(u32::MAX)),
+        priority: (held || waiting).then(|| u8::try_from(r.flr.prio).unwrap_or(u8::MAX)),
+        queue_position: if r.flr.cs == fc::CState::QUEUED { r.queue_position } else { None },
+        last_deny: r.last_deny.clone(),
+        last_revoke: r.last_revoke.clone(),
     }
 }
 
@@ -1110,4 +1169,55 @@ fn scalability(v: &str) -> Option<(u8, u8)> {
     let s: u8 = s.parse().ok()?;
     let t: u8 = t.trim_end_matches(|c: char| !c.is_ascii_digit()).parse().ok()?;
     Some((s.checked_sub(1)?, t.checked_sub(1)?))
+}
+
+#[cfg(test)]
+mod ptt_surface_test {
+    use super::*;
+
+    fn step(r: &mut Room, rx: fc::Rx) -> crate::api::PttInfo {
+        ptt_rx(r, &rx);
+        let plan = pb::plan(fc::receive(&r.flr, &rx));
+        r.flr = plan.state.clone();
+        ptt_settle(r, &plan.events);
+        ptt_info(r)
+    }
+
+    fn held(prio: i64) -> Room {
+        let mut r = Room::new("r1");
+        r.flr = fc::Cl { cs: fc::CState::PERM, prio, grant: 25, is_pub: true, ..fc::initial() };
+        r
+    }
+
+    #[test]
+    fn granted_carries_remaining_and_priority() {
+        let p = ptt_info(&held(3));
+        assert_eq!((p.state.as_str(), p.remaining_sec, p.priority, p.queue_position), ("PERM", Some(25), Some(3), None));
+    }
+
+    #[test]
+    fn revoke_causes_are_kept_apart() {
+        for (cause, text) in [(i64::from(crate::api::floor::revoke::PREEMPTED), "preempted"), (i64::from(crate::api::floor::revoke::TOO_LONG), "too long"), (i64::from(crate::api::floor::revoke::NO_PERMISSION), "no permission")] {
+            let mut r = held(0);
+            let p = step(&mut r, fc::Rx::Revoke(fc::RxRevoke { ack: false, cause, reason: Some(text.into()) }));
+            assert_eq!(p.last_revoke, Some(crate::api::FloorCause { cause: cause as u16, text: Some(text.into()) }), "회수 사유 {cause}");
+            assert_eq!(p.state, "PREL");
+            assert_eq!(p.remaining_sec, None, "허가를 놓으면 허가 시간은 없다");
+        }
+    }
+
+    #[test]
+    fn deny_cause_and_queue_position() {
+        let mut r = Room::new("r1");
+        r.flr = fc::Cl { cs: fc::CState::PREQ, want: true, is_pub: true, ..fc::initial() };
+        let p = step(&mut r, fc::Rx::Deny(fc::RxDeny { ack: false, cause: i64::from(crate::api::floor::deny::RETRY_AFTER), reason: None }));
+        assert_eq!(p.last_deny.map(|c| c.cause), Some(u16::from(crate::api::floor::deny::RETRY_AFTER)));
+        assert_eq!(p.last_revoke, None, "거절은 회수 사유를 건드리지 않는다");
+        let mut r = Room::new("r1");
+        r.flr = fc::Cl { cs: fc::CState::PREQ, want: true, is_pub: true, prio: 1, ..fc::initial() };
+        let p = step(&mut r, fc::Rx::Qinfo(fc::RxQinfo { ack: false, info: fc::RxQinfoInfo { position: 2, priority: 1 } }));
+        assert_eq!((p.state.as_str(), p.queue_position, p.priority), ("QUEUED", Some(2), Some(1)));
+        let p = step(&mut r, fc::Rx::Granted(fc::RxGranted { ack: false, priority: 1, duration: 20 }));
+        assert_eq!((p.state.as_str(), p.remaining_sec), ("QUEUED", Some(20)), "큐 승계 허가 — 의지 표시 전에도 허가 시간이 보인다");
+    }
 }

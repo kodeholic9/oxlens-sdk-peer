@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
 use super::{Cmd, Core, PublishReply};
-use crate::api::{Event, PttInfo, RoomView, Snapshot, TrackSpec};
+use crate::api::{Event, RoomView, Snapshot, TrackSpec};
 use crate::error::{Category, Error};
 use crate::generated::ws_wire::{AffiliationReq, AffiliationRes, Duplex, Kind, MessageBody, MessageReq, Op, PublishTrack, PublishTracksReq, PublishTracksReqAddAction, PublishTracksReqRemoveAction, Source, TrackSetReq};
 use crate::generated::{aff_binding as ab, aff_client as ac, floor_client as fc, pub_binding as pbd, publish_client as pc};
@@ -815,7 +815,7 @@ impl Core {
                 joined: r.st.rs == crate::generated::room_client::RoomSt::JOINED,
                 server: r.sfu.clone(),
                 speaker: r.flr.shown.clone(),
-                ptt: PttInfo { state: r.flr.cs.as_str().to_string(), trusted: r.flr.sub.as_str() != "WAIT" },
+                ptt: super::room::ptt_info(r),
                 permission: r.me.as_ref().and_then(|m| m.permission.clone()),
                 published: self.pubs.values().filter(|t| t.room == r.id).filter_map(|t| t.track_id.clone()).collect(),
             })

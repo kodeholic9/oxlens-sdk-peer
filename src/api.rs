@@ -152,8 +152,8 @@ pub enum Event {
     /// 그 발행 연결의 목표 비트레이트가 바뀌었다(TWCC 손실 · 지연 기울기 · REMB 의 최솟값 — 앞서 알린 값과 5% 넘게 다를 때 · context 202611/20261108d E4).
     /// ★SDK 는 인코딩하지 않는다 — 인코더를 맞추는 것은 앱 몫이고 SDK 는 버리거나 늦추지 않는다
     TargetBitrate { server: String, bps: u64 },
-    /// 발언권 누름 쪽(SDK:IMPL-FLR-EXPOSE) — event = granted · denied · queued · revoked · state · state = 위 클라 상태
-    Ptt { room: String, event: String, state: String },
+    /// 발언권 누름 쪽(SDK:IMPL-FLR-EXPOSE) — event = granted · denied · queued · revoked · state · `ptt` = 그 걸음 뒤 값(사유 · 허가 시간 · 순번 — `denied` 면 `last_deny` · `revoked` 면 `last_revoke` 가 이 사건의 사유)
+    Ptt { room: String, event: String, ptt: PttInfo },
     /// 발언 방이 바뀌었다(소속 응답 — None = 없다)
     SpeakingRoom { room: Option<String> },
     /// 방 문자(연:AUX.op.MESSAGE)
@@ -204,6 +204,29 @@ pub struct PttInfo {
     /// 위 클라 상태 이름(NOPERM · PREQ · PERM · QUEUED …)
     pub state: String,
     pub trusted: bool,
+    /// 허가에 실린 발언 시간(초 — SDK:IMPL-FLR-EXPOSE `remainingSec` · 표의 기본값이 아니다) · 허가를 쥐었을 때만
+    pub remaining_sec: Option<u32>,
+    /// 요청 · 허가 우선순위(`priority`) · 허가를 쥐었거나 기다릴 때만
+    pub priority: Option<u8>,
+    /// 큐 순번(`queue.position` — 254 = 큐에 없음 · 255 = 미상) · 기다릴 때만
+    pub queue_position: Option<u8>,
+    /// 마지막 거절 · 회수 사유(`lastDeny` · `lastRevoke` — 회수 2 와 4 는 처방이 반대 · 연:RULE-FLR-APP-EXPOSE) — 다음 거절 · 회수가 덮는다
+    pub last_deny: Option<FloorCause>,
+    pub last_revoke: Option<FloorCause>,
+}
+
+/// 발언권 사유(연:RULE-FLR-TLV 사유 칸 · 글) — 번호는 `floor::deny` · `floor::revoke`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FloorCause {
+    pub cause: u16,
+    pub text: Option<String>,
+}
+
+/// 발언권 상수 — 원장 생성본 그대로(손 상수로 옮겨 적지 않는다)
+pub mod floor {
+    pub use crate::generated::floor_consts::{deny, revoke};
+    /// 서버 `T1`(End of RTP media) — 허가한 뒤 · RTP 마다 다시 걸리고 만료하면 화자에게 알리지 않고 회수한다(연:RULE-FLR-PROC-TAKEN-IDLE 5)
+    pub const T1_MS: u64 = crate::generated::floor_consts::timers::T1_MS;
 }
 
 /// 수치 — 미디어 경로와 수신 정리층의 계수
@@ -501,6 +524,11 @@ impl Client {
         let shared = std::sync::Arc::new(crate::record::Shared::default());
         let _ = self.send(Cmd::Records(tx, shared.clone()));
         crate::record::Records::new(rx, shared)
+    }
+
+    /// 앱 운영 로그 한 줄 — SDK 와 같은 로거 · 같은 꼴(머리 · `session` · `user` 는 SDK 가 붙인다 · SDK:RULE-PLAT-SERVER 운영 로그) · 기다리지 않는다
+    pub fn log(&self, line: crate::log::AppLine) {
+        let _ = self.send(Cmd::Log(line));
     }
 
     pub async fn stats(&self) -> Stats {

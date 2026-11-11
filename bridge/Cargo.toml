@@ -1,0 +1,24 @@
+# author: kodeholic (powered by Claude)
+# AI 에이전트 브리지(SDK:RULE-PLAT-AGENT) — oxpeer 위 내장 결과물. 무전 방 하나에 에이전트로 들어가 사람 발언을 고객 AI(WS)로 보내고 AI 음성을 발언권을 잡아 낸다.
+# ★oxpeer 공개 표면만 쓴다 — 별도 크레이트라 pub(crate) 를 못 본다(설계 202611/20261111f §13-7 · 202611/20261112a E7).
+# 코덱은 libopus 정적 번들(opusic-c → opusic-sys · libopus 1.6.1 · cmake) — 받는 장비의 판에 흔들리지 않는다(SDK:RULE-PLAT-AGENT-AUDIO 코덱 경계).
+[package]
+name = "oxbridge"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Tae Goo Kang <kodeholic99@gmail.com>"]
+description = "OxLens AI agent bridge — floor-aware PTT agent seam over WebSocket"
+publish = false
+
+[dependencies]
+oxpeer = { path = "..", features = ["record"] }
+opusic-c = "1.6"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+serde_json = "1"
+# wss://(원격 AI) — oxpeer 와 같은 rustls 계열(ring · tls12) · 뿌리 webpki 또는 설정 PEM
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "1"

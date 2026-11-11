@@ -255,7 +255,7 @@ async fn echo(client: &Client, events: &mut oxpeer::Events, media: &mut oxpeer::
                             echoes.push(json!({ "from": from, "sources": sources, "heard": packets.len(), "sent": sent, "granted": granted, "at_ms": at, "released_ms": t0.elapsed().as_millis() as u64 }));
                         }
                     }
-                    Event::Ptt { room: r, event, state } if r == room => ptt.push(json!({ "event": event, "state": state, "ms": t0.elapsed().as_millis() as u64 })),
+                    Event::Ptt { room: r, event, ptt: info } if r == room => ptt.push(ptt_json(&event, &info, json!({ "ms": t0.elapsed().as_millis() as u64 }))),
                     Event::Closed { .. } => break,
                     _ => {}
                 }
@@ -290,8 +290,8 @@ async fn press_and_wait(client: &Client, events: &mut oxpeer::Events, room: &str
         tokio::select! {
             _ = &mut deadline => return false,
             e = events.next() => match e {
-                Some(Event::Ptt { room: r, event, state }) if r == room => {
-                    ptt.push(json!({ "event": event, "state": state, "ms": t0.elapsed().as_millis() as u64 }));
+                Some(Event::Ptt { room: r, event, ptt: info }) if r == room => {
+                    ptt.push(ptt_json(&event, &info, json!({ "ms": t0.elapsed().as_millis() as u64 })));
                     match event.as_str() {
                         "granted" => return true,
                         "denied" | "revoked" => return false,
@@ -409,7 +409,7 @@ async fn beacon(client: &Client, a: &Args, events: &mut oxpeer::Events, audio: L
                 }
                 Some(Event::TargetBitrate { bps, .. }) => targets.push(json!([wall_ms(), bps])),
                 Some(Event::Published { room, track_id }) => published.push(json!({ "room": room, "track_id": track_id, "wall_ms": wall_ms() })),
-                Some(Event::Ptt { room, event, state }) => ptt.push(json!({ "room": room, "event": event, "state": state, "wall_ms": wall_ms() })),
+                Some(Event::Ptt { room, event, ptt: info }) => ptt.push(ptt_json(&event, &info, json!({ "room": room, "wall_ms": wall_ms() }))),
                 Some(Event::Session(s)) => sessions.push(json!({ "state": format!("{:?}", s.state), "wall_ms": wall_ms() })),
                 Some(Event::Rebuilt) => sessions.push(json!({ "state": "Rebuilt", "wall_ms": wall_ms() })),
                 // 입장(처음 · 재구축 · 다시 connect) — 2층이 명단 통지를 셀 때 에이전트의 입장 사실로 쓴다
@@ -490,4 +490,21 @@ async fn file(a: &Args, events: &mut oxpeer::Events, audio: LocalTrack, video: O
         o.insert("video_samples".into(), json!(frames.len()));
         o.insert("keyframe_requests".into(), json!(kreq));
     }
+}
+
+/// 발언권 사건 한 줄 — 상태 · 사유(거절 · 회수) · 허가 시간 · 순번(SDK:IMPL-FLR-EXPOSE 거울)
+fn ptt_json(event: &str, p: &oxpeer::PttInfo, mut base: Value) -> Value {
+    let cause = match event {
+        "denied" => p.last_deny.as_ref(),
+        "revoked" => p.last_revoke.as_ref(),
+        _ => None,
+    };
+    if let Some(o) = base.as_object_mut() {
+        o.insert("event".into(), json!(event));
+        o.insert("state".into(), json!(p.state));
+        o.insert("cause".into(), json!(cause.map(|c| c.cause)));
+        o.insert("remaining_sec".into(), json!(p.remaining_sec));
+        o.insert("queue_position".into(), json!(p.queue_position));
+    }
+    base
 }

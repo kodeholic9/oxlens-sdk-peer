@@ -2,6 +2,10 @@
 # 서버사이드 SDK — 녹음 · 녹화 · AI 에이전트 같은 서버 쪽 프로그램이 방에 peer 로 들어가는 Rust 라이브러리(SDK:RULE-PLAT-SERVER).
 # 서버 크레이트를 물지 않는다 — wire · 영역 상태기는 규격 원천의 Rust 생성본(src/gen · context/spec 의 npm run sync:peer)이고,
 # 미디어 스택만 서버와 같은 webrtc-rs 계열 · 같은 판이다(dtls · webrtc-srtp · webrtc-util 0.17 · sctp-proto 0.9).
+# 워크스페이스 — AI 에이전트 브리지(bridge/ · SDK:RULE-PLAT-AGENT)는 oxpeer 공개 표면만 쓰는 별도 크레이트(202611/20261112a E7) · 한 Cargo.lock · 한 target
+[workspace]
+members = [".", "bridge"]
+
 [package]
 name = "oxpeer"
 version = "0.1.0"

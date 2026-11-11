@@ -92,6 +92,72 @@ pub(crate) struct Line {
     msg: Option<String>,
 }
 
+/// 앱이 내는 운영 로그 줄(SDK:RULE-PLAT-SERVER 운영 로그 — 앱 몫의 판단 · 계수도 같은 로거 · 같은 꼴로) — `Client::log` 로 낸다.
+/// 머리 · `session` · `user` · `epoch` 는 SDK 가 붙인다 · `diag` 만 수준으로 걸러진다 · 채널이 차면 버리고 센다
+#[derive(Clone, Debug)]
+pub struct AppLine {
+    pub(crate) kind: AppKind,
+    pub(crate) level: Level,
+    pub(crate) spec: Option<String>,
+    pub(crate) room: Option<String>,
+    pub(crate) keys: Vec<(String, String)>,
+    pub(crate) msg: Option<String>,
+}
+
+/// 줄 종류 — `ev` 사건 · `stat` 계수 · `diag` 진단
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppKind {
+    Ev,
+    Stat,
+    Diag,
+}
+
+impl AppLine {
+    pub fn new(kind: AppKind) -> AppLine {
+        AppLine { kind, level: Level::Info, spec: None, room: None, keys: Vec::new(), msg: None }
+    }
+    pub fn level(mut self, l: Level) -> AppLine {
+        self.level = l;
+        self
+    }
+    /// 판단 근거 — 규격 문장 라벨
+    pub fn spec(mut self, s: impl Into<String>) -> AppLine {
+        self.spec = Some(s.into());
+        self
+    }
+    pub fn room(mut self, r: impl Into<String>) -> AppLine {
+        self.room = Some(r.into());
+        self
+    }
+    pub fn key(mut self, k: impl Into<String>, v: impl ToString) -> AppLine {
+        self.keys.push((k.into(), v.to_string()));
+        self
+    }
+    pub fn msg(mut self, m: impl Into<String>) -> AppLine {
+        self.msg = Some(m.into());
+        self
+    }
+
+    pub(crate) fn into_line(self) -> Line {
+        let kind = match self.kind {
+            AppKind::Ev => Kind::Ev,
+            AppKind::Stat => Kind::Stat,
+            AppKind::Diag => Kind::Diag,
+        };
+        let mut l = Line::new(kind);
+        l.level = self.level;
+        l.spec = self.spec;
+        if let Some(r) = self.room {
+            l = l.corr("room", r);
+        }
+        for (k, v) in self.keys {
+            l = l.key(k, v);
+        }
+        l.msg = self.msg;
+        l
+    }
+}
+
 /// 상관 키 차례(운영 줄 모형 그대로)
 const CORR: [&str; 6] = ["session", "room", "user", "epoch", "track", "ssrc"];
 
@@ -349,6 +415,15 @@ mod tests {
         assert_eq!(&keys[..6], &["ts", "mono", "node", "proc", "kind", "spec"]);
         assert!(s.contains(" room=r1 ssrc=7 area=SES from=A msg=\"hello world\""), "{s}");
         assert!(s.contains(" mono="));
+    }
+
+    #[test]
+    fn app_line_renders_in_the_same_shape() {
+        let (lg, _) = logger();
+        lg.bind(Some("sess-1"), Some("agent-1"));
+        let s = lg.render(lg.prepare(AppLine::new(AppKind::Diag).level(Level::Warn).spec("SDK:RULE-PLAT-AGENT-SILENCE").room("ch-1").key("reply", "r7").msg("reply truncated").into_line()));
+        assert!(s.contains(" proc=peer kind=diag spec=SDK:RULE-PLAT-AGENT-SILENCE"), "{s}");
+        assert!(s.contains(&format!(" session={} room=ch-1 user=agent-1 epoch={} reply=r7 msg=\"reply truncated\"", fingerprint("sess-1"), lg.epoch)), "{s}");
     }
 
     #[test]

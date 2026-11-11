@@ -60,6 +60,8 @@ pub(crate) enum Cmd {
     PttRelease(String, oneshot::Sender<Result<(), Error>>),
     Message(String, String, oneshot::Sender<Result<String, Error>>),
     Snapshot(oneshot::Sender<Snapshot>),
+    /// 앱 운영 로그 줄(SDK:RULE-PLAT-SERVER 운영 로그)
+    Log(crate::log::AppLine),
     /// 라이브 레코드 통(지점 ①)
     #[cfg(feature = "record")]
     Records(mpsc::Sender<crate::record::Record>, std::sync::Arc<crate::record::Shared>),
@@ -575,6 +577,7 @@ impl Core {
             Cmd::Snapshot(tx) => {
                 let _ = tx.send(self.snapshot());
             }
+            Cmd::Log(line) => self.log.emit(line.into_line()),
         }
     }
 

@@ -6,6 +6,7 @@
 //! `--video`(녹화 · 20261107a → 202611/20261110a) — ★녹음과 같은 파이프라인 · 세그먼트마다 Matroska 파일 하나(영상 · 음성 모두 · 영상은 키프레임부터).
 //!   개인 트랙은 녹화 내내 파일 하나 · 무전 슬롯은 발언 한 건 = 파일 하나 · `--span-secs N` 이면 트랙마다 N 초 길이 정책.
 //!   `--spatial N` 은 영상 트랙의 층 상한(기본은 최고 단) · `--layer-plan 4:0,8:1` 은 입장 뒤 그 초에 상한을 바꾼다.
+//! `--records-capacity N` · `--consume-stall-ms N`(시험 — 라이브 통 칸 수 · 입장 뒤 N ms 통을 안 읽는 느린 소비자 → 넘치면 꼬리 읽기로 강등 · 요약 `records.degraded` · SDK:RULE-PLAT-REC-API)
 //! `--raw DIR`(녹음 원시 기록 · context 202611/20261109c) — 받는 줄 전부를 MCAP 파트(`<user>-NNNN.mcap`)로 함께 적는다(SDK:RULE-PLAT-REC-TAP).
 //!   손잡이 `--raw-part-ms` · `--raw-part-bytes` · `--raw-flush-ms` · `--raw-tick-ms`(기본은 `RecordConfig::new`).
 //!
@@ -49,10 +50,14 @@ struct Args {
     raw_tick_ms: Option<u64>,
     /// close() 뒤 Client 를 놓기 전 이만큼 살려 두고 그동안 쓴 CPU 를 잰다(context 202611/20261109d — 닫힌 전송로의 DTLS 읽기 고리 돌기 재발 검사)
     linger_ms: Option<u64>,
+    /// 라이브 레코드 통 칸 수(`--records-capacity` · 기본 65,536)
+    records_capacity: usize,
+    /// ★시험 — 입장 뒤 이 ms 동안 레코드 통을 읽지 않는다(`--consume-stall-ms` · 느린 소비자 · 통이 넘치면 꼬리 읽기로 강등 — SDK:RULE-PLAT-REC-API)
+    consume_stall_ms: Option<u64>,
 }
 
 fn args() -> Args {
-    let mut a = Args { base: String::new(), room: String::new(), out: PathBuf::from("."), secs: None, hidden: false, user: "oxpeer-recorder".into(), api_key: "ox_k_demo".into(), api_secret: "ox_s_demo".into(), tls_root: None, video: false, spatial: None, layer_plan: Vec::new(), priority: Vec::new(), span_secs: None, hls: false, raw: None, raw_part_ms: None, raw_part_bytes: None, raw_flush_ms: None, raw_tick_ms: None, linger_ms: None };
+    let mut a = Args { base: String::new(), room: String::new(), out: PathBuf::from("."), secs: None, hidden: false, user: "oxpeer-recorder".into(), api_key: "ox_k_demo".into(), api_secret: "ox_s_demo".into(), tls_root: None, video: false, spatial: None, layer_plan: Vec::new(), priority: Vec::new(), span_secs: None, hls: false, raw: None, raw_part_ms: None, raw_part_bytes: None, raw_flush_ms: None, raw_tick_ms: None, linger_ms: None, records_capacity: 1 << 16, consume_stall_ms: None };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         let mut v = || it.next().unwrap_or_default();
@@ -86,6 +91,8 @@ fn args() -> Args {
             "--raw-flush-ms" => a.raw_flush_ms = v().parse().ok(),
             "--raw-tick-ms" => a.raw_tick_ms = v().parse().ok(),
             "--linger-ms" => a.linger_ms = v().parse().ok(),
+            "--records-capacity" => a.records_capacity = v().parse().unwrap_or(1 << 16),
+            "--consume-stall-ms" => a.consume_stall_ms = v().parse().ok(),
             "--layer-plan" => {
                 a.layer_plan = v().split(',').filter_map(|x| x.split_once(':')).filter_map(|(t, n)| Some((t.parse().ok()?, n.parse().ok()?))).collect();
             }
@@ -141,7 +148,7 @@ async fn main() {
         }
     };
     // ★입장 전에 연다 — 입장 뒤 레코드 전량을 받아야 파일로 다시 지은 것과 같다(늦게 연 통도 해석 상태는 받는다 — SDK:RULE-PLAT-REC-API)
-    let mut records = client.records(1 << 16);
+    let mut records = client.records(a.records_capacity);
     if let Err(e) = client.join(&a.room).await {
         eprintln!("입장 실패: {e}");
         std::process::exit(1);
@@ -161,6 +168,9 @@ async fn main() {
         }
     };
     tokio::pin!(stop);
+    let stall = tokio::time::sleep(Duration::from_millis(a.consume_stall_ms.unwrap_or(0)));
+    tokio::pin!(stall);
+    let mut stalled = a.consume_stall_ms.is_some();
     // ★발언 경계는 파이프라인이 정한다(SDK:RULE-PLAT-REC-SPLIT 발언 — 줄마다 출처가 바뀌면 새 세그먼트 · 출처 없는 프레임은 밖)
     let mut pipe = Pipeline::new(Policy::Utterance);
     let mut sink = OggSink::new(&a.out).expect("출력 폴더");
@@ -181,7 +191,8 @@ async fn main() {
             }
             // 미디어 통은 비워 둔다(이 갈래는 레코드 흐름으로 짓는다 — 통이 차 버리면 계수가 오른다)
             p = media.next() => if p.is_none() { break },
-            r = records.next() => {
+            _ = &mut stall, if stalled => stalled = false,
+            r = records.next(), if !stalled => {
                 let Some(r) = r else { break };
                 tally.feed(&a.room, &mut pipe, &mut sink, &r);
             }

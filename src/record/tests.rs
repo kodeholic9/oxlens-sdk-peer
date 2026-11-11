@@ -1342,28 +1342,70 @@ fn mkv_span_with_audio_clock_behind_video_places_every_block_on_its_sr_time() {
     std::fs::remove_dir_all(&d).ok();
 }
 
-#[test]
-fn mkv_av_log_time_file_patched_by_late_sr_names_its_anchor_track() {
-    // SR 이 여는 보류(2초) 뒤에 온다 — 파일은 log_time 기준으로 열리고 · 닫을 때 영상 트랙 두 기준 차로 DateUTC 를 고쳐 쓴다.
-    //   ★한 파일 DateUTC 는 한 값 — 그 닻 트랙만 UTC 와 맞는다(2층 장시간 판 첫 SR 파일 음성 60ms · 202611/20261110e). 요약이 닻을 적는다
+/// SR 을 `sr_at_ms` 에 받고(늦은 SR) · 영상이 `video_delay_ms` 늦게 닿는 사람 하나(도착 차 = 늦은 SR 맞춤이 고칠 오차)
+fn late_sr_av(secs: u32, sr_at_ms: u64, video_delay_ms: u64) -> Vec<Record> {
     let t0 = 1_800_000_000_000_000_000u64;
-    let mut recs = av_stream(5, 1000, None);
+    let mut recs = av_stream(secs, 1000, None);
     for r in &mut recs {
-        if r.channel == Channel::Sr {
-            r.log_time = t0 + 3_000_000_000;
+        match r.channel {
+            Channel::Sr => r.log_time = t0 + sr_at_ms * 1_000_000,
+            Channel::Rtp(200) => r.log_time += video_delay_ms * 1_000_000,
+            _ => {}
         }
     }
     recs.sort_by_key(|r| (r.log_time, r.sequence));
+    for (i, r) in recs.iter_mut().enumerate() {
+        r.sequence = i as u32 + 1;
+    }
+    recs
+}
+
+#[test]
+fn mkv_log_time_file_with_late_sr_moves_video_onto_audio_and_anchors_date_on_audio() {
+    // SR 이 여는 보류(2초) 뒤에 온다 → 파일은 log_time 기준. 영상이 60ms 늦게 닿아 도착 차만큼 어긋난다(D7)
+    //   ★늦은 SR 맞춤(SDK:RULE-PLAT-REC-HLS) — 두 트랙이 UTC 를 받으면 영상만 견본마다 5ms 이하로 옮겨 목표 −60ms 에 닿는다 · DateUTC 닻 = 음성
+    let t0_ms = (1_800_000_000_000_000_000u64 / 1_000_000) as f64;
     let d = tmp("mkv-late-sr");
-    let (fs, _) = mkv_av_build(&recs, &d, Policy::Utterance, MkvConfig::default());
+    let (fs, _) = mkv_av_build(&late_sr_av(5, 3_000, 60), &d, Policy::Utterance, MkvConfig::default());
     assert_eq!(fs.len(), 1);
     let f = &fs[0];
-    assert_eq!((f.base, f.date, f.date_track), ("log_time", "utc", Some("video")));
-    let v = &f.tracks[0];
-    let want = (t0 / 1_000_000) as f64 + 500.0 + (f64::from(v.first_rtp.unwrap()) - (1000.0 + 500.0 * 90.0)) / 90.0;
-    assert!(((f.start_ms + v.first_ms) as f64 - want).abs() <= 1.5, "닻(영상) 첫 블록 = SR 시각");
+    assert_eq!((f.base, f.date, f.date_track), ("log_time", "utc", Some("audio")));
+    assert!(f.video_shift_us.is_some_and(|x| (x + 60_000).abs() <= 1_000), "영상 목표 −60ms · {:?}", f.video_shift_us);
+    for t in &f.tracks {
+        let (clock, sr_rtp) = if t.kind == "video" { (90.0, 1000.0 + 500.0 * 90.0) } else { (48.0, 500.0 * 48.0) };
+        let want = t0_ms + 500.0 + (f64::from(t.last_rtp.unwrap()) - sr_rtp) / clock;
+        let got = (f.start_ms + t.last_ms) as f64;
+        assert!((got - want).abs() <= 1.5, "{} 마지막 블록 {got} · SR 로 셈한 {want:.1}", t.kind);
+    }
     let (fu, _) = mkv_av_build(&av_stream(5, 1000, None), &d, Policy::Utterance, MkvConfig::default());
-    assert_eq!((fu[0].base, fu[0].date_track), ("utc", None), "utc 기준 파일은 닻이 없다 — 모든 트랙이 SR 시각");
+    assert_eq!((fu[0].base, fu[0].date_track, fu[0].video_shift_us), ("utc", None, None), "utc 기준 파일은 닻 · 맞춤이 없다 — 모든 트랙이 SR 시각");
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn hls_log_time_stream_with_late_sr_moves_video_onto_audio_without_discontinuity() {
+    // SR 이 첫 조각(4초) 뒤 6초에 온다 → 묶음은 log_time 기준 · 영상이 60ms 늦게 닿는다(D7 — 2층 장시간 판 49 ~ 65ms)
+    //   ★늦은 SR 맞춤 — 끊김 없이 영상 견본 길이로 다가가 · 뒤 조각의 영상 − 음성 디코드 시각 차가 SR 이 일찍 온 판(utc 기준)과 같아진다
+    let d = tmp("hls-late-sr");
+    let late = late_sr_av(12, 6_000, 60);
+    let (st, _) = hls_build(&late, &d.join("late"));
+    let (ctl, _) = hls_build(&late_sr_av(12, 500, 60), &d.join("ctl"));
+    assert_eq!((st[0].base, ctl[0].base), (Some("log_time"), Some("utc")));
+    assert!(st[0].video_shift_us.is_some_and(|x| (x + 60_000).abs() <= 1_000), "영상 목표 −60ms · {:?}", st[0].video_shift_us);
+    assert_eq!(ctl[0].video_shift_us, None);
+    assert!(st[0].segments.iter().all(|x| !x.discontinuity), "다시 맞추는 끊김은 없다");
+    assert_eq!(st[0].segments.len(), ctl[0].segments.len());
+    let av = |s: &HlsStream, i: usize| -> f64 {
+        let m = read_moof(&std::fs::read(&s.segments[i].file).unwrap());
+        let tf = |id: u32| m.iter().find(|t| t.0 == id).map(|t| t.1).unwrap();
+        (tf(1) as f64 / 90_000.0 - tf(2) as f64 / 48_000.0) * 1000.0
+    };
+    let last = st[0].segments.len() - 1;
+    assert!((av(&st[0], last) - av(&ctl[0], last)).abs() <= 1.0, "마지막 조각 영상 − 음성 {:.1}ms · utc 기준 판 {:.1}ms", av(&st[0], last), av(&ctl[0], last));
+    assert!((av(&st[0], 0) - av(&ctl[0], 0) - 60.0).abs() <= 1.0, "SR 전 첫 조각은 도착 차 60ms 그대로(기다리지 않는다)");
+    let durs: Vec<u32> = st[0].segments.iter().flat_map(|x| read_moof(&std::fs::read(&x.file).unwrap()).into_iter().filter(|t| t.0 == 1).flat_map(|t| t.2.into_iter().map(|r| r.0))).collect();
+    assert!(durs.iter().all(|d| (2_550..=3_450).contains(d)), "영상 견본 길이는 한 프레임(3,000 틱) ± 5ms(450 틱) 안 — 한 번에 옮기지 않는다: {:?}", durs.iter().filter(|d| !(2_550..=3_450).contains(*d)).collect::<Vec<_>>());
+    assert!(durs.iter().filter(|d| **d != 3_000).count() >= 12, "60ms 를 5ms 씩 — 바뀐 견본이 12 이상");
     std::fs::remove_dir_all(&d).ok();
 }
 

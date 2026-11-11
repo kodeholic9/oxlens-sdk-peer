@@ -105,7 +105,7 @@ impl Out {
                 let name = |p: &std::path::Path| p.display().to_string();
                 out["hls"] = json!(s.streams().iter().map(|st| json!({
                     "key": st.key, "dir": name(&st.dir), "room": st.room, "owner": st.owner, "base": st.base, "refused": st.refused,
-                    "over_target": st.over_target, "keyframe_requests": st.keyframe_requests, "replaced": st.replaced,
+                    "over_target": st.over_target, "keyframe_requests": st.keyframe_requests, "replaced": st.replaced, "video_shift_us": st.video_shift_us,
                     "tracks": st.tracks, "inits": st.inits.iter().map(|p| name(p)).collect::<Vec<_>>(),
                     "event": name(&st.event_playlist), "live": name(&st.live_playlist),
                     "segments": st.segments.iter().map(|x| json!({ "file": name(&x.file), "init": name(&x.init), "discontinuity": x.discontinuity, "duration": x.duration })).collect::<Vec<_>>(),
@@ -175,7 +175,7 @@ fn files(sink: &MkvSink) -> Vec<Value> {
         .map(|f| {
             json!({
                 "file": f.path, "group": f.group, "index": f.index, "who": f.user_id, "owner": f.owner, "slot": f.owner.is_none(), "source": f.source,
-                "base": f.base, "date": f.date, "date_track": f.date_track, "start_wall_ms": f.start_ms, "duration_ms": f.duration_ms, "reason": f.reason,
+                "base": f.base, "date": f.date, "date_track": f.date_track, "video_shift_us": f.video_shift_us, "start_wall_ms": f.start_ms, "duration_ms": f.duration_ms, "reason": f.reason,
                 "tracks": f.tracks.iter().map(|t| json!({
                     "kind": t.kind, "track_id": t.track_id, "codec": t.codec, "num": t.num, "frames": t.frames, "keyframes": t.keyframes,
                     "synced": t.synced, "filled": t.filled, "first_rtp": t.first_rtp, "last_rtp": t.last_rtp, "first_ms": t.first_ms, "rebased": t.rebased,

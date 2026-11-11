@@ -70,6 +70,8 @@ pub struct HlsStream {
     pub keyframe_requests: u64,
     /// 같은 시각의 새 층 프레임으로 바꿔 낀 영상 견본 수(시뮬캐스트 층 바꿈 — 서버가 같은 그림을 층만 바꿔 다시 보낸다)
     pub replaced: u64,
+    /// 늦은 SR 맞춤의 영상 목표(µs) — `log_time` 기준 묶음에서 두 트랙이 UTC 를 받은 뒤 정한다 · 없으면 맞춤 없음
+    pub video_shift_us: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +171,9 @@ struct Group {
     init: Option<PathBuf>,
     out: HlsStream,
     ended: bool,
+    /// 늦은 SR 맞춤 — 영상 목표 · 다음 영상 견본에 줄 양(영상 틱)
+    vshift: Option<i64>,
+    vshift_at: i64,
 }
 
 /// 묶음마다 HLS 하나(H264 · Opus)
@@ -260,8 +265,11 @@ impl HlsSink {
                 tracks: Vec::new(),
                 keyframe_requests: 0,
                 replaced: 0,
+                video_shift_us: None,
             },
             ended: false,
+            vshift: None,
+            vshift_at: 0,
         });
         g.out.tracks.push((s.kind.clone(), s.track_id.clone(), s.codec.clone()));
         let ok = match kind {
@@ -469,6 +477,15 @@ fn flush(g: &mut Group, cfg: &HlsConfig, log: Option<&crate::log::Logger>, targe
         g.out.base = Some(if utc { "utc" } else { "log_time" });
     }
     let (utc, origin, lt) = g.base.unwrap_or((false, 0, 0));
+    if !utc
+        && g.vshift.is_none()
+        && let (Some(v), Some(a)) = (g.video.as_ref(), g.audio.as_ref())
+        && let (Some((vu, vat)), Some((au, aat))) = (v.first_utc, a.first_utc)
+    {
+        let ns = super::pipeline::late_sr_shift_ns((v.first_log, vu, vat, Kind::Video.timescale()), (a.first_log, au, aat, Kind::Audio.timescale()));
+        g.vshift = Some((ns * i128::from(Kind::Video.timescale()) / 1_000_000_000) as i64);
+        g.out.video_shift_us = Some((ns / 1_000) as i64);
+    }
     for (k, t) in [(Kind::Video, g.video.as_mut()), (Kind::Audio, g.audio.as_mut())] {
         if let Some(t) = t
             && t.t0.is_none()
@@ -511,18 +528,27 @@ fn flush(g: &mut Group, cfg: &HlsConfig, log: Option<&crate::log::Logger>, targe
         }
         let off = ((t.t0.unwrap_or(origin) - origin).max(0) * i128::from(k.timescale()) / 1_000_000_000) as u64;
         let buf = std::mem::take(&mut t.buf);
+        let step = (super::pipeline::LATE_SR_STEP_NS * i128::from(Kind::Video.timescale()) / 1_000_000_000) as i64;
+        let shift0 = g.vshift_at;
         let mut rows = Vec::with_capacity(buf.len());
         let mut data = Vec::new();
         for (i, s) in buf.iter().enumerate() {
             let dur = match k {
                 Kind::Audio => opus_samples(&s.data),
-                Kind::Video => match buf.get(i + 1) {
-                    Some(nx) => nx.ticks.saturating_sub(s.ticks),
-                    None => match next.filter(|(nk, _)| *nk == Kind::Video) {
-                        Some((_, nt)) => nt.saturating_sub(s.ticks),
-                        None => t.last_dur.max(1),
-                    },
-                },
+                Kind::Video => {
+                    let base = match buf.get(i + 1) {
+                        Some(nx) => nx.ticks.saturating_sub(s.ticks),
+                        None => match next.filter(|(nk, _)| *nk == Kind::Video) {
+                            Some((_, nt)) => nt.saturating_sub(s.ticks),
+                            None => t.last_dur.max(1),
+                        },
+                    };
+                    let now = g.vshift_at;
+                    if let Some(target) = g.vshift {
+                        g.vshift_at = super::pipeline::late_sr_step(i128::from(now), i128::from(target), i128::from(step)) as i64;
+                    }
+                    base.saturating_add_signed(g.vshift_at - now).max(1)
+                }
             };
             if dur > 0 {
                 t.last_dur = dur;
@@ -536,7 +562,7 @@ fn flush(g: &mut Group, cfg: &HlsConfig, log: Option<&crate::log::Logger>, targe
         }
         let tfdt = match (k, t.next_dts) {
             (Kind::Audio, Some(n)) => n,
-            _ => off + buf[0].ticks,
+            _ => (off + buf[0].ticks).saturating_add_signed(shift0),
         };
         if k == Kind::Audio {
             t.next_dts = Some(tfdt + span);

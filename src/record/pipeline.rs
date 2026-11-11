@@ -671,3 +671,18 @@ impl Pipeline {
         }
     }
 }
+
+/// ★늦은 SR 맞춤(SDK:RULE-PLAT-REC-HLS 「늦은 SR 맞춤」 · Matroska 도 파일마다 같다) — `log_time` 기준에서 영상 · 음성이 둘 다 UTC 를 받으면 영상만 옮긴다.
+/// 목표(ns) = (두 트랙 UTC 시작 차) − (두 트랙 첫 프레임 `log_time` 차). UTC 시작 = 첫 UTC 프레임의 UTC − 그 프레임까지의 트랙 경과.
+pub(crate) fn late_sr_shift_ns(video: (u64, u64, u64, u64), audio: (u64, u64, u64, u64)) -> i128 {
+    let start = |(_, utc, at, clock): (u64, u64, u64, u64)| i128::from(utc) - i128::from(at) * 1_000_000_000 / i128::from(clock.max(1));
+    (start(video) - start(audio)) - (i128::from(video.0) - i128::from(audio.0))
+}
+
+/// 영상 견본마다 옮기는 상한 — LiveKit Egress 기본(`DefaultMaxDriftAdjustment` 5ms)과 같다
+pub(crate) const LATE_SR_STEP_NS: i128 = 5_000_000;
+
+/// 지금 옮긴 양에서 목표로 한 걸음(상한 `step`)
+pub(crate) fn late_sr_step(applied: i128, target: i128, step: i128) -> i128 {
+    applied + (target - applied).clamp(-step, step)
+}

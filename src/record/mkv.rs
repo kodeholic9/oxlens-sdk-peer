@@ -512,6 +512,8 @@ pub struct MkvTrack {
     pub last_rtp: Option<u32>,
     /// 파일 원점에서 이 트랙 첫 블록까지(ms)
     pub first_ms: u64,
+    /// 마지막 블록 시각(파일 원점에서 ms)
+    pub last_ms: u64,
     /// 이 파일 안에서 줄이 바뀐 횟수(`log_time` 차로 이었다)
     pub rebased: u64,
 }
@@ -535,9 +537,10 @@ pub struct MkvFile {
     /// 파일 시작 벽시계(DateUTC · 유닉스 ms)와 그 출처 — `utc` · `log_time`(log_time 으로 연 파일도 닫기 전에 SR 을 받으면 utc 로 고쳐 쓴다)
     pub start_ms: u64,
     pub date: &'static str,
-    /// `log_time` 기준 파일의 DateUTC 를 UTC 로 고쳐 쓸 때 닻이 된 트랙(`video` · 없으면 `audio`) — 한 파일 DateUTC 는 한 값이라
-    ///   그 트랙 블록만 UTC 와 맞고 · 다른 트랙은 두 트랙의 도착 차만큼 어긋날 수 있다(트랙 사이 맞춤은 `log_time` 그대로). `utc` 기준 파일은 없음
+    /// `log_time` 기준 파일의 DateUTC 를 UTC 로 고쳐 쓸 때 닻이 된 트랙(`audio` · 없으면 `video`) — 영상은 늦은 SR 맞춤으로 음성에 맞춘다. `utc` 기준 파일은 없음
     pub date_track: Option<&'static str>,
+    /// 늦은 SR 맞춤의 영상 목표(µs · SDK:RULE-PLAT-REC-HLS 「늦은 SR 맞춤」 — 파일마다) · 없으면 맞춤 없음
+    pub video_shift_us: Option<i64>,
     pub duration_ms: u64,
     /// 닫힌 까닭 — `end` · `track`(트랙이 방에서 사라짐) · `source`(화자 바뀜) · `span` · `late_track`(연 뒤 새 종류가 듦) · `no_source` · `gap`
     pub reason: Option<String>,
@@ -604,6 +607,8 @@ struct OpenFile {
     keyed: bool,
     start: Option<(Kind, u64)>,
     asked: bool,
+    vshift: Option<i128>,
+    vshift_at: i128,
 }
 
 struct Group {
@@ -959,7 +964,7 @@ fn open_file(dir: &Path, g: &mut Group, late_key: &mut u64) -> io::Result<()> {
     // 길이 정책의 시작 = 모은 더미의 첫 이끄는 트랙(영상 · 없으면 음성) 프레임 — 보류 동안 쌓인 프레임도 셈에 든다
     let lead = if kinds.contains(&Kind::Video) { Kind::Video } else { Kind::Audio };
     let start = pend.iter().find(|p| p.kind == lead).map(|p| (lead, p.ticks));
-    g.file = Some(OpenFile { m, path, index, origin, utc, source: g.pend_source, user_id: g.pend_user.clone(), tracks, keyed: first_vkey.is_some(), start, asked: false });
+    g.file = Some(OpenFile { m, path, index, origin, utc, source: g.pend_source, user_id: g.pend_user.clone(), tracks, keyed: first_vkey.is_some(), start, asked: false, vshift: None, vshift_at: 0 });
     g.pend_since = None;
     for p in pend {
         write_one(g, p, late_key)?;
@@ -978,7 +983,21 @@ fn write_one(g: &mut Group, p: Pend, late_key: &mut u64) -> io::Result<()> {
         Kind::Audio => i128::from(super::ogg::opus_samples(&p.data)) * 1_000_000_000 / 48_000,
         Kind::Video => 1_000_000_000 / 30,
     };
+    let shift = match (g.video.as_ref(), g.audio.as_ref()) {
+        (Some(v), Some(a)) => match (v.first_utc, a.first_utc) {
+            (Some((vu, vat)), Some((au, aat))) => Some(super::pipeline::late_sr_shift_ns((v.first_log, vu, vat, v.codec.clock()), (a.first_log, au, aat, a.codec.clock()))),
+            _ => None,
+        },
+        _ => None,
+    };
     let Some(fl) = g.file.as_mut() else { return Ok(()) };
+    if !fl.utc
+        && fl.vshift.is_none()
+        && fl.tracks.iter().any(|(k, _)| *k == Kind::Video)
+        && fl.tracks.iter().any(|(k, _)| *k == Kind::Audio)
+    {
+        fl.vshift = shift;
+    }
     if p.kind == Kind::Video && !fl.keyed {
         if !p.key {
             *late_key += 1;
@@ -986,6 +1005,15 @@ fn write_one(g: &mut Group, p: Pend, late_key: &mut u64) -> io::Result<()> {
         }
         fl.keyed = true;
     }
+    let abs = if p.kind == Kind::Video && !fl.utc {
+        let now = fl.vshift_at;
+        if let Some(target) = fl.vshift {
+            fl.vshift_at = super::pipeline::late_sr_step(now, target, super::pipeline::LATE_SR_STEP_NS);
+        }
+        abs + now
+    } else {
+        abs
+    };
     let ms = ((abs - fl.origin).max(0) / 1_000_000) as u64;
     let end_ms = ((abs + dur_ns - fl.origin).max(0) / 1_000_000) as u64;
     let Some((_, tr)) = fl.tracks.iter_mut().find(|(k, _)| *k == p.kind) else { return Ok(()) };
@@ -995,6 +1023,7 @@ fn write_one(g: &mut Group, p: Pend, late_key: &mut u64) -> io::Result<()> {
         tr.first_rtp = Some(p.rtp);
     }
     tr.frames += 1;
+    tr.last_ms = ms;
     tr.keyframes += u64::from(p.key && p.kind == Kind::Video);
     tr.synced += u64::from(p.utc);
     tr.filled += u64::from(p.filled);
@@ -1016,7 +1045,7 @@ fn close_file(_dir: &Path, g: &mut Group, reason: &str, done: &mut Vec<MkvFile>)
     let mut date = if fl.utc { "utc" } else { "log_time" };
     let mut date_track = None;
     if !fl.utc {
-        let pick = [Kind::Video, Kind::Audio].into_iter().find(|k| fl.tracks.iter().any(|(x, _)| x == k) && g.trk(*k).is_some_and(|t| t.first_utc.is_some()));
+        let pick = [Kind::Audio, Kind::Video].into_iter().find(|k| fl.tracks.iter().any(|(x, _)| x == k) && g.trk(*k).is_some_and(|t| t.first_utc.is_some()));
         if let Some(k) = pick
             && let Some(t) = g.trk(k)
         {
@@ -1041,6 +1070,7 @@ fn close_file(_dir: &Path, g: &mut Group, reason: &str, done: &mut Vec<MkvFile>)
         start_ms: (date_ns.max(0) / 1_000_000) as u64,
         date,
         date_track,
+        video_shift_us: fl.vshift.map(|x| (x / 1_000) as i64),
         duration_ms,
         reason: Some(reason.to_string()),
     });

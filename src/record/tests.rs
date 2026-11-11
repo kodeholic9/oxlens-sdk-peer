@@ -489,6 +489,32 @@ fn hole_over_cap_opens_new_segment_without_fill() {
 }
 
 #[test]
+fn audio_hole_across_rtp_wrap_is_filled_like_any_other_hole() {
+    let s = u32::MAX - 960 * 3 + 1;
+    let at = |k: u32| s.wrapping_add(k * 960);
+    let out = run_pipe(Policy::Utterance, &opus_stream(&[(1, at(0)), (2, at(1)), (5, at(4)), (6, at(5))], 0x78));
+    let frames: Vec<(u32, bool)> = out.iter().filter_map(|o| if let Output::Frame(f) = o { Some((f.rtp_ts, f.filled)) } else { None }).collect();
+    assert_eq!(frames, vec![(at(0), false), (at(1), false), (at(2), true), (at(3), true), (at(4), false), (at(5), false)], "구멍이 넘침을 가로질러도 RTP 차로 셈 — PLC 둘 · 시각도 넘침을 따라간다");
+    assert!(at(2) > at(1) && at(3) < at(2), "구멍이 넘침 앞(앞 프레임 끝 at(2))에서 시작해 넘침 뒤에서 끝난다 — 빼기 자체가 넘침을 가로지른다");
+    let closes = out.iter().filter(|o| matches!(o, Output::Segment(x) if x.event == SegmentKind::Closed)).count();
+    assert_eq!(closes, 1, "넘침이 상한 넘는 구멍으로 읽혀 세그먼트를 새로 열지 않는다");
+}
+
+#[test]
+fn hole_over_cap_across_rtp_wrap_still_opens_new_segment() {
+    let s = u32::MAX - 10_000;
+    let mut pl = Pipeline::new(Policy::Utterance).with_gap_max(Duration::from_millis(100));
+    let mut out = Vec::new();
+    for r in opus_stream(&[(1, s), (2, s.wrapping_add(960)), (3, s.wrapping_add(48_000))], 0x78) {
+        out.extend(pl.push(&r));
+    }
+    out.extend(pl.finish());
+    let closes: Vec<Option<&str>> = out.iter().filter_map(|o| if let Output::Segment(x) = o { (x.event == SegmentKind::Closed).then_some(x.reason) } else { None }).collect();
+    assert_eq!(closes, vec![Some("gap"), Some("end")], "넘침 뒤 1초 구멍도 상한(100ms)을 넘는 구멍");
+    assert!(!out.iter().any(|o| matches!(o, Output::Frame(f) if f.filled)));
+}
+
+#[test]
 fn video_is_never_filled() {
     let out = run_pipe(Policy::Utterance, &stream());
     assert!(!out.iter().any(|o| matches!(o, Output::Frame(f) if f.filled && f.kind == "video")));
@@ -663,6 +689,36 @@ fn mkv_rtp_time_wrap_keeps_blocks_moving_forward() {
     let v = &f[0].tracks[0];
     assert_eq!((v.frames, v.first_rtp, v.last_rtp), (8, Some(start), Some(start.wrapping_add(7 * 3000))));
     assert_eq!(f[0].duration_ms, (7 * 3000 + 3000) / 90, "넘침을 지나도 앞으로만 간다 — 길이 = 마지막 블록 + 한 프레임");
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn mkv_av_file_across_rtp_wrap_of_both_tracks_is_one_file_moving_forward() {
+    let mut recs = av_stream(6, u32::MAX - 90_000 * 2, None);
+    let off = u32::MAX - 48_000 * 3;
+    for r in recs.iter_mut() {
+        match &r.channel {
+            Channel::Rtp(100) => {
+                let ts = u32::from_be_bytes(r.data[4..8].try_into().unwrap()).wrapping_add(off);
+                r.data[4..8].copy_from_slice(&ts.to_be_bytes());
+            }
+            Channel::Sr => {
+                let mut j: serde_json::Value = serde_json::from_slice(&r.data).unwrap();
+                if j["ssrc"] == 100 {
+                    j["rtp"] = serde_json::json!((j["rtp"].as_u64().unwrap() as u32).wrapping_add(off));
+                    r.data = serde_json::to_vec(&j).unwrap();
+                }
+            }
+            _ => {}
+        }
+    }
+    let d = tmp("mkv-av-wrap");
+    let f = mkv_build(&recs, &d);
+    assert_eq!(f.len(), 1, "넘침은 파일 경계가 아니다 — 사람 하나 · 파일 하나");
+    let (v, a) = (f[0].tracks.iter().find(|t| t.kind == "video").unwrap(), f[0].tracks.iter().find(|t| t.kind == "audio").unwrap());
+    assert!(v.last_rtp.unwrap() < v.first_rtp.unwrap() && a.last_rtp.unwrap() < a.first_rtp.unwrap(), "두 트랙 모두 넘침을 지났다");
+    assert_eq!(f[0].base, "utc");
+    assert!((5_900..=6_100).contains(&f[0].duration_ms), "넘침을 펼쳐 길이가 판 길이 그대로 — {}", f[0].duration_ms);
     std::fs::remove_dir_all(&d).ok();
 }
 

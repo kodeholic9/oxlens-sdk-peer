@@ -8,7 +8,7 @@
 //!   `--spatial N` 은 영상 트랙의 층 상한(기본은 최고 단) · `--layer-plan 4:0,8:1` 은 입장 뒤 그 초에 상한을 바꾼다.
 //! `--records-capacity N` · `--consume-stall-ms N`(시험 — 라이브 통 칸 수 · 입장 뒤 N ms 통을 안 읽는 느린 소비자 → 넘치면 꼬리 읽기로 강등 · 요약 `records.degraded` · SDK:RULE-PLAT-REC-API)
 //! `--raw DIR`(녹음 원시 기록 · context 202611/20261109c) — 받는 줄 전부를 MCAP 파트(`<user>-NNNN.mcap`)로 함께 적는다(SDK:RULE-PLAT-REC-TAP).
-//!   손잡이 `--raw-part-ms` · `--raw-part-bytes` · `--raw-flush-ms` · `--raw-tick-ms`(기본은 `RecordConfig::new`).
+//!   손잡이 `--raw-part-ms` · `--raw-part-bytes` · `--raw-flush-ms` · `--raw-tick-ms` · `--raw-min-free-bytes`(디스크 하한)(기본은 `RecordConfig::new`).
 //!
 //!   cargo run --example recorder -- --base http://127.0.0.1:1974/media --room ch-1 --out ./rec [--secs 30] [--hidden] [--user rec-1] [--video [--span-secs N] [--spatial N] [--layer-plan S:N,..]]
 //!
@@ -48,6 +48,8 @@ struct Args {
     raw_part_bytes: Option<u64>,
     raw_flush_ms: Option<u64>,
     raw_tick_ms: Option<u64>,
+    /// 원시 기록 디스크 하한(`--raw-min-free-bytes` · 기본 `RecordConfig::new` — SDK:RULE-PLAT-REC-PART)
+    raw_min_free_bytes: Option<u64>,
     /// close() 뒤 Client 를 놓기 전 이만큼 살려 두고 그동안 쓴 CPU 를 잰다(context 202611/20261109d — 닫힌 전송로의 DTLS 읽기 고리 돌기 재발 검사)
     linger_ms: Option<u64>,
     /// 라이브 레코드 통 칸 수(`--records-capacity` · 기본 65,536)
@@ -57,7 +59,7 @@ struct Args {
 }
 
 fn args() -> Args {
-    let mut a = Args { base: String::new(), room: String::new(), out: PathBuf::from("."), secs: None, hidden: false, user: "oxpeer-recorder".into(), api_key: "ox_k_demo".into(), api_secret: "ox_s_demo".into(), tls_root: None, video: false, spatial: None, layer_plan: Vec::new(), priority: Vec::new(), span_secs: None, hls: false, raw: None, raw_part_ms: None, raw_part_bytes: None, raw_flush_ms: None, raw_tick_ms: None, linger_ms: None, records_capacity: 1 << 16, consume_stall_ms: None };
+    let mut a = Args { base: String::new(), room: String::new(), out: PathBuf::from("."), secs: None, hidden: false, user: "oxpeer-recorder".into(), api_key: "ox_k_demo".into(), api_secret: "ox_s_demo".into(), tls_root: None, video: false, spatial: None, layer_plan: Vec::new(), priority: Vec::new(), span_secs: None, hls: false, raw: None, raw_part_ms: None, raw_part_bytes: None, raw_flush_ms: None, raw_tick_ms: None, raw_min_free_bytes: None, linger_ms: None, records_capacity: 1 << 16, consume_stall_ms: None };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         let mut v = || it.next().unwrap_or_default();
@@ -90,6 +92,7 @@ fn args() -> Args {
             "--raw-part-bytes" => a.raw_part_bytes = v().parse().ok(),
             "--raw-flush-ms" => a.raw_flush_ms = v().parse().ok(),
             "--raw-tick-ms" => a.raw_tick_ms = v().parse().ok(),
+            "--raw-min-free-bytes" => a.raw_min_free_bytes = v().parse().ok(),
             "--linger-ms" => a.linger_ms = v().parse().ok(),
             "--records-capacity" => a.records_capacity = v().parse().unwrap_or(1 << 16),
             "--consume-stall-ms" => a.consume_stall_ms = v().parse().ok(),
@@ -134,6 +137,9 @@ async fn main() {
         }
         if let Some(ms) = a.raw_tick_ms {
             rc.tick = Duration::from_millis(ms);
+        }
+        if let Some(b) = a.raw_min_free_bytes {
+            rc.min_free_bytes = b;
         }
         cfg.record = Some(rc);
     } else {

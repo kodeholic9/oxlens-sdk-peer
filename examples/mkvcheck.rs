@@ -40,6 +40,7 @@ fn seg(id: u64, kind: &str, codec: &str, event: SegmentKind) -> Segment {
         bytes: 0,
         filled: 0,
         reason: if event == SegmentKind::Closed { Some("end") } else { None },
+        utterance: None,
     }
 }
 
@@ -146,6 +147,7 @@ fn main() {
             bytes: 0,
             filled: 0,
             reason: None,
+            utterance: None,
         };
         sink.write(&Output::Segment(seg.clone())).expect("열기");
         let (mut i, mut n, mut t0) = (0, 0u64, None);

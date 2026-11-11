@@ -598,7 +598,6 @@ struct OpenFile {
     origin: i128,
     utc: bool,
     source: Option<u32>,
-    sources: [Option<u32>; 2],
     user_id: Option<String>,
     tracks: Vec<(Kind, MkvTrack)>,
     /// 영상이 키프레임을 받았나(파일 안 영상은 키프레임부터)
@@ -617,9 +616,9 @@ struct Group {
     pend: Vec<Pend>,
     pend_since: Option<u64>,
     pend_source: Option<u32>,
-    /// 종류마다 처음 본 출처 번호(영상 · 음성) — 화자 사용자를 모를 때 견준다
-    pend_sources: [Option<u32>; 2],
     pend_user: Option<String>,
+    /// 지금 파일(또는 모으는 더미)의 발언 번호 — 무전 슬롯은 이것이 바뀐 세그먼트에서 새 파일(SDK:RULE-PLAT-REC-MKV)
+    utt: Option<u64>,
     /// 길이 정책으로 자른 뒤 모으는 중 — 다음에 여는 파일은 앞 파일을 잇는다
     cont: bool,
     n: u64,
@@ -727,30 +726,24 @@ impl MkvSink {
             pend: Vec::new(),
             pend_since: None,
             pend_source: None,
-            pend_sources: [None, None],
             pend_user: None,
+            utt: None,
             cont: false,
             n: 0,
         });
         self.segs.insert(s.id, (key.clone(), kind));
-        // 슬롯 — 출처가 바뀌면 새 파일(발언 하나 = 파일 하나) · 열린 파일에 없는 종류가 들면 새 파일
-        // ★모으던 더미(아직 안 연 파일)도 화자가 바뀌면 그 자리에서 파일로 내고 닫는다 — 안 그러면 다음 화자의 첫 프레임이 앞 화자 더미에 섞인다(1층에서 잡힘)
-        //   ★화자는 출처 사용자로 견준다 — 같은 화자라도 음성 · 영상 트랙의 CSRC 는 다르다(2층에서 잡힘 — CSRC 로 견주면 한 발언이 영상만 · 음성만으로 갈린다).
-        //   사용자를 모를 때만 같은 종류의 CSRC 로
-        let cur_user = g.file.as_ref().map(|f| f.user_id.clone()).or_else(|| (!g.pend.is_empty()).then(|| g.pend_user.clone()));
-        let cur_src = g.file.as_ref().map(|f| f.sources[kind as usize]).or_else(|| (!g.pend.is_empty()).then(|| g.pend_sources[kind as usize]));
-        let other_source = g.owner.is_none()
-            && match (cur_user.clone().flatten(), s.user_id.as_ref()) {
-                (Some(a), Some(b)) => a != *b,
-                _ => cur_src.flatten().is_some_and(|c| Some(c) != s.source),
-            };
+        // 슬롯 — 발언 번호가 바뀌면 새 파일(발언 하나 = 파일 하나 · CSRC 로 견주지 않는다) · 열린 파일에 없는 종류가 들면 새 파일
+        // ★모으던 더미(아직 안 연 파일)도 발언이 바뀌면 그 자리에서 파일로 내고 닫는다 — 안 그러면 다음 화자의 첫 프레임이 앞 화자 더미에 섞인다
+        let busy_now = g.file.is_some() || !g.pend.is_empty();
+        let other_source = g.owner.is_none() && busy_now && g.utt != s.utterance;
         let new_kind = g.file.as_ref().is_some_and(|f| !f.tracks.iter().any(|(k, _)| *k == kind));
         if other_source || new_kind {
             if g.file.is_none() && !g.pend.is_empty() {
                 open_file(&self.dir, g, &mut self.late_key)?;
             }
-            close_file(&self.dir, g, if other_source { "source" } else { "late_track" }, &mut self.done)?;
+            close_file(&self.dir, g, if other_source { "utterance" } else { "late_track" }, &mut self.done)?;
         }
+        g.utt = s.utterance;
         let same = match kind {
             Kind::Video => g.video.as_ref().is_some_and(|t| t.track_id == s.track_id),
             Kind::Audio => g.audio.as_ref().is_some_and(|t| t.track_id == s.track_id),
@@ -828,9 +821,6 @@ impl MkvSink {
                 g.pend_source = f.source;
                 g.pend_user = f.user_id.clone().or_else(|| g.owner.clone());
             }
-            if g.pend_sources[kind as usize].is_none() {
-                g.pend_sources[kind as usize] = f.source;
-            }
             if g.pend_user.is_none() {
                 g.pend_user = f.user_id.clone();
             }
@@ -851,7 +841,6 @@ impl MkvSink {
             close_file(&self.dir, g, "late_track", &mut self.done)?;
             g.pend_since = Some(f.log_time);
             g.pend_source = f.source;
-            g.pend_sources[kind as usize] = f.source;
             g.pend_user = f.user_id.clone().or_else(|| g.owner.clone());
             g.pend.push(p);
             return Ok(());
@@ -871,8 +860,7 @@ impl MkvSink {
                     close_file(&self.dir, g, "span", &mut self.done)?;
                     g.pend_since = Some(f.log_time);
                     g.pend_source = f.source;
-                    g.pend_sources[kind as usize] = f.source;
-                    g.pend_user = f.user_id.clone().or_else(|| g.owner.clone());
+                            g.pend_user = f.user_id.clone().or_else(|| g.owner.clone());
                     g.pend.push(p);
                     // ★이어지는 파일도 음성을 보고 연다(보류 길은 같다) — 음성 RTP 시각이 영상보다 느리면 자른 키 뒤에 오는 음성이 키보다 이르다.
                     //   키 하나로 열면 그 음성이 원점 앞으로 떨어져 0 에 눌린다(2층 장시간 판 · 파일마다 1.4초씩 · 202611/20261110e)
@@ -971,8 +959,7 @@ fn open_file(dir: &Path, g: &mut Group, late_key: &mut u64) -> io::Result<()> {
     // 길이 정책의 시작 = 모은 더미의 첫 이끄는 트랙(영상 · 없으면 음성) 프레임 — 보류 동안 쌓인 프레임도 셈에 든다
     let lead = if kinds.contains(&Kind::Video) { Kind::Video } else { Kind::Audio };
     let start = pend.iter().find(|p| p.kind == lead).map(|p| (lead, p.ticks));
-    let sources = std::mem::take(&mut g.pend_sources);
-    g.file = Some(OpenFile { m, path, index, origin, utc, source: g.pend_source, sources, user_id: g.pend_user.clone(), tracks, keyed: first_vkey.is_some(), start, asked: false });
+    g.file = Some(OpenFile { m, path, index, origin, utc, source: g.pend_source, user_id: g.pend_user.clone(), tracks, keyed: first_vkey.is_some(), start, asked: false });
     g.pend_since = None;
     for p in pend {
         write_one(g, p, late_key)?;

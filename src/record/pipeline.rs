@@ -79,15 +79,17 @@ pub struct Segment {
     pub bytes: u64,
     /// 메운 프레임 수(SDK:RULE-PLAT-REC-GAP)
     pub filled: u64,
-    /// 닫힌 까닭 — `source` · `no_source` · `span` · `gap` · `track` · `end`
+    /// 닫힌 까닭 — `taken` · `idle` · `span` · `gap` · `track` · `end`
     pub reason: Option<&'static str>,
+    /// 발언 번호 — 발언 정책의 무전 슬롯 세그먼트(발언권 허가마다 · 같은 발언의 음성 · 영상이 같은 번호 — SDK:RULE-PLAT-REC-SPLIT)
+    pub utterance: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Output {
     Frame(Frame),
     Segment(Segment),
-    /// 발언 정책이 담지 않은 출처 없는 프레임
+    /// 발언 정책이 어느 발언에도 담지 않은 프레임(출처 없음 · 지금 화자가 아님 · 허가 없이 1초)
     Orphan(Frame),
 }
 
@@ -133,7 +135,40 @@ pub struct Counts {
     pub filled: u64,
     /// 목록에서 빠진 개인 트랙으로 판정된 늦은 프레임(SDK:RULE-PLAT-REC-SPLIT 트랙이 사라짐) — 세그먼트에 넣지 않았다
     pub late: u64,
+    /// 발언 정책 — 지금 화자가 아닌 출처의 슬롯 프레임(앞 화자의 늦은 패킷) · 담지 않았다
+    pub other_speaker: u64,
+    /// 발언 정책 — 허가 전에 와 들고 있던 프레임 중 그 허가와 안 맞거나 1초를 넘은 것 · 담지 않았다
+    pub unheld: u64,
 }
+
+/// 방의 지금 화자(`ctl/floor` `taken`) — 허가 번호(MBCP SEQ — 같은 허가의 재전송 · 파트 머리 다시 적기를 가린다) · 출처 번호 · 발언 번호
+#[derive(Clone)]
+struct Speaker {
+    seq: Option<u64>,
+    sources: Vec<u32>,
+    utt: u64,
+}
+
+/// 끝나는 발언 — 반환 · 다음 허가 뒤 유예 동안 앞 화자의 늦은 패킷을 그 발언에 넣는다
+struct Ending {
+    old: Speaker,
+    deadline: u64,
+    reason: &'static str,
+}
+
+impl Speaker {
+    fn owns(&self, src: Option<u32>) -> bool {
+        match src {
+            Some(c) => self.sources.is_empty() || self.sources.contains(&c),
+            None => false,
+        }
+    }
+}
+
+/// 허가 전에 온 슬롯 프레임을 드는 시간(`log_time` ns — SDK:RULE-PLAT-REC-SPLIT 발언)
+const HOLD_BEFORE_TAKEN_NS: u64 = 1_000_000_000;
+/// 반환 · 다음 허가 뒤 앞 화자의 늦은 패킷을 그 발언에 받는 유예(`log_time` ns — 발언권 사건과 미디어는 길이 달라 뒤바뀐다)
+const ENDING_GRACE_NS: u64 = 200_000_000;
 
 /// 음성 세그먼트의 꼬리 — 다음 프레임이 이어 붙을 RTP 시각 · 앞 TOC · 넘긴 나머지(표본)
 #[derive(Clone, Copy)]
@@ -164,11 +199,16 @@ pub struct Pipeline {
     open: BTreeMap<String, Segment>,
     next_id: u64,
     counts: Counts,
+    speaking: HashMap<String, Speaker>,
+    held: HashMap<String, Vec<Frame>>,
+    ending: BTreeMap<String, Ending>,
+    next_utt: u64,
+    last_at: u64,
 }
 
 impl Pipeline {
     pub fn new(policy: Policy) -> Pipeline {
-        Pipeline { policy, gap_max: GAP_MAX_SAMPLES, tails: HashMap::new(), rows: HashMap::new(), owners: HashMap::new(), sources: HashMap::new(), src_tracks: HashMap::new(), listed: HashMap::new(), departed: HashSet::new(), lines: HashMap::new(), sr: HashMap::new(), open: BTreeMap::new(), next_id: 0, counts: Counts::default() }
+        Pipeline { policy, gap_max: GAP_MAX_SAMPLES, tails: HashMap::new(), rows: HashMap::new(), owners: HashMap::new(), sources: HashMap::new(), src_tracks: HashMap::new(), listed: HashMap::new(), departed: HashSet::new(), lines: HashMap::new(), sr: HashMap::new(), open: BTreeMap::new(), next_id: 0, counts: Counts::default(), speaking: HashMap::new(), held: HashMap::new(), ending: BTreeMap::new(), next_utt: 0, last_at: 0 }
     }
 
     /// 구멍 상한(SDK:RULE-PLAT-REC-GAP — 넘으면 세그먼트를 새로 연다)
@@ -184,11 +224,16 @@ impl Pipeline {
     /// 레코드 하나 → 출력 열
     pub fn push(&mut self, r: &Record) -> Vec<Output> {
         self.counts.records += 1;
+        self.last_at = self.last_at.max(r.log_time);
         let mut out = Vec::new();
+        let due: Vec<String> = self.ending.iter().filter(|(_, e)| r.log_time > e.deadline).map(|(k, _)| k.clone()).collect();
+        for room in due {
+            self.end_utterance(&room, r.log_time, &mut out);
+        }
         match &r.channel {
             Channel::Rtp(ssrc) => self.rtp(*ssrc, r, &mut out),
             Channel::Track => self.track(&r.data, &mut out),
-            Channel::Floor => self.floor(&r.data),
+            Channel::Floor => self.floor(&r.data, r.log_time, &mut out),
             Channel::Sr => {
                 if let Ok(v) = serde_json::from_slice::<Value>(&r.data)
                     && let (Some(s), Some(n), Some(t)) = (v["ssrc"].as_u64(), v["ntp"].as_u64(), v["rtp"].as_u64())
@@ -217,15 +262,27 @@ impl Pipeline {
 
     /// 끝 — 열린 세그먼트를 닫는다(번호 차례) · 조립 중인 프레임은 끝이 없어 버린다
     pub fn finish(&mut self) -> Vec<Output> {
+        let mut out = Vec::new();
+        let ending: Vec<String> = self.ending.keys().cloned().collect();
+        for room in ending {
+            self.end_utterance(&room, self.last_at, &mut out);
+        }
+        let mut rooms: Vec<String> = self.held.keys().cloned().collect();
+        rooms.sort();
+        for r in rooms {
+            for f in self.held.remove(&r).unwrap_or_default() {
+                self.counts.unheld += 1;
+                out.push(Output::Orphan(f));
+            }
+        }
         let mut segs: Vec<Segment> = std::mem::take(&mut self.open).into_values().collect();
         segs.sort_by_key(|s| s.id);
-        segs.into_iter()
-            .map(|mut s| {
-                s.event = SegmentKind::Closed;
-                s.reason = Some("end");
-                Output::Segment(s)
-            })
-            .collect()
+        out.extend(segs.into_iter().map(|mut s| {
+            s.event = SegmentKind::Closed;
+            s.reason = Some("end");
+            Output::Segment(s)
+        }));
+        out
     }
 
     fn track(&mut self, data: &[u8], out: &mut Vec<Output>) {
@@ -285,14 +342,75 @@ impl Pipeline {
         }
     }
 
-    fn floor(&mut self, data: &[u8]) {
+    /// 발언권 사건 — ★발언 경계(SDK:RULE-PLAT-REC-SPLIT 발언) · 출처 번호 → 사용자(식별)
+    fn floor(&mut self, data: &[u8], at: u64, out: &mut Vec<Output>) {
         let Ok(v) = serde_json::from_slice::<Value>(data) else { return };
-        if v["event"].as_str() != Some("taken") {
+        let Some(room) = v["room"].as_str().map(str::to_string) else { return };
+        let taken = match v["event"].as_str() {
+            Some("taken") => true,
+            Some("idle") => false,
+            _ => return,
+        };
+        let sources: Vec<u32> = v["sources"].as_array().into_iter().flatten().filter_map(Value::as_u64).map(|c| c as u32).collect();
+        if let Some(u) = v["user_id"].as_str() {
+            for c in &sources {
+                self.sources.insert(*c, u.to_string());
+            }
+        }
+        if self.policy != Policy::Utterance {
             return;
         }
-        let Some(u) = v["user_id"].as_str() else { return };
-        for c in v["sources"].as_array().into_iter().flatten().filter_map(Value::as_u64) {
-            self.sources.insert(c as u32, u.to_string());
+        let seq = v["seq"].as_u64();
+        if taken && seq.is_some() && self.speaking.get(&room).is_some_and(|sp| sp.seq == seq) {
+            return;
+        }
+        if let Some(old) = self.speaking.remove(&room) {
+            if self.ending.contains_key(&room) {
+                self.end_utterance(&room, at, out);
+            }
+            let open = self.open.values().any(|s| s.room == room && s.owner.is_none());
+            if open {
+                self.ending.insert(room.clone(), Ending { old, deadline: at.saturating_add(ENDING_GRACE_NS), reason: if taken { "taken" } else { "idle" } });
+            }
+        }
+        if taken {
+            let sp = Speaker { seq, sources, utt: self.next_utt };
+            self.next_utt += 1;
+            self.speaking.insert(room.clone(), sp);
+        }
+        if !self.ending.contains_key(&room) {
+            self.release_held(&room, at, out);
+        }
+    }
+
+    /// 끝나는 발언을 닫고(유예가 지났다) 그동안 들고 있던 새 화자 프레임을 낸다
+    fn end_utterance(&mut self, room: &str, at: u64, out: &mut Vec<Output>) {
+        let Some(e) = self.ending.remove(room) else { return };
+        let slots: Vec<String> = self.open.iter().filter(|(_, s)| s.room == room && s.owner.is_none()).map(|(k, _)| k.clone()).collect();
+        for k in slots {
+            self.close(&k, e.reason, out);
+        }
+        self.release_held(room, at, out);
+    }
+
+    /// 들고 있던 프레임 — 지금 화자의 것이고 1초 안이면 그 발언에 · 다른 사람 것이면 센다 · 화자가 아직 없으면 1초까지 더 든다
+    fn release_held(&mut self, room: &str, at: u64, out: &mut Vec<Output>) {
+        let held = self.held.remove(room).unwrap_or_default();
+        let sp = self.speaking.get(room).cloned();
+        for f in held {
+            let fresh = at.saturating_sub(f.log_time) <= HOLD_BEFORE_TAKEN_NS;
+            match &sp {
+                Some(sp) if fresh && sp.owns(f.source) => self.split(f, out),
+                Some(_) if fresh => {
+                    self.counts.other_speaker += 1;
+                    out.push(Output::Orphan(f));
+                }
+                None if fresh => self.held.entry(room.to_string()).or_default().push(f),
+                _ => {
+                    self.counts.unheld += 1;
+                    out.push(Output::Orphan(f));
+                }
+            }
         }
     }
 
@@ -327,9 +445,6 @@ impl Pipeline {
                 rec_first: r.sequence,
                 rec_last: r.sequence,
             });
-            if a.source != h.csrc {
-                a.broken = true;
-            }
             a.seq_last = h.seq;
             a.rec_last = r.sequence;
             match piece {
@@ -410,13 +525,40 @@ impl Pipeline {
         let key = format!("track/{}", f.track_id);
         match self.policy {
             Policy::Utterance => {
-                let Some(src) = f.source else {
-                    self.close(&key, "no_source", out);
+                if f.source.is_none() {
                     out.push(Output::Orphan(f));
                     return;
-                };
-                if self.open.get(&key).is_some_and(|s| s.source != Some(src)) {
-                    self.close(&key, "source", out);
+                }
+                if f.owner.is_none() && let Some(e) = self.ending.get(&f.room) {
+                    if !(e.old.owns(f.source) && f.log_time <= e.deadline) {
+                        self.held.entry(f.room.clone()).or_default().push(f);
+                        return;
+                    }
+                } else if f.owner.is_none() {
+                    match self.speaking.get(&f.room) {
+                        Some(sp) if !sp.owns(f.source) => {
+                            self.counts.other_speaker += 1;
+                            out.push(Output::Orphan(f));
+                            return;
+                        }
+                        Some(_) => {}
+                        None => {
+                            let room = f.room.clone();
+                            let now = f.log_time;
+                            let held = self.held.entry(room).or_default();
+                            let keep: Vec<Frame> = std::mem::take(held);
+                            for h in keep {
+                                if now.saturating_sub(h.log_time) > HOLD_BEFORE_TAKEN_NS {
+                                    self.counts.unheld += 1;
+                                    out.push(Output::Orphan(h));
+                                } else {
+                                    held.push(h);
+                                }
+                            }
+                            held.push(f);
+                            return;
+                        }
+                    }
                 }
             }
             Policy::Span { time_ns, bytes } => {
@@ -450,6 +592,7 @@ impl Pipeline {
                 bytes: 0,
                 filled: 0,
                 reason: None,
+                utterance: if self.policy == Policy::Utterance && f.owner.is_none() { self.speaking.get(&f.room).map(|sp| sp.utt) } else { None },
             };
             self.tails.remove(&key);
             self.next_id += 1;

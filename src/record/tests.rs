@@ -252,7 +252,7 @@ fn pipeline_is_deterministic() {
 }
 
 #[test]
-fn utterance_policy_splits_by_source_and_leaves_server_silence_out() {
+fn utterance_policy_splits_at_taken_and_leaves_frames_without_source_out() {
     let out = run_pipe(Policy::Utterance, &stream());
     let audio: Vec<(Option<u32>, Option<u64>, Option<String>)> = out
         .iter()
@@ -261,11 +261,122 @@ fn utterance_policy_splits_by_source_and_leaves_server_silence_out() {
             _ => None,
         })
         .collect();
-    assert_eq!(audio, vec![(Some(7), Some(0), Some("A".into())), (Some(7), Some(0), Some("A".into())), (Some(8), Some(1), Some("B".into()))]);
+    assert_eq!(audio, vec![(Some(7), Some(0), Some("A".into())), (Some(7), Some(0), Some("A".into())), (Some(8), Some(2), Some("B".into()))], "B 발언은 A 발언의 유예가 지난 뒤 연다(그 사이 연 영상 세그먼트가 1)");
     let orphans = out.iter().filter(|o| matches!(o, Output::Orphan(f) if f.data == [0xF8, 0xFF, 0xFE])).count();
-    assert_eq!(orphans, 2, "서버 침묵은 세그먼트 밖");
+    assert_eq!(orphans, 2, "출처 없는 프레임은 세그먼트 밖");
     let closed: Vec<(u64, Option<&str>)> = out.iter().filter_map(|o| if let Output::Segment(s) = o { (s.event == SegmentKind::Closed).then_some((s.id, s.reason)) } else { None }).collect();
-    assert_eq!(&closed[..2], &[(0, Some("source")), (1, Some("no_source"))]);
+    assert_eq!(closed[0], (0, Some("taken")), "경계는 발언권 허가 · 출처 없는 프레임은 세그먼트를 닫지 않는다");
+    assert!(closed[1..].iter().all(|c| c.1 == Some("end")));
+}
+
+fn floor(n: u32, t: u64, ev: &str, who: &str, src: &[u32]) -> Record {
+    let user = if ev == "taken" { format!("\"{who}\"") } else { "null".into() };
+    rec(n, t, Channel::Floor, format!(r#"{{"room":"r","event":"{ev}","user_id":{user},"sources":{src:?},"seq":{n}}}"#).into_bytes())
+}
+
+fn slot_audio(n: u32, t: u64, seq: u16, src: u32) -> Record {
+    rec(n, t, Channel::Rtp(100), pkt(seq, u32::from(seq) * 960, true, Some(src), &[0x78, seq as u8]))
+}
+
+/// 발언 정책 출력 → (세그먼트 번호, 출처) 열 · 고아 출처 열 · 닫힌 까닭 열
+type Utter = (Vec<(Option<u64>, Option<u32>)>, Vec<Option<u32>>, Vec<&'static str>);
+
+fn utter(out: &[Output]) -> Utter {
+    let fr = out.iter().filter_map(|o| if let Output::Frame(f) = o && !f.filled { Some((f.segment, f.source)) } else { None }).collect();
+    let orph = out.iter().filter_map(|o| if let Output::Orphan(f) = o { Some(f.source) } else { None }).collect();
+    let closed = out.iter().filter_map(|o| if let Output::Segment(x) = o { (x.event == SegmentKind::Closed).then_some(x.reason.unwrap_or("-")) } else { None }).collect();
+    (fr, orph, closed)
+}
+
+#[test]
+fn new_speaker_media_before_its_taken_is_held_and_opens_its_utterance() {
+    let ms = 1_000_000u64;
+    let recs = [
+        rec(1, 0, Channel::Track, tracks("r")),
+        floor(2, 0, "taken", "A", &[7]),
+        slot_audio(3, 20 * ms, 1, 7),
+        floor(4, 40 * ms, "idle", "", &[]),
+        slot_audio(5, 60 * ms, 2, 8),
+        slot_audio(6, 80 * ms, 3, 8),
+        floor(7, 90 * ms, "taken", "B", &[8]),
+        slot_audio(8, 100 * ms, 4, 8),
+    ];
+    let mut pl = Pipeline::new(Policy::Utterance);
+    let mut out: Vec<Output> = recs.iter().flat_map(|r| pl.push(r)).collect();
+    out.extend(pl.finish());
+    let (fr, orph, closed) = utter(&out);
+    assert_eq!(fr, vec![(Some(0), Some(7)), (Some(1), Some(8)), (Some(1), Some(8)), (Some(1), Some(8))], "허가보다 먼저 온 B 의 첫 두 프레임이 B 발언 앞에");
+    assert!(orph.is_empty());
+    assert_eq!(closed, vec!["idle", "end"]);
+    let opened: Vec<Option<u64>> = out.iter().filter_map(|o| if let Output::Segment(x) = o { (x.event == SegmentKind::Opened).then_some(x.utterance) } else { None }).collect();
+    assert_eq!(opened, vec![Some(0), Some(1)], "허가마다 발언 번호");
+}
+
+#[test]
+fn previous_speaker_tail_goes_to_its_utterance_within_grace_and_never_to_the_new_one() {
+    let ms = 1_000_000u64;
+    let recs = [
+        rec(1, 0, Channel::Track, tracks("r")),
+        floor(2, 0, "taken", "A", &[7]),
+        slot_audio(3, 20 * ms, 1, 7),
+        floor(4, 30 * ms, "taken", "B", &[8]),
+        slot_audio(5, 35 * ms, 2, 7),
+        slot_audio(6, 40 * ms, 3, 8),
+        slot_audio(7, 400 * ms, 4, 7),
+        slot_audio(8, 420 * ms, 5, 8),
+    ];
+    let mut pl = Pipeline::new(Policy::Utterance);
+    let mut out: Vec<Output> = recs.iter().flat_map(|r| pl.push(r)).collect();
+    out.extend(pl.finish());
+    let (fr, orph, closed) = utter(&out);
+    assert_eq!(fr, vec![(Some(0), Some(7)), (Some(0), Some(7)), (Some(1), Some(8)), (Some(1), Some(8))], "승계 — B 허가 뒤 유예(200ms) 안에 온 A 의 꼬리는 A 발언에 · B 의 첫 프레임은 유예 뒤 B 발언 앞에");
+    assert_eq!(orph, vec![Some(7)], "유예를 넘긴 A 의 패킷은 어느 발언에도 넣지 않고 센다");
+    assert_eq!(pl.counts().other_speaker, 1);
+    assert_eq!(closed, vec!["taken", "end"]);
+}
+
+#[test]
+fn repeated_taken_of_the_same_grant_does_not_split_the_utterance() {
+    let ms = 1_000_000u64;
+    let recs = [
+        rec(1, 0, Channel::Track, tracks("r")),
+        floor(2, 0, "taken", "A", &[7]),
+        slot_audio(3, 20 * ms, 1, 7),
+        floor(2, 30 * ms, "taken", "A", &[7]),
+        slot_audio(4, 40 * ms, 2, 7),
+        floor(2, 50 * ms, "taken", "A", &[7]),
+        slot_audio(5, 60 * ms, 3, 7),
+    ];
+    let mut pl = Pipeline::new(Policy::Utterance);
+    let mut out: Vec<Output> = recs.iter().flat_map(|r| pl.push(r)).collect();
+    out.extend(pl.finish());
+    let (fr, orph, closed) = utter(&out);
+    assert_eq!(fr, vec![(Some(0), Some(7)); 3], "같은 허가 번호의 TAKEN(재전송 · 파트 머리 다시 적기)은 새 발언이 아니다");
+    assert!(orph.is_empty());
+    assert_eq!(closed, vec!["end"]);
+}
+
+#[test]
+fn media_without_taken_for_over_a_second_is_left_out() {
+    let ms = 1_000_000u64;
+    let recs = [
+        rec(1, 0, Channel::Track, tracks("r")),
+        slot_audio(2, 0, 1, 8),
+        slot_audio(3, 1_500 * ms, 2, 8),
+        floor(4, 1_510 * ms, "taken", "B", &[8]),
+        slot_audio(5, 1_520 * ms, 3, 8),
+        floor(6, 1_600 * ms, "idle", "", &[]),
+        slot_audio(7, 1_620 * ms, 4, 8),
+        slot_audio(8, 1_900 * ms, 5, 8),
+    ];
+    let mut pl = Pipeline::new(Policy::Utterance);
+    let mut out: Vec<Output> = recs.iter().flat_map(|r| pl.push(r)).collect();
+    out.extend(pl.finish());
+    let (fr, orph, closed) = utter(&out);
+    assert_eq!(fr, vec![(Some(0), Some(8)), (Some(0), Some(8)), (Some(0), Some(8))], "1초 안에 허가가 온 프레임 · 반환 뒤 유예 안의 꼬리가 그 발언에");
+    assert_eq!(orph, vec![Some(8), Some(8)], "1초를 넘긴 것 · 반환 뒤 유예를 넘기고 허가 없이 끝난 것");
+    assert_eq!(pl.counts().unheld, 2);
+    assert_eq!(closed, vec!["idle"]);
 }
 
 #[test]
@@ -317,7 +428,7 @@ fn ogg_sink_bytes_are_identical_for_identical_records() {
         assert_eq!(sink.files()[0].packets, 2);
         assert_eq!(sink.files()[0].samples, 1_920);
     }
-    for name in ["r-0000-A.ogg", "r-0001-B.ogg"] {
+    for name in ["r-0000-A.ogg", "r-0002-B.ogg"] {
         assert_eq!(std::fs::read(d1.join(name)).unwrap(), std::fs::read(d2.join(name)).unwrap(), "{name}");
     }
 }
@@ -456,7 +567,7 @@ async fn late_subscriber_gets_current_state_first() {
 // ── 3단계 — 음성 구멍 PLC(SDK:RULE-PLAT-REC-GAP) ──
 
 fn opus_stream(seqs_ts: &[(u16, u32)], toc: u8) -> Vec<Record> {
-    let mut v = vec![rec(1, 0, Channel::Track, tracks("r"))];
+    let mut v = vec![rec(1, 0, Channel::Track, tracks("r")), rec(1, 0, Channel::Floor, br#"{"room":"r","event":"taken","user_id":"A","sources":[7],"seq":1}"#.to_vec())];
     for (i, (seq, ts)) in seqs_ts.iter().enumerate() {
         v.push(rec(2 + i as u32, (i as u64 + 1) * 20_000_000, Channel::Rtp(100), pkt(*seq, *ts, true, Some(7), &[toc, 9, 9])));
     }
@@ -597,8 +708,10 @@ fn slot_video_segment_opens_only_at_keyframe_of_new_source() {
     let ms = 1_000_000u64;
     let recs = [
         rec(1, 0, Channel::Track, track_list("r", serde_json::json!([{ "track_id": "slot-v", "kind": "video" }]), serde_json::json!({ "400": vrow("slot-v") }))),
+        rec(1, 0, Channel::Floor, br#"{"room":"r","event":"taken","user_id":"A","sources":[7],"seq":1}"#.to_vec()),
         rec(2, ms, Channel::Rtp(400), pkt(1, 3000, true, Some(7), KEY)),
         rec(3, 2 * ms, Channel::Rtp(400), pkt(2, 6000, true, Some(7), DELTA)),
+        rec(3, 2 * ms, Channel::Floor, br#"{"room":"r","event":"taken","user_id":"B","sources":[8],"seq":2}"#.to_vec()),
         rec(4, 3 * ms, Channel::Rtp(400), pkt(3, 9000, true, Some(8), DELTA)),
         rec(5, 4 * ms, Channel::Rtp(400), pkt(4, 12000, true, Some(8), KEY)),
     ];
@@ -606,7 +719,7 @@ fn slot_video_segment_opens_only_at_keyframe_of_new_source() {
     let mut out: Vec<Output> = recs.iter().flat_map(|r| pl.push(r)).collect();
     out.extend(pl.finish());
     let s = segs(&out);
-    assert_eq!(s[1], (SegmentKind::Closed, 0, "slot-v".into(), Some("source")));
+    assert_eq!(s[1], (SegmentKind::Closed, 0, "slot-v".into(), Some("taken")));
     assert_eq!(s[2], (SegmentKind::Opened, 1, "slot-v".into(), None));
     let first_of_1 = out.iter().find_map(|o| if let Output::Frame(f) = o && f.segment == Some(1) { Some((f.rtp_ts, f.keyframe)) } else { None });
     assert_eq!(first_of_1, Some((12000, true)), "새 화자의 첫 키프레임부터");
@@ -1011,7 +1124,7 @@ fn pipeline_assembles_video_frame_across_seq_wrap_and_ogg_keeps_range() {
     // 발언 파일(Ogg) — seq 범위가 넘침을 가로질러도 첫 · 끝이 그대로
     let tracks = serde_json::json!([{ "track_id": "slot-a", "kind": "audio" }]);
     let rows = serde_json::json!({ "100": { "track_id": "slot-a", "kind": "audio", "codec": "opus", "pt": 111 } });
-    let mut a = vec![rec(1, 0, Channel::Track, track_list("r", tracks, rows))];
+    let mut a = vec![rec(1, 0, Channel::Track, track_list("r", tracks, rows)), rec(1, 0, Channel::Floor, br#"{"room":"r","event":"taken","user_id":"A","sources":[7],"seq":1}"#.to_vec())];
     for (i, sq) in [65533u16, 65534, 65535, 0, 1, 2].into_iter().enumerate() {
         a.push(rec(2 + i as u32, i as u64 * 20 * ms, Channel::Rtp(100), pkt(sq, i as u32 * 960, true, Some(7), &[0x78, i as u8])));
     }
@@ -1215,17 +1328,17 @@ fn mkv_av_log_time_file_patched_by_late_sr_names_its_anchor_track() {
 
 #[test]
 fn mkv_slot_utterance_is_one_file_per_speaker_with_both_kinds() {
-    // 무전 슬롯 — 화자 A(출처 7) 영상 · 음성 → 화자 B(출처 8). 출처가 바뀐 첫 프레임에서 새 파일 · 그 파일 영상은 B 의 첫 키프레임부터
+    // 무전 슬롯 — 화자 A(출처 7) 영상 · 음성 → 허가 B → 화자 B(출처 8). 발언 번호가 바뀐 세그먼트에서 새 파일 · 그 파일 영상은 B 의 첫 키프레임부터
     let ms = 1_000_000u64;
     let tracks = serde_json::json!([{ "track_id": "slot-a", "kind": "audio" }, { "track_id": "slot-v", "kind": "video" }]);
     let rows = serde_json::json!({ "100": { "track_id": "slot-a", "kind": "audio", "codec": "opus", "pt": 111 }, "200": vrow("slot-v") });
     // ★같은 화자라도 음성 · 영상 CSRC 가 다르다(실제 — 2층에서 잡힌 결함) · 화자 사용자는 Floor Taken 의 출처 번호로 안다
     let mut recs = vec![rec(1, 0, Channel::Track, track_list("r", tracks, rows))];
-    recs.push(rec(2, 0, Channel::Floor, br#"{"room":"r","event":"taken","user_id":"A","sources":[7,17],"seq":1}"#.to_vec()));
-    recs.push(rec(3, 0, Channel::Floor, br#"{"room":"r","event":"taken","user_id":"B","sources":[8,18],"seq":2}"#.to_vec()));
-    let mut n = 4u32;
+    let mut n = 2u32;
     let (mut aseq, mut vseq) = (0u16, 0u16);
-    for (src, t0) in [(7u32, 0u32), (8, 3000)] {
+    for (src, t0, who) in [(7u32, 0u32, "A"), (8, 3000, "B")] {
+        recs.push(rec(n, u64::from(t0) * ms, Channel::Floor, format!(r#"{{"room":"r","event":"taken","user_id":"{who}","sources":[{src},{}],"seq":{n}}}"#, src + 10).into_bytes()));
+        n += 1;
         for i in 0..100u32 {
             let t = t0 + i * 20;
             recs.push(rec(n, u64::from(t) * ms, Channel::Rtp(100), pkt(aseq, t * 48, true, Some(src), &[0x78, i as u8])));
@@ -1246,7 +1359,7 @@ fn mkv_slot_utterance_is_one_file_per_speaker_with_both_kinds() {
     assert_eq!(fs.iter().map(|f| f.source).collect::<Vec<_>>(), vec![Some(7), Some(8)], "발언 하나 = 파일 하나");
     assert!(fs.iter().all(|f| f.tracks.len() == 2), "파일마다 영상 · 음성");
     assert_eq!(fs[1].tracks.iter().find(|t| t.kind == "audio").unwrap().frames, 100, "B 의 음성은 첫 프레임부터 B 파일");
-    assert_eq!(fs[0].reason.as_deref(), Some("source"));
+    assert_eq!(fs[0].reason.as_deref(), Some("taken"), "다음 허가에서 앞 발언 파일을 닫는다");
     std::fs::remove_dir_all(&d).ok();
 }
 

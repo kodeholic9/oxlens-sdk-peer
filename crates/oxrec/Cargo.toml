@@ -1,0 +1,24 @@
+# author: kodeholic (powered by Claude)
+# 녹음 · 녹화 실행 파일(SDK:RULE-PLAT-REC-* · SDK:RULE-PLAT-SERVER) — 방에 녹음기(참가자 종류 1)로 들어가 받기만 한다 · 원시 기록(MCAP) · Ogg · Matroska · HLS.
+# oxpeer 공개 표면만 쓴다(옛 oxpeer 예제 recorder · context 202611/20261112g).
+[package]
+name = "oxrec"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "OxLens recorder — joins rooms as a recorder peer and writes raw (MCAP) · Ogg · Matroska · HLS"
+publish = false
+
+[[bin]]
+name = "oxrec"
+path = "src/main.rs"
+
+[dependencies]
+oxpeer = { path = "../oxpeer", features = ["record"] }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"

@@ -91,7 +91,7 @@ mod tests {
     /// 판정 근거는 규격 벡터(oxlens-spec/vectors/frame.json — 웹 SDK 와 같은 것)다
     #[test]
     fn spec_vectors_frame() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../oxlens-spec/vectors/frame.json");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../oxlens-spec/vectors/frame.json");
         let v: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("규격 벡터")).unwrap();
         let cases = v["cases"].as_array().unwrap();
         assert!(!cases.is_empty());

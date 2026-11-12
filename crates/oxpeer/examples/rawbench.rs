@@ -2,7 +2,7 @@
 //! 녹음 원시 기록 실측(context 202611/20261109c M6 · M8 · M9 · M10) — 서버 없이 합성 RTP 를 기록기와 같은 쓰기 경로(MCAP · 청크 · 시간으로 닫기)로 쓴다.
 //! 시각은 합성(미디어 시간)이다 — 60초 분량을 될 수 있는 대로 빨리 써서 「미디어 1초당 비용」을 잰다.
 //!
-//!   cargo run --release --example rawbench --features record-lz4,record-zstd -- --out /tmp/rawbench
+//!   cargo run -p oxpeer --release --example rawbench --features record-lz4,record-zstd -- --out /tmp/rawbench
 //!
 //! 표준 출력에 한 줄 JSON — 판마다 (형상 · F · 압축 · fsync) 파일 바이트 · 페이로드 바이트 · 오버헤드 · 미디어 1초당 CPU µs · 시간당 크기.
 

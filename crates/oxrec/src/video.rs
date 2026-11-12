@@ -75,7 +75,7 @@ impl Out {
             Out::Hls(s) => s.finish(),
         };
         if let Err(e) = r {
-            eprintln!("[recorder] 결과물 마무리 실패: {e}");
+            eprintln!("[oxrec] 결과물 마무리 실패: {e}");
         }
     }
 
@@ -164,7 +164,7 @@ impl Tally {
             Output::Segment(_) => {}
         }
         if let Err(e) = sink.write(o) {
-            eprintln!("[recorder] 파일 쓰기 실패: {e}");
+            eprintln!("[oxrec] 파일 쓰기 실패: {e}");
         }
     }
 }

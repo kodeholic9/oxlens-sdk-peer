@@ -3,7 +3,7 @@
 //! ★공개 결과물 `MkvSink`(SDK:RULE-PLAT-REC-MKV · 지점 ② ③ — 202611/20261110a)로 파일에 쓴다. 판정은 `scripts/media_check.sh` 가 ffprobe · ffmpeg 로 한다.
 //! 같은 표본(H264 + Opus — 한 사람의 두 트랙 · RTP 시각 순으로 섞어)을 ★공개 결과물 `HlsSink`(SDK:RULE-PLAT-REC-HLS — 202611/20261110b)로 `hls/` 에 짓는다(해상도 바뀜 → 끊김).
 //!
-//!   cargo run --example mkvcheck --features record -- <표본 폴더>
+//!   cargo run -p oxpeer --example mkvcheck --features record -- <표본 폴더>
 
 use std::path::PathBuf;
 

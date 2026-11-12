@@ -3,7 +3,7 @@
 //! 방 쪽: oxpeer 로 발언 방에 들어가 반이중 음성을 발행하고 · 라이브 레코드 통(지점 ① → 발언 정책 파이프라인 지점 ② ③)으로 턴을 짓는다.
 //! AI 쪽: 고객 WS 서버로 접속해(끊기면 다시) 사건 · PCM 을 주고받는다 · 방 연결과 AI 연결의 수명은 따로다.
 //!
-//!   oxbridge --base http://127.0.0.1:1974/media --room ch-1 --ai-url ws://127.0.0.1:9000/agent \
+//!   oxbridge-ai --base http://127.0.0.1:1974/media --room ch-1 --ai-url ws://127.0.0.1:9000/agent \
 //!            [--token T | --user agent-1 [--api-key K --api-secret S]] [--header 'Authorization: Bearer x'] [--custom persona=ops] \
 //!            [--rate 16000] [--silence-ms 3000] [--ws-queue-ms 5000] [--secs N] [--tls-root ca.pem] [--ai-tls-root ca.pem]
 //!
@@ -13,11 +13,11 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use oxbridge::codec::{self, Codec};
-use oxbridge::reply::{Act, Limits, PttView, Replies};
-use oxbridge::seam::{self, FromAi};
-use oxbridge::turn::{TurnOut, Turns};
-use oxbridge::ws::{self, In, OutQueue, Target};
+use oxbridge_ai::codec::{self, Codec};
+use oxbridge_ai::reply::{Act, Limits, PttView, Replies};
+use oxbridge_ai::seam::{self, FromAi};
+use oxbridge_ai::turn::{TurnOut, Turns};
+use oxbridge_ai::ws::{self, In, OutQueue, Target};
 use oxpeer::log::{AppKind, AppLine, Level};
 use oxpeer::record::{Channel, Pipeline, Policy, RecordConfig};
 use oxpeer::{Client, Config, Duplex, Event, Kind, OutFrame, TokenReq, TrackSpec};
@@ -77,14 +77,14 @@ fn args() -> Args {
         }
     }
     if a.base.is_empty() || a.room.is_empty() || a.ai_url.is_empty() {
-        eprintln!("사용: oxbridge --base http://host:port/media --room <방> --ai-url ws://host:port/path [--token T | --user id] [--header 'K: V'] [--custom k=v] [--rate 16000] [--silence-ms N] [--secs N]");
+        eprintln!("사용: oxbridge-ai --base http://host:port/media --room <방> --ai-url ws://host:port/path [--token T | --user id] [--header 'K: V'] [--custom k=v] [--rate 16000] [--silence-ms N] [--secs N]");
         std::process::exit(2);
     }
     a
 }
 
 fn fail(what: &str, e: impl std::fmt::Display) -> ! {
-    eprintln!("[oxbridge] {what}: {e}");
+    eprintln!("[oxbridge-ai] {what}: {e}");
     std::process::exit(1);
 }
 
@@ -420,7 +420,7 @@ async fn main() {
     let track = client.publish(&a.room, TrackSpec { kind: Kind::Audio, duplex: Duplex::Half, simulcast: false }).await.unwrap_or_else(|e| fail("발행", e));
     let snap = client.snapshot().await.unwrap_or_else(|e| fail("상태", e));
     let me = snap.session.and_then(|s| s.user_id).unwrap_or_default();
-    eprintln!("[oxbridge] {} 에 들어왔다 — 발행 {} · AI {}", a.room, track.track_id, a.ai_url);
+    eprintln!("[oxbridge-ai] {} 에 들어왔다 — 발행 {} · AI {}", a.room, track.track_id, a.ai_url);
 
     // 방 쪽 송출 일꾼 — 프레임은 송신 시계로 · 놓기 전에 통을 비운다(SDK:RULE-PLAT-AGENT-REPLY)
     let (tx, mut tx_rx) = mpsc::channel::<Tx>(64);

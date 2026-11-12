@@ -11,7 +11,7 @@
 //! `reconnect` — 전이중 표지 · `--reconnect-at N` 초에 `close()` 한 뒤 ★같은 객체로 `connect()` · 다시 들어 다시 발행(SDK:ses.md `close()`).
 //! `file` — 진짜 코덱 표본을 되풀이해 전이중으로 낸다(`--opus a.ogg` · `--h264 v.h264` 또는 `--vp8 v.ivf` · 영상 30fps) · 키프레임 요청이 오면 다음 키프레임으로 건너뛴다(3층 — 브라우저가 실제로 디코드하나).
 //!
-//!   cargo run --example agent -- --base http://127.0.0.1:1974/media --room ch-1 [--secs 30] [--user agent-1] [--mode echo|beacon|duplex|move|reconnect] [--video [--simulcast]] [--room2 ch-2] [--reconnect-at N] [--tls-root ca.pem]
+//!   cargo run -p oxpeer --example agent_echo -- --base http://127.0.0.1:1974/media --room ch-1 [--secs 30] [--user agent-1] [--mode echo|beacon|duplex|move|reconnect] [--video [--simulcast]] [--room2 ch-2] [--reconnect-at N] [--tls-root ca.pem]
 //!
 //! 끝나면 표준 출력에 한 줄 JSON(되울림마다 · 발언권 사건 · 키프레임 요청 · 보내는 쪽 계수)을 쓴다 — 2층 시험이 읽는다.
 
@@ -177,7 +177,7 @@ async fn main() {
         }
     };
     let me = client.snapshot().await.ok().and_then(|s| s.session.and_then(|x| x.user_id)).unwrap_or_default();
-    eprintln!("[agent] {} 에 들어왔다({}) — 발행 {}", a.room, a.mode, audio.track_id);
+    eprintln!("[agent_echo] {} 에 들어왔다({}) — 발행 {}", a.room, a.mode, audio.track_id);
     let secs = a.secs;
     let stop = async {
         match secs {

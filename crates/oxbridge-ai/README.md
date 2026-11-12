@@ -1,4 +1,4 @@
-# oxbridge — AI 에이전트 브리지
+# oxbridge-ai — AI 에이전트 브리지
 
 무전 방 하나에 에이전트(`participant_type:2`)로 들어가서 두 가지를 합니다.
 - 사람의 발언을 고객 AI 서비스(WebSocket)로 보냅니다.
@@ -15,7 +15,7 @@
 ## 실행
 
 ```sh
-cargo run -p oxbridge -- --base https://hub.example/media --room ch-1 --ai-url wss://ai.example/agent \
+cargo run -p oxbridge-ai -- --base https://hub.example/media --room ch-1 --ai-url wss://ai.example/agent \
   --token "$TOKEN" --header 'Authorization: Bearer …' --custom persona=dispatcher [--rate 16000] [--silence-ms 3000]
 ```
 

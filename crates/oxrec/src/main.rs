@@ -1,5 +1,5 @@
 // author: kodeholic (powered by Claude)
-//! 예제 녹음 · 녹화기 — 서버사이드 SDK(oxpeer)로 방에 녹음 참가자(`participant_type:1`)로 들어간다.
+//! 녹음 · 녹화 실행 파일 oxrec — 서버사이드 SDK(oxpeer)로 방에 녹음 참가자(`participant_type:1`)로 들어간다.
 //! 기본(녹음) — ★발언 한 건마다 Ogg Opus 파일 하나. 발언 경계는 ★패킷의 출처(CSRC — SDK:RULE-PLAT-SERVER 「출처 표지」)가 정한다 —
 //!   출처가 바뀌면 새 파일 · 출처 없는 패킷(표지를 끈 연결 — 서버는 미디어 프레임을 짓지 않는다)은 경계 밖이고 열린 파일을 닫는다. 화자 사건과 도착 시각을 맞대지 않는다.
 //!   무전 슬롯 오디오(PTT)만 담는다(개인 트랙은 센다).
@@ -10,7 +10,7 @@
 //! `--raw DIR`(녹음 원시 기록 · context 202611/20261109c) — 받는 줄 전부를 MCAP 파트(`<user>-NNNN.mcap`)로 함께 적는다(SDK:RULE-PLAT-REC-TAP).
 //!   손잡이 `--raw-part-ms` · `--raw-part-bytes` · `--raw-flush-ms` · `--raw-tick-ms` · `--raw-min-free-bytes`(디스크 하한)(기본은 `RecordConfig::new`).
 //!
-//!   cargo run --example recorder -- --base http://127.0.0.1:1974/media --room ch-1 --out ./rec [--secs 30] [--hidden] [--user rec-1] [--video [--span-secs N] [--spatial N] [--layer-plan S:N,..]]
+//!   cargo run -p oxrec -- --base http://127.0.0.1:1974/media --room ch-1 --out ./rec [--secs 30] [--hidden] [--user rec-1] [--video [--span-secs N] [--spatial N] [--layer-plan S:N,..]]
 //!
 //! 끝나면 표준 출력에 한 줄 JSON(파일마다 화자 · 수 · 경계 밖 수 · 정리층 계수 · 복구 사실)을 쓴다 — 2층 시험이 이것과 파일을 읽는다.
 
@@ -159,7 +159,7 @@ async fn main() {
         eprintln!("입장 실패: {e}");
         std::process::exit(1);
     }
-    eprintln!("[recorder] {} 에 들어왔다 — 발언을 기다린다", a.room);
+    eprintln!("[oxrec] {} 에 들어왔다 — 발언을 기다린다", a.room);
     if a.video {
         let out = video::run(&a, client, events, media, records).await;
         println!("{out}");
@@ -355,7 +355,7 @@ impl Flow {
             Event::Resync { room: r } if r == room => self.resync += 1,
             Event::JoinFailed { room: r, error } if r == room => self.join_failed.push(error.code),
             Event::Closed { code, name, .. } => {
-                eprintln!("[recorder] 세션이 끝났다 {code} {name}");
+                eprintln!("[oxrec] 세션이 끝났다 {code} {name}");
                 return true;
             }
             _ => {}

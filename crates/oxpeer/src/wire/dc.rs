@@ -67,7 +67,7 @@ mod tests {
     /// MBCP 머리 · TLV — 규격 벡터(oxlens-spec/vectors/mbcp.json)
     #[test]
     fn spec_vectors_mbcp() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../oxlens-spec/vectors/mbcp.json");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../oxlens-spec/vectors/mbcp.json");
         let v: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("규격 벡터")).unwrap();
         let cases = v["cases"].as_array().unwrap();
         assert!(!cases.is_empty());

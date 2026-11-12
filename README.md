@@ -46,12 +46,12 @@ client.connect().await?;                                                        
 오디오엔 `ssrc-audio-level` 을 싣는다(서버가 줄 상한을 넘는 방에서 음량으로 고른다 · 안 주면 말소리 30 dBov). SR 1초 · 영상 NACK 엔 RTX · 서버의 키프레임 요청은 사건 `KeyframeRequested{layer}`(앱이 인코더에 시킨다).
 ★대역 추정 — 패킷마다 transport-cc 를 싣고 서버 TWCC 로 목표 비트레이트를 셈한다(손실 · 지연 기울기 · REMB 의 최솟값) → 사건 `TargetBitrate{bps}` · `Stats::target_bps`. 인코더를 맞추는 것은 앱 몫이다(SDK 는 버리거나 늦추지 않는다).
 
-예제 — 녹음(발언 한 건마다 Ogg Opus 파일 하나 · 패킷 출처가 경계)과 녹화(`--video` — 트랙마다 Matroska 하나 · 무전 슬롯은 발언마다) · 에이전트(`agent` — `echo` 무전 되울림 · `beacon` 전이중 표지 발행 시험판(`--video [--simulcast]`) · `duplex` · `move --room2` · `reconnect --reconnect-at N` 걸음표 · `file --opus a.ogg --h264 v.h264` 진짜 표본) · 둘 다 `--tls-root ca.pem`:
+녹음 · 녹화는 실행 파일 `oxrec`(`crates/oxrec`) · 에이전트는 예제 `agent_echo` — 녹음(발언 한 건마다 Ogg Opus 파일 하나 · 패킷 출처가 경계)과 녹화(`--video` — 트랙마다 Matroska 하나 · 무전 슬롯은 발언마다) · 에이전트(`agent_echo` — `echo` 무전 되울림 · `beacon` 전이중 표지 발행 시험판(`--video [--simulcast]`) · `duplex` · `move --room2` · `reconnect --reconnect-at N` 걸음표 · `file --opus a.ogg --h264 v.h264` 진짜 표본) · 둘 다 `--tls-root ca.pem`:
 
 ```sh
-cargo run --example recorder -- --base http://127.0.0.1:1974/media --room ch-1 --out ./rec --secs 30 --hidden
-cargo run --example recorder -- --base http://127.0.0.1:1974/media --room conf-1 --out ./rec --video [--spatial 0] [--layer-plan 4:0,8:1]
-cargo run --example agent -- --base http://127.0.0.1:1974/media --room ch-1 --mode echo
+cargo run -p oxrec -- --base http://127.0.0.1:1974/media --room ch-1 --out ./rec --secs 30 --hidden
+cargo run -p oxrec -- --base http://127.0.0.1:1974/media --room conf-1 --out ./rec --video [--spatial 0] [--layer-plan 4:0,8:1]
+cargo run -p oxpeer --example agent_echo -- --base http://127.0.0.1:1974/media --room ch-1 --mode echo
 ```
 
 ### 녹음 원시 기록(기능 `record` — context 202611/20261109c)
@@ -59,7 +59,7 @@ cargo run --example agent -- --base http://127.0.0.1:1974/media --room ch-1 --mo
 `Config.record = Some(RecordConfig::new(dir, recording_id))` 면 받는 줄 전부를 ★수신 정리층 출구에서 MCAP 파트(`<recording_id>-NNNN.mcap`)로 적는다 —
 복호한 RTP 원본(RTX 로 메운 것은 원래 패킷으로) · 빈 번호(`gap`) · SR · 트랙 목록 · 발언권 · 세션 사건 · `tick`(SDK:RULE-PLAT-REC-TAP · REC-RAW · REC-CLOCK · REC-PART).
 청크는 tick 경계에서 F(기본 2초)마다 닫는다 — 프로세스가 죽어도 잃는 것은 닫히지 않은 청크뿐이다. 파트는 크기(기본 1GiB) · 시간(기본 1시간) 중 먼저 닿는 쪽에서 돈다 · 파트마다 머리 스냅숏이 있어 따로 읽힌다.
-다시 읽기는 `record::FileSource`(파일 차례 그대로 · Footer 없는 파트는 마지막 닫힌 청크까지). 예제 `recorder --raw DIR [--raw-part-ms N] [--raw-flush-ms N]` · 실측 `cargo run --release --example rawbench --features record-lz4,record-zstd`.
+다시 읽기는 `record::FileSource`(파일 차례 그대로 · Footer 없는 파트는 마지막 닫힌 청크까지). `oxrec --raw DIR [--raw-part-ms N] [--raw-flush-ms N]` · 실측 `cargo run -p oxpeer --release --example rawbench --features record-lz4,record-zstd`.
 
 파이프라인(context 202611/20261109d · SDK:RULE-PLAT-REC-PIPE · REC-SPLIT · REC-API) — 레코드 흐름 하나 위에 결과물을 짓는다:
 
@@ -78,17 +78,18 @@ cargo run --example agent -- --base http://127.0.0.1:1974/media --room ch-1 --mo
 
 | 자리 | 무엇 |
 |---|---|
-| `src/generated/` | ★**생성본 — 손으로 고치지 않는다.** 영역 클라 상태기(세션 · 방 · 연결 · 구독 · 트랙 · 발언권) · 결합 · WS wire · 발언권 코덱 · 정책 SDK 기본값. 규격 저장소에서 `npm run sync:peer` 로 옮긴다 |
-| `src/core/` | SDK 루프 하나 — 입구 표 · 효과 표 · 이음매 집행 · 시계(절차는 생성 상태기가 정한다) |
-| `src/link/` | 전송(UDP · ICE consent · DTLS · SRTP · SCTP/DCEP) — 층마다 사실을 낸다 · `recv.rs` 수신 정리층 · `depack.rs` RTP 꼴 → 코덱 꼴 |
-| `src/sig.rs` · `src/wire/` | WS 소켓 · 대기표 · 프레임 머리(WS · DC) |
-| `tests/vectors/` | 규격 짓기의 재생 시험이 TS 판 상태기에 넣은 호출과 결과 — Rust 판이 같은 결과를 내는지 1층이 맞댄다 |
-| `src/record/` | 녹음(기능 `record`) — 기록기 · 파트 회전 · `FileSource` · 라이브 통(`live.rs` 꼬리 강등) · `Pipeline` · `OggSink` |
-| `examples/recorder/` | 예제 녹음 · 녹화기(Ogg Opus · `--video` Matroska · `--raw` MCAP 원시) |
-| `examples/rawbench.rs` | 원시 기록 실측(합성 RTP — F · fsync · 압축 · 시간당 크기) |
-| `examples/rawtool.rs` | 원시 파트 → 프레임 목록(전체 · 파트 단독 · 대조군) — 2층 「파트 자족」 「조립 대조」 재료 |
-| `examples/agent/` | 예제 에이전트(무전 되울림 · 전이중 표지 발행) |
-| `src/core/pubs.rs` · `src/link/send.rs` | 말하는 쪽 — 발행 · 소속 · 누름 · 메시지 결합 / 패킷화 · 확장 · 보낸 기록 · RTX · SR |
+| `crates/oxpeer/src/generated/` | ★**생성본 — 손으로 고치지 않는다.** 영역 클라 상태기(세션 · 방 · 연결 · 구독 · 트랙 · 발언권) · 결합 · WS wire · 발언권 코덱 · 정책 SDK 기본값. 규격 저장소에서 `npm run sync:peer` 로 옮긴다 |
+| `crates/oxpeer/src/core/` | SDK 루프 하나 — 입구 표 · 효과 표 · 이음매 집행 · 시계(절차는 생성 상태기가 정한다) |
+| `crates/oxpeer/src/link/` | 전송(UDP · ICE consent · DTLS · SRTP · SCTP/DCEP) — 층마다 사실을 낸다 · `recv.rs` 수신 정리층 · `depack.rs` RTP 꼴 → 코덱 꼴 |
+| `crates/oxpeer/src/sig.rs` · `src/wire/` | WS 소켓 · 대기표 · 프레임 머리(WS · DC) |
+| `crates/oxpeer/tests/vectors/` | 규격 짓기의 재생 시험이 TS 판 상태기에 넣은 호출과 결과 — Rust 판이 같은 결과를 내는지 1층이 맞댄다 |
+| `crates/oxpeer/src/record/` | 녹음(기능 `record`) — 기록기 · 파트 회전 · `FileSource` · 라이브 통(`live.rs` 꼬리 강등) · `Pipeline` · `OggSink` |
+| `crates/oxrec/` | 녹음 · 녹화 실행 파일 `oxrec`(Ogg Opus · `--video` Matroska · `--raw` MCAP 원시) |
+| `crates/oxpeer/examples/rawbench.rs` | 원시 기록 실측(합성 RTP — F · fsync · 압축 · 시간당 크기) |
+| `crates/oxpeer/examples/rawtool.rs` | 원시 파트 → 프레임 목록(전체 · 파트 단독 · 대조군) — 2층 「파트 자족」 「조립 대조」 재료 |
+| `crates/oxpeer/examples/agent_echo/` | 예제 에이전트(무전 되울림 · 전이중 표지 발행) |
+| `crates/oxbridge-ai/` | AI 에이전트 브리지 실행 파일 `oxbridge-ai`(SDK:RULE-PLAT-AGENT · 그 README) |
+| `crates/oxpeer/src/core/pubs.rs` · `src/link/send.rs` | 말하는 쪽 — 발행 · 소속 · 누름 · 메시지 결합 / 패킷화 · 확장 · 보낸 기록 · RTX · SR |
 
 ## 게이트
 
@@ -101,7 +102,7 @@ scripts/media_check.sh # 재생기 호환 실측 — ffmpeg(libvpx · libx264 ·
 lib 시험(`media_fixture_*` · `#[ignore]`)이 libwebrtc 꼴 RTP(VP8 서술자 · H264 STAP-A · FU-A)로 쪼개 뒤바뀜 · RTX 복구를 섞어 수신 정리층에 넣고 원본과 바이트 대조 →
 예제 `mkvcheck` 가 녹화기의 MKV 쓰개로 파일을 짓고 → ffprobe · ffmpeg 가 디코드 오류 0 · 해상도 바뀜 · 길이 · 시간 이동을 본다.
 
-2층은 labs(`oxlens-labs/oxe2epy`)가 예제 녹음 · 녹화기를 띄워 「봇이 보낸 것 = 파일」로 견준다(봇 본문 표지 — 보낸 ssrc · 번호) — 재는 쪽은 labs 다.
+2층은 labs(`oxlens-labs/oxe2epy`)가 녹음 · 녹화기 `oxrec` 를 띄워 「봇이 보낸 것 = 파일」로 견준다(봇 본문 표지 — 보낸 ssrc · 번호) — 재는 쪽은 labs 다.
 
 | 시나리오 | 자극 | 복구 길 |
 |---|---|---|

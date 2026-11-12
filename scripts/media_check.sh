@@ -14,8 +14,8 @@ src 640x360 -c:v libx264 -profile:v baseline -tune zerolatency -g 30 -x264-param
 src 320x180 -c:v libx264 -profile:v baseline -tune zerolatency -g 30 -x264-params aud=1 -f h264 "$D/h264_b.h264"
 ffmpeg -v error -f lavfi -i "sine=frequency=440:sample_rate=48000" -t 2 -c:a libopus -frame_duration 20 -b:a 32k "$D/opus.ogg"
 
-OXPEER_MEDIA_DIR="$D" cargo test --offline --lib media_fixture -- --ignored --nocapture --test-threads 1
-cargo run --offline -q --features record --example mkvcheck -- "$D"
+OXPEER_MEDIA_DIR="$D" cargo test --offline -p oxpeer --lib media_fixture -- --ignored --nocapture --test-threads 1
+cargo run --offline -q -p oxpeer --features record --example mkvcheck -- "$D"
 
 fail=0
 for f in vp8 h264 opus; do

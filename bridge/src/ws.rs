@@ -1,6 +1,6 @@
 // author: kodeholic (powered by Claude)
 //! 이음매 연결(SDK:RULE-PLAT-AGENT-CONNECT · SDK:RULE-PLAT-AGENT-FAULT) — 브리지가 고객 WS 서버로 접속한다 · 끊기면 물러서며 다시.
-//! ★AI 로 가는 통은 상한 — 넘치면 가장 오래된 음성부터 버리고 다음 음성 앞에 `gap(overflow)` 를 낸다(수신 루프 · 레코드 통을 막지 않는다).
+//! ★AI 로 가는 통은 상한 — 넘치면 가장 오래된 음성부터 버리고 다음에 꺼낼 때 `gap(overflow)` 를 먼저 낸다(수신 루프 · 레코드 통을 막지 않는다).
 //! `wss://` 는 rustls(ring · tls12 — oxpeer 와 같은 계열) · 뿌리는 webpki 또는 설정의 PEM.
 
 use std::collections::VecDeque;
@@ -11,7 +11,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{Notify, mpsc};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
@@ -21,6 +21,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 
 use crate::seam;
+
+/// 커널 송신 버퍼(바이트) — 16kHz 음성 약 1초
+const SEND_BUF: u32 = 32 * 1024;
 
 /// 나가는 것 하나
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,10 +66,9 @@ impl OutQueue {
         self.audio += 1;
     }
 
-    /// 다음 하나 — 버린 음성이 있으면 다음 음성 앞에 `gap(overflow)`
+    /// 다음 하나 — 버린 음성이 있으면 무엇보다 먼저 `gap(overflow)`(뒤에 음성이 더 오지 않아도 알린다)
     pub fn pop(&mut self) -> Option<Out> {
-        if let (Some((a, b)), Some(Out::Audio { .. })) = (self.dropped, self.q.front()) {
-            self.dropped = None;
+        if let Some((a, b)) = self.dropped.take() {
             return Some(Out::Text(seam::event("gap", json!({ "from_seq": a, "to_seq": b, "reason": "overflow" }))));
         }
         let o = self.q.pop_front()?;
@@ -134,7 +136,11 @@ async fn dial(t: &Target, tls: Option<&Arc<ClientConfig>>) -> Result<Pin<Box<dyn
     let auth = rest.split('/').next().unwrap_or(rest);
     let secure = t.url.starts_with("wss://");
     let addr = if auth.contains(':') && !auth.ends_with(']') { auth.to_string() } else { format!("{auth}:{}", if secure { 443 } else { 80 }) };
-    let tcp = TcpStream::connect(&addr).await.map_err(|e| format!("{addr}: 연결 {e}"))?;
+    let sa = tokio::net::lookup_host(&addr).await.map_err(|e| format!("{addr}: 이름 {e}"))?.next().ok_or_else(|| format!("{addr}: 주소 없음"))?;
+    let sock = if sa.is_ipv4() { TcpSocket::new_v4() } else { TcpSocket::new_v6() }.map_err(|e| format!("소켓: {e}"))?;
+    // ★커널 송신 버퍼를 묶는다 — 자동 조정(수 MB)이 AI 로 가는 음성을 수십 초 쌓으면 통 상한이 뜻을 잃고 지연만 커진다(SDK:RULE-PLAT-AGENT-FAULT · 20261112 2층 실측)
+    let _ = sock.set_send_buffer_size(SEND_BUF);
+    let tcp: TcpStream = sock.connect(sa).await.map_err(|e| format!("{addr}: 연결 {e}"))?;
     let _ = tcp.set_nodelay(true);
     let Some(cfg) = tls else { return Ok(Box::pin(tcp)) };
     let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&addr).trim_start_matches('[').trim_end_matches(']').to_string();
@@ -233,16 +239,26 @@ mod tests {
             q.audio(s, vec![s as u8]);
         }
         let out = texts(&mut q);
-        assert_eq!(out[0], Out::Text("t0".into()), "사건은 버리지 않는다");
-        match &out[1] {
+        match &out[0] {
             Out::Text(s) => {
                 let v: serde_json::Value = serde_json::from_str(s).unwrap();
                 assert_eq!((v["type"].as_str(), v["from_seq"].as_u64(), v["to_seq"].as_u64(), v["reason"].as_str()), (Some("gap"), Some(0), Some(2), Some("overflow")));
             }
             o => panic!("gap 이 먼저 와야 한다: {o:?}"),
         }
+        assert_eq!(out[1], Out::Text("t0".into()), "사건은 버리지 않는다");
         assert_eq!(&out[2..], &[Out::Audio { seq: 3, bytes: vec![3] }, Out::Audio { seq: 4, bytes: vec![4] }]);
         assert_eq!(q.overflow_frames, 3);
+    }
+
+    #[test]
+    fn overflow_at_the_tail_is_still_reported() {
+        let mut q = OutQueue::new(1);
+        q.audio(0, vec![]);
+        q.audio(1, vec![]);
+        assert_eq!(q.pop().map(|o| matches!(o, Out::Text(_))), Some(true), "뒤에 음성이 없어도 gap 이 나간다");
+        assert_eq!(q.pop(), Some(Out::Audio { seq: 1, bytes: vec![] }));
+        assert!(q.is_empty());
     }
 
     #[test]

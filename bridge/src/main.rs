@@ -152,6 +152,8 @@ struct Bridge {
     orphan_diag: u64,
     pcm_carry: Vec<u8>,
     stop_reason: Option<String>,
+    /// 무음 상한 `L`(ms — 요약에 싣는다)
+    silence_ms: u64,
 }
 
 impl Bridge {
@@ -236,7 +238,7 @@ impl Bridge {
                     }
                 }
                 let Some(pcm) = self.codec.decode(&data) else {
-                    self.diag(Level::Warn, "SDK:RULE-PLAT-AGENT-AUDIO", "decode_error", format!("bytes={}", data.len()));
+                    self.diag(Level::Warn, "SD-RULE-PLAT-AGENT-AUDIO", "decode_error", format!("bytes={}", data.len()));
                     return;
                 };
                 self.expect_ts = Some(rtp_ts.wrapping_add((pcm.len() as u64 * 48_000 / u64::from(self.rate)) as u32));
@@ -249,7 +251,7 @@ impl Bridge {
             TurnOut::Orphan { source, user } => {
                 self.orphan_diag += 1;
                 if self.orphan_diag <= 20 || self.orphan_diag.is_multiple_of(100) {
-                    self.diag(Level::Warn, "SDK:RULE-PLAT-AGENT-TURN", "orphan_frame", format!("source={source:?} user={user:?} total={}", self.orphan_diag));
+                    self.diag(Level::Warn, "SD-RULE-PLAT-AGENT-TURN", "orphan_frame", format!("source={source:?} user={user:?} total={}", self.orphan_diag));
                 }
             }
         }
@@ -264,12 +266,12 @@ impl Bridge {
                     let level = codec::level_dbov(&pcm);
                     match self.codec.encode(&pcm) {
                         Some(pkt) => self.room_tx(Tx::Frame(OutFrame { data: pkt.into(), duration: Duration::from_millis(u64::from(seam::FRAME_MS)), keyframe: false, audio_level: Some(level) })),
-                        None => self.diag(Level::Warn, "SDK:RULE-PLAT-AGENT-AUDIO", "encode_error", String::new()),
+                        None => self.diag(Level::Warn, "SD-RULE-PLAT-AGENT-AUDIO", "encode_error", String::new()),
                     }
                 }
                 Act::State(v) => {
                     if v["state"] != "floor_granted" && v["state"] != "floor_queued" && v["state"] != "done" {
-                        self.diag(Level::Info, "SDK:RULE-PLAT-AGENT-REPLY", "reply_state", v.to_string());
+                        self.diag(Level::Info, "SD-RULE-PLAT-AGENT-REPLY", "reply_state", v.to_string());
                     }
                     self.send_text("reply.state", v);
                 }
@@ -296,7 +298,7 @@ impl Bridge {
                 let resumed = self.ws_connects > 0;
                 self.ws_connects += 1;
                 self.ws_up = true;
-                self.diag(Level::Info, "SDK:RULE-PLAT-AGENT-CONNECT", "ai_connected", format!("resumed={resumed}"));
+                self.diag(Level::Info, "SD-RULE-PLAT-AGENT-CONNECT", "ai_connected", format!("resumed={resumed}"));
                 self.start_event(resumed);
                 if let Some((a, b)) = self.disconnected.take() {
                     self.send_text("gap", json!({ "from_seq": a, "to_seq": b, "reason": "disconnected" }));
@@ -305,7 +307,7 @@ impl Bridge {
             In::Down(e) => {
                 if self.ws_up {
                     self.ws_downs += 1;
-                    self.diag(Level::Warn, "SDK:RULE-PLAT-AGENT-FAULT", "ai_disconnected", e);
+                    self.diag(Level::Warn, "SD-RULE-PLAT-AGENT-FAULT", "ai_disconnected", e);
                 }
                 self.ws_up = false;
                 if let Some((a, b)) = self.outq.lock().ok().and_then(|mut q| q.cut()) {
@@ -333,7 +335,7 @@ impl Bridge {
                     self.acts(acts);
                 }
                 Ok(None) => {}
-                Err(e) => self.diag(Level::Warn, "SDK:RULE-PLAT-AGENT-EVENTS", "ai_bad_event", e),
+                Err(e) => self.diag(Level::Warn, "SD-RULE-PLAT-AGENT-EVENTS", "ai_bad_event", e),
             },
             In::Binary(b) => {
                 let pcm = seam::pcm_from_bytes(&mut self.pcm_carry, &b);
@@ -367,7 +369,7 @@ impl Bridge {
         let t = &self.turns.counts;
         let p = pipe.counts();
         json!({
-            "room": self.room, "user": self.me, "session": self.session, "rate": self.rate, "stop_reason": self.stop_reason,
+            "room": self.room, "user": self.me, "session": self.session, "rate": self.rate, "stop_reason": self.stop_reason, "silence_ms": self.silence_ms,
             "turns": t.turns, "self_utterances": t.self_utterances, "self_frames": t.self_frames,
             "orphan_sourceless": t.orphan_sourceless, "orphan_sourced": t.orphan_sourced,
             "pipeline": { "frames": p.frames, "filled": p.filled, "other_speaker": p.other_speaker, "unheld": p.unheld, "broken": p.broken },
@@ -455,12 +457,11 @@ async fn main() {
         turns: Turns::new(me.clone()), replies: Replies::new(lim, frame_n), outq: outq.clone(), kick: kick.clone(), tx,
         ws_up: false, ws_connects: 0, ws_downs: 0, seq: 0, disconnected: Range::default(), filled: Range::default(), expect_ts: None, carry: Vec::new(),
         participants: BTreeSet::new(), foreign: None, turn_end_at: None, reply_pcm_at: None, lat_ai_ms: Vec::new(), lat_bridge_ms: Vec::new(),
-        frames_to_ai: 0, gaps_network: 0, tx_dropped: 0, orphan_diag: 0, pcm_carry: Vec::new(), stop_reason: None,
+        frames_to_ai: 0, gaps_network: 0, tx_dropped: 0, orphan_diag: 0, pcm_carry: Vec::new(), stop_reason: None, silence_ms: lim.silence.as_millis() as u64,
     };
     let mut pipe = Pipeline::new(Policy::Utterance);
     let mut tick = tokio::time::interval(Duration::from_millis(10));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut stat_at = Instant::now();
     let secs = a.secs;
     let stop = async {
         match secs {
@@ -526,11 +527,6 @@ async fn main() {
                 }
                 let acts = b.replies.tick(now);
                 b.acts(acts);
-                if now.saturating_duration_since(stat_at) >= Duration::from_secs(5) {
-                    stat_at = now;
-                    let s = b.summary(&pipe);
-                    client.log(AppLine::new(AppKind::Stat).spec("SDK:RULE-PLAT-AGENT").room(&b.room).key("turns", &s["turns"]).key("frames_to_ai", &s["frames_to_ai"]).key("frames_sent", &s["frames_sent"]).key("overflow_frames", &s["overflow_frames"]).key("orphans", b.turns.counts.orphan_sourced + b.turns.counts.orphan_sourceless).key("ws_up", b.ws_up));
-                }
             }
         }
     }

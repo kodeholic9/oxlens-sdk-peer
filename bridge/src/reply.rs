@@ -161,7 +161,7 @@ impl Replies {
     pub fn reply_start(&mut self, id: &str) -> Vec<Act> {
         if let Some(r) = &self.cur {
             self.counts.overlap += 1;
-            return vec![Act::Diag { what: "reply_overlap", spec: "SDK:RULE-PLAT-AGENT-REPLY", detail: format!("active={} new={id}", r.id) }];
+            return vec![Act::Diag { what: "reply_overlap", spec: "SD-RULE-PLAT-AGENT-REPLY", detail: format!("active={} new={id}", r.id) }];
         }
         self.counts.started += 1;
         self.cur = Some(Reply { id: id.to_string(), items: VecDeque::new(), frames: 0, ended: false, carry: Vec::new() });
@@ -210,7 +210,7 @@ impl Replies {
     pub fn reply_end(&mut self, id: &str, now: Instant) -> Vec<Act> {
         let n = self.frame_n;
         let Some(r) = self.cur.as_mut().filter(|r| r.id == id) else {
-            return vec![Act::Diag { what: "reply_end_unknown", spec: "SDK:RULE-PLAT-AGENT-REPLY", detail: format!("reply={id}") }];
+            return vec![Act::Diag { what: "reply_end_unknown", spec: "SD-RULE-PLAT-AGENT-REPLY", detail: format!("reply={id}") }];
         };
         r.ended = true;
         if !r.carry.is_empty() {
@@ -304,7 +304,7 @@ impl Replies {
         }
         self.floor = Floor::None;
         self.counts.lost += 1;
-        let mut acts = vec![Act::Diag { what: "floor_lost_silent", spec: "SDK:RULE-PLAT-AGENT-SILENCE", detail: format!("taken_by={user}") }];
+        let mut acts = vec![Act::Diag { what: "floor_lost_silent", spec: "SD-RULE-PLAT-AGENT-SILENCE", detail: format!("taken_by={user}") }];
         acts.extend(self.finish(json!({ "state": "lost", "taken_by": user }), false));
         acts
     }
@@ -346,7 +346,7 @@ impl Replies {
         let quiet = self.since.map(|s| now.saturating_duration_since(s)).unwrap_or_default();
         if !matches!(r.items.front(), Some(Item::Frame(_))) && quiet >= self.lim.silence {
             self.counts.truncated_silence += 1;
-            acts.push(Act::Diag { what: "reply_truncated_silence", spec: "SDK:RULE-PLAT-AGENT-SILENCE", detail: format!("quiet_ms={}", quiet.as_millis()) });
+            acts.push(Act::Diag { what: "reply_truncated_silence", spec: "SD-RULE-PLAT-AGENT-SILENCE", detail: format!("quiet_ms={}", quiet.as_millis()) });
             acts.extend(self.finish(json!({ "state": "truncated", "limit": "silence" }), true));
         }
         acts

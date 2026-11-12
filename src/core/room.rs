@@ -1063,6 +1063,10 @@ impl Core {
             let Some(ptt) = self.rooms.get(id).map(ptt_info) else { continue };
             self.emit(Event::Ptt { room: id.to_string(), event: what.to_string(), ptt });
         }
+        // 큐 승계 허가 — 누름은 늘 hold 다(SDK:IMPL-FLR-BUTTON `ptt.input` 기본 · 서버사이드에 toggle 표면이 없다) → 승계 허가가 온 순간 누른 채면 곧 의지 표시(연:RULE-FLR-PROC-QUEUED-ACCEPT)
+        if entry != "intent" && self.rooms.get(id).is_some_and(hold_intent_due) {
+            self.floor_enter(id, "intent", fc::intent, "hold");
+        }
         // 효과 표 — 화자 · 믿음(듣기 몫) · 재생은 서버사이드 대상 아님(SDK:RULE-PLAT-SERVER)
         for f in fx {
             match f {
@@ -1116,6 +1120,11 @@ impl Core {
         }
         self.floor_enter(&room, "receive", |s| Some(fc::receive(s, &rx)), "DC");
     }
+}
+
+/// 승계 허가가 와 있고(`QUEUED` · `sub = GRANTED`) 앱이 아직 누른 채인가(`want`) — 그러면 의지 표시를 곧 넣는다(hold)
+pub(crate) fn hold_intent_due(r: &Room) -> bool {
+    r.flr.cs == fc::CState::QUEUED && r.flr.sub == fc::CSub::GRANTED && r.flr.want
 }
 
 /// 받은 발언권 메시지에서 표면이 쓸 것 — 거절 · 회수 사유는 효과가 날 때까지 들고 · 순번은 곧 적는다
@@ -1219,5 +1228,12 @@ mod ptt_surface_test {
         assert_eq!((p.state.as_str(), p.queue_position, p.priority), ("QUEUED", Some(2), Some(1)));
         let p = step(&mut r, fc::Rx::Granted(fc::RxGranted { ack: false, priority: 1, duration: 20 }));
         assert_eq!((p.state.as_str(), p.remaining_sec), ("QUEUED", Some(20)), "큐 승계 허가 — 의지 표시 전에도 허가 시간이 보인다");
+        assert!(hold_intent_due(&r), "누른 채 승계 허가 — hold 면 의지 표시가 곧 들어가야 한다");
+        let plan = pb::plan(fc::intent(&r.flr).expect("승계 허가 창의 의지 표시"));
+        assert_eq!(plan.state.cs, fc::CState::PERM);
+        assert!(plan.routed.contains(&fc::Fx::mic_open), "의지 표시가 마이크 게이트를 연다");
+        let mut gone = Room::new("r1");
+        gone.flr = fc::Cl { want: false, ..r.flr.clone() };
+        assert!(!hold_intent_due(&gone), "놓은 뒤 온 승계 허가는 의지 표시하지 않는다(승계 시한이 처리)");
     }
 }

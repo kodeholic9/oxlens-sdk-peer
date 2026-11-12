@@ -518,8 +518,12 @@ impl Core {
     fn link_seam(&mut self, server: &str, fx: lc::SeamFx) {
         let rooms = self.rooms_on(server);
         match fx {
-            lc::SeamFx::floor_dc_down => rooms.iter().for_each(|r| self.floor_enter(r, "dcDown", |s| Some(crate::generated::floor_client::dc_down(s)), "dc")),
-            lc::SeamFx::floor_dc_up => rooms.iter().for_each(|r| self.floor_enter(r, "dcUp", |s| Some(crate::generated::floor_client::dc_up(s)), "dc")),
+            lc::SeamFx::floor_dc_down => rooms.iter().for_each(|r| {
+                self.floor_enter(r, "dcDown", |s| Some(crate::generated::floor_client::dc_down(s)), "dc");
+            }),
+            lc::SeamFx::floor_dc_up => rooms.iter().for_each(|r| {
+                self.floor_enter(r, "dcUp", |s| Some(crate::generated::floor_client::dc_up(s)), "dc");
+            }),
             lc::SeamFx::floor_down_server => rooms.iter().for_each(|r| self.floor_down(r)),
             lc::SeamFx::rooms_rejoin_server => self.rejoin_all(rooms),
             lc::SeamFx::store_drop_server => rooms.iter().for_each(|r| self.room_down_all(r)),

@@ -590,8 +590,12 @@ impl Core {
             rc::SeamFx::store_drop => self.trk_store_drop(id, label),
             rc::SeamFx::ready_tracks => self.sub_enter(id, "ready", |s| Some(uc::ready(s)), label),
             rc::SeamFx::sub_drop => self.sub_enter(id, "dropRoom", |s| Some(uc::drop_room(s)), label),
-            rc::SeamFx::floor_join => self.floor_enter(id, "join", |s| Some(fc::join(s)), label),
-            rc::SeamFx::floor_leave => self.floor_enter(id, "leave", |s| Some(fc::leave(s)), label),
+            rc::SeamFx::floor_join => {
+                self.floor_enter(id, "join", |s| Some(fc::join(s)), label);
+            }
+            rc::SeamFx::floor_leave => {
+                self.floor_enter(id, "leave", |s| Some(fc::leave(s)), label);
+            }
             rc::SeamFx::link_table => {
                 let t = self.rooms.get(id).and_then(|r| r.join_table.clone());
                 if let Some(s) = server {
@@ -1007,16 +1011,16 @@ impl Core {
 
     // ── 발언권 듣기(FLR) ──────────────────────────────────────────────
 
-    pub(super) fn floor_enter(&mut self, id: &str, entry: &'static str, f: impl Fn(&fc::Cl) -> Option<fc::Step>, cause: &str) {
-        let Some(r) = self.rooms.get(id) else { return };
+    pub(super) fn floor_enter(&mut self, id: &str, entry: &'static str, f: impl Fn(&fc::Cl) -> Option<fc::Step>, cause: &str) -> Vec<fc::Fx> {
+        let Some(r) = self.rooms.get(id) else { return vec![] };
         let Some(step) = f(&r.flr) else {
             self.impossible("FLR", id, r.flr.cs.as_str(), entry);
-            return;
+            return vec![];
         };
         let prev = r.flr.cs;
         let fx = step.fx.clone();
         let plan = pb::plan(step);
-        let Some(r) = self.rooms.get_mut(id) else { return };
+        let Some(r) = self.rooms.get_mut(id) else { return fx };
         r.flr = plan.state.clone();
         let shown = r.flr.shown.clone();
         let server = r.sfu.clone();
@@ -1068,7 +1072,7 @@ impl Core {
             self.floor_enter(id, "intent", fc::intent, "hold");
         }
         // 효과 표 — 화자 · 믿음(듣기 몫) · 재생은 서버사이드 대상 아님(SDK:RULE-PLAT-SERVER)
-        for f in fx {
+        for f in &fx {
             match f {
                 fc::Fx::app_speaker => self.emit(Event::Speaker { room: id.to_string(), user_id: shown.clone() }),
                 fc::Fx::app_speaker_none => self.emit(Event::Speaker { room: id.to_string(), user_id: None }),
@@ -1077,6 +1081,7 @@ impl Core {
                 _ => {}
             }
         }
+        fx
     }
 
     pub(super) fn floor_expire(&mut self, id: &str, t: fc::TimerName) {
@@ -1093,18 +1098,6 @@ impl Core {
         if self.rooms.get(&room).and_then(|r| r.sfu.as_deref()) != Some(server) {
             return;
         }
-        // 발언권 사건(SDK:RULE-PLAT-REC-RAW `ctl/floor`) — TAKEN · IDLE 과 출처 번호
-        #[cfg(feature = "record")]
-        if let Some(rec) = &self.sink.recorder {
-            let b = match &rx {
-                fc::Rx::Taken(m) => Some(serde_json::json!({ "room": room, "event": "taken", "user_id": m.speaker, "sources": m.sources, "seq": m.seq })),
-                fc::Rx::Idle(m) => Some(serde_json::json!({ "room": room, "event": "idle", "user_id": serde_json::Value::Null, "prev": m.prev, "seq": m.seq })),
-                _ => None,
-            };
-            if let Some(b) = b {
-                rec.push(crate::record::Channel::Floor, b.to_string().into_bytes());
-            }
-        }
         // 화자의 출처 번호(연:RULE-FLR-SLOT-SOURCES) — 반이중 발행은 트랙 목록에 없어 슬롯 패킷의 CSRC 는 이것으로 주인을 안다
         if let fc::Rx::Taken(m) = &rx {
             let fresh: Vec<u32> = m.sources.iter().flatten().filter_map(|c| u32::try_from(*c).ok()).filter(|c| self.talk_sources.get(c) != Some(&m.speaker)).collect();
@@ -1118,7 +1111,24 @@ impl Core {
         if let Some(r) = self.rooms.get_mut(&room) {
             ptt_rx(r, &rx);
         }
-        self.floor_enter(&room, "receive", |s| Some(fc::receive(s, &rx)), "DC");
+        let fx = self.floor_enter(&room, "receive", |s| Some(fc::receive(s, &rx)), "DC");
+        // 발언권 사건(SDK:RULE-PLAT-REC-RAW `ctl/floor`) — 상태기 뒤에 적는다(받은 GRANTED 는 그 효과로 가린다)
+        #[cfg(feature = "record")]
+        if let Some(rec) = &self.sink.recorder
+            && let Some(b) = floor_record(&room, self.user_id.as_deref(), &rx, &fx)
+        {
+            rec.push(crate::record::Channel::Floor, b.to_string().into_bytes());
+        }
+    }
+}
+
+/// `ctl/floor` 한 줄 — 받은 TAKEN · IDLE 과 출처 번호 · ★받은 GRANTED 는 상태기가 앞 화자를 지운 때(`app_speaker_none` — 요청 · 놓는 중 · 큐 승계 허가)만 `granted`(나) · 큐 승계 재전송 · 쥔 동안 온 허가는 상태기가 효과 없이 거른다 · 놓는 중 재전송은 다시 적히나 지울 발언이 없다
+pub(crate) fn floor_record(room: &str, me: Option<&str>, rx: &fc::Rx, fx: &[fc::Fx]) -> Option<Value> {
+    match rx {
+        fc::Rx::Taken(m) => Some(json!({ "room": room, "event": "taken", "user_id": m.speaker, "sources": m.sources, "seq": m.seq })),
+        fc::Rx::Idle(m) => Some(json!({ "room": room, "event": "idle", "user_id": Value::Null, "prev": m.prev, "seq": m.seq })),
+        fc::Rx::Granted(_) if fx.contains(&fc::Fx::app_speaker_none) => Some(json!({ "room": room, "event": "granted", "user_id": me, "seq": Value::Null })),
+        _ => None,
     }
 }
 
@@ -1196,6 +1206,25 @@ mod ptt_surface_test {
         let mut r = Room::new("r1");
         r.flr = fc::Cl { cs: fc::CState::PERM, prio, grant: 25, is_pub: true, ..fc::initial() };
         r
+    }
+
+    #[test]
+    fn own_grant_is_written_where_the_machine_clears_the_speaker() {
+        let g = || fc::Rx::Granted(fc::RxGranted { ack: true, priority: 0, duration: 30 });
+        let rec = |cl: fc::Cl, rx: &fc::Rx| floor_record("r1", Some("me"), rx, &fc::receive(&cl, rx).fx);
+        let want = Some(json!({ "room": "r1", "event": "granted", "user_id": "me", "seq": Value::Null }));
+        let base = fc::Cl { want: true, is_pub: true, ..fc::initial() };
+        assert_eq!(rec(fc::Cl { cs: fc::CState::PREQ, ..base.clone() }, &g()), want, "요청 뒤 허가");
+        let prel = fc::Cl { cs: fc::CState::PREL, ..base.clone() };
+        assert_eq!(rec(prel.clone(), &g()), want, "놓는 중 승계 허가");
+        assert_eq!(rec(fc::receive(&prel, &g()).s, &g()), want, "놓는 중 허가의 재전송은 PREL 에 머물러 다시 적힌다 — 파이프라인에서 해가 없다(지울 발언이 없다)");
+        let queued = fc::Cl { cs: fc::CState::QUEUED, sub: fc::CSub::WAIT, ..base.clone() };
+        assert_eq!(rec(queued.clone(), &g()), want, "큐 승계 허가");
+        let again = fc::receive(&queued, &g()).s;
+        assert_eq!(rec(again, &g()), None, "같은 허가 재전송(A 비트)은 두 번째 줄을 내지 않는다");
+        assert_eq!(rec(fc::Cl { cs: fc::CState::PERM, ..base.clone() }, &g()), None, "쥔 동안 온 허가");
+        let taken = fc::Rx::Taken(fc::RxTaken { ack: false, speaker: "A".into(), sources: Some(vec![7]), seq: 3 });
+        assert_eq!(rec(base.clone(), &taken).map(|v| v["event"].clone()), Some(json!("taken")));
     }
 
     #[test]

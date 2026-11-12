@@ -346,9 +346,11 @@ impl Pipeline {
     fn floor(&mut self, data: &[u8], at: u64, out: &mut Vec<Output>) {
         let Ok(v) = serde_json::from_slice::<Value>(data) else { return };
         let Some(room) = v["room"].as_str().map(str::to_string) else { return };
-        let taken = match v["event"].as_str() {
-            Some("taken") => true,
-            Some("idle") => false,
+        // ★`granted` = 내 허가(나는 내 발언을 받지 않는다) — 지금 화자 발언은 다음 허가처럼 닫고 · 새 화자는 열지 않는다
+        let (taken, opens) = match v["event"].as_str() {
+            Some("taken") => (true, true),
+            Some("granted") => (true, false),
+            Some("idle") => (false, false),
             _ => return,
         };
         let sources: Vec<u32> = v["sources"].as_array().into_iter().flatten().filter_map(Value::as_u64).map(|c| c as u32).collect();
@@ -361,7 +363,7 @@ impl Pipeline {
             return;
         }
         let seq = v["seq"].as_u64();
-        if taken && seq.is_some() && self.speaking.get(&room).is_some_and(|sp| sp.seq == seq) {
+        if opens && seq.is_some() && self.speaking.get(&room).is_some_and(|sp| sp.seq == seq) {
             return;
         }
         if let Some(old) = self.speaking.remove(&room) {
@@ -373,7 +375,7 @@ impl Pipeline {
                 self.ending.insert(room.clone(), Ending { old, deadline: at.saturating_add(ENDING_GRACE_NS), reason: if taken { "taken" } else { "idle" } });
             }
         }
-        if taken {
+        if opens {
             let sp = Speaker { seq, sources, utt: self.next_utt };
             self.next_utt += 1;
             self.speaking.insert(room.clone(), sp);

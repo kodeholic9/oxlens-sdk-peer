@@ -336,6 +336,32 @@ fn previous_speaker_tail_goes_to_its_utterance_within_grace_and_never_to_the_new
 }
 
 #[test]
+fn own_grant_closes_the_previous_speaker_and_opens_no_one() {
+    // 큐 승계 허가가 나에게 오면 남들은 TAKEN 을 받고 나는 GRANTED 를 받는다 — 앞 화자 발언이 그때 닫혀야 한다(20261112f)
+    let ms = 1_000_000u64;
+    let recs = [
+        rec(1, 0, Channel::Track, tracks("r")),
+        floor(2, 0, "taken", "A", &[7]),
+        slot_audio(3, 20 * ms, 1, 7),
+        rec(4, 30 * ms, Channel::Floor, br#"{"room":"r","event":"granted","user_id":"me","seq":null}"#.to_vec()),
+        rec(41, 32 * ms, Channel::Floor, br#"{"room":"r","event":"granted","user_id":"me","seq":null}"#.to_vec()),
+        slot_audio(5, 35 * ms, 2, 7),
+        slot_audio(6, 400 * ms, 3, 7),
+        floor(7, 1_000 * ms, "taken", "B", &[8]),
+        slot_audio(8, 1_020 * ms, 4, 8),
+    ];
+    let mut pl = Pipeline::new(Policy::Utterance);
+    let mut out: Vec<Output> = recs[..7].iter().flat_map(|r| pl.push(r)).collect();
+    assert_eq!(utter(&out).2, vec!["taken"], "A 발언은 내 허가 + 유예(400ms 레코드)에서 닫힌다 — B 허가를 기다리지 않는다 · 두 번째 granted(놓는 중 허가 재전송)는 해가 없다");
+    out.extend(recs[7..].iter().flat_map(|r| pl.push(r)));
+    out.extend(pl.finish());
+    let (fr, orph, closed) = utter(&out);
+    assert_eq!(fr, vec![(Some(0), Some(7)), (Some(0), Some(7)), (Some(1), Some(8))], "유예 안 A 꼬리는 A 발언에 · 내 허가는 발언을 열지 않는다(B 가 다음 번호)");
+    assert_eq!(orph, vec![Some(7)], "유예를 넘긴 A 패킷은 센다");
+    assert_eq!(closed, vec!["taken", "end"]);
+}
+
+#[test]
 fn repeated_taken_of_the_same_grant_does_not_split_the_utterance() {
     let ms = 1_000_000u64;
     let recs = [

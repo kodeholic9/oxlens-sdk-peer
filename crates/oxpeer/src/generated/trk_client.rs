@@ -138,7 +138,7 @@ pub struct TrackStateMsg {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct St {
-    /// 트랙 층 — 받은 항목으로 통째 교체한다
+    /// 트랙 층 — 받은 항목으로 통째 교체한다 · ★받을 트랙만 — 내 개인 트랙은 넣지 않는다(델타 길 mine_other · 스냅샷은 내 것을 빼고 넘긴다 — 202611/20261113j ③-2)
     pub lay: Rec<Layer>,
     /// 트랙 층의 muted — TRACK_STATE 와 항목 교체가 고친다
     pub muted: Rec<bool>,
@@ -240,7 +240,7 @@ pub fn track_state(s: &St, m: &TrackStateMsg) -> Option<Step> {
     Some(done(s, St { muted: { let mut r = s.muted.clone(); r.insert(m.track_id.clone(), m.muted); r }, ..s.clone() }, "TRK.C.any.track_state", vec![], vec![Fx::app_track_state], vec![], vec![]))
 }
 
-/// 스냅샷(입장 응답 · RESUME · GET)의 tracks 를 받았다 — 그 방 트랙 목록 전부다(보기용 · RULE-TRK-FOUR-PATHS · RULE-TRK-PER-PATH) · ★배정표는 실려 오지 않는다(입장 응답 · RESUME 의 표는 MLINE_EVENT 와 같은 길로 받는다)
+/// 스냅샷(입장 응답 · RESUME · GET)의 tracks 를 받았다 — 그 방 트랙 목록 전부다(보기용 · RULE-TRK-FOUR-PATHS · RULE-TRK-PER-PATH) · ★sLay · sMuted 는 내 개인 트랙을 뺀 것이다 — 받을 트랙이 아니다(델타 길 mine_other 와 같은 보관본 · 202611/20261113j ③-2) · ★배정표는 실려 오지 않는다(입장 응답 · RESUME 의 표는 MLINE_EVENT 와 같은 길로 받는다)
 pub fn snapshot(s: &St, s_lay: &Rec<Layer>, s_muted: &Rec<bool>) -> Step {
     if *s_lay != s.lay || *s_muted != s.muted {
         return done(s, St { lay: s_lay.clone(), muted: s_muted.clone(), ..s.clone() }, "TRK.C.any.snapshot", vec![], vec![Fx::app_tracks], vec![], vec![]);

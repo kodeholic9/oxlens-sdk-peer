@@ -1267,3 +1267,25 @@ mod ptt_surface_test {
         assert!(!hold_intent_due(&gone), "놓은 뒤 온 승계 허가는 의지 표시하지 않는다(승계 시한이 처리)");
     }
 }
+
+#[cfg(test)]
+mod own_track_test {
+    use super::*;
+
+    fn entry(v: Value) -> TrackEntry {
+        serde_json::from_value(v).expect("트랙 항목")
+    }
+
+    /// 스냅샷 · 델타가 같은 보관본을 짓는 거르기(연:TRK.C.any.snapshot · 연:TRK.C.any.mine_other · context 202611/20261113j ③-2) — 내 개인 트랙만 뺀다
+    #[test]
+    fn own_is_only_my_individual_track() {
+        let r = Room::new("r1");
+        let mine = entry(json!({ "type": "individual", "room_id": "r1", "track_id": "t1", "kind": "video", "user_id": "me" }));
+        let other = entry(json!({ "type": "individual", "room_id": "r1", "track_id": "t2", "kind": "video", "user_id": "you" }));
+        let slot = entry(json!({ "type": "slot", "room_id": "r1", "track_id": "ptt-r1-video", "kind": "video" }));
+        assert!(r.own(&mine, Some("me")), "내 개인 트랙은 받을 트랙이 아니다");
+        assert!(!r.own(&other, Some("me")), "남의 트랙은 받는다");
+        assert!(!r.own(&slot, Some("me")), "방 슬롯은 내가 말해도 받을 트랙이다");
+        assert!(!r.own(&mine, None), "내 신원을 모르면 거르지 않는다");
+    }
+}

@@ -1,5 +1,5 @@
 // ★생성 파일 — gen/axis_client.mts 가 원천(context/spec/protocol · areas/room/behavior)에서 짓는다. 손으로 고치지 않는다.
-// IR sha256 2b1c11b92e31d09f · 영역 ROOM 클라 상태기 Rust 판 — 같은 생성기의 TS 판과 한 뿌리(같은 입구 · 같은 경우 · 같은 라벨).
+// IR sha256 b500f2c633b6688f · 영역 ROOM 클라 상태기 Rust 판 — 같은 생성기의 TS 판과 한 뿌리(같은 입구 · 같은 경우 · 같은 라벨).
 // 집행은 부르는 쪽 몫이다 — out(보낼 것) · fx(이 영역의 효과) · seams(다른 영역 입구로 — 받는 곳은 위가 정했다) · start(새로 걸 타이머). armed() 밖의 타이머는 멈춘다.
 // 모형 자리(트랙 · 배정표 사본의 열쇠)는 문자열이다 — 실제 값을 넣는 법은 결합이 정한다(SDK:RULE-MOD-BINDING-VALUES).
 #![allow(dead_code, unused_variables, unused_mut, unused_parens, non_camel_case_types, clippy::all)]
@@ -383,7 +383,7 @@ pub fn join_res(s: &St, m: &JoinResMsg, pcm: PcMode) -> Option<Step> {
         return Some(done(s, St { rs: RoomSt::LEAVING, sfu: m.server_config.sfu_id, jid: m.join_id, jsure: true, ..s.clone() }, "ROOM.C.JOINING.join_pc_mismatch", vec![Tx::RoomLeave { join_id: m.join_id }], vec![Fx::app_join_failed], vec![Seam { fx: SeamFx::aff_leave, to: "AFF", at: "self" }, Seam { fx: SeamFx::room_sub_rooms, to: "ROOM", at: "sameServer" }], vec![]));
     }
     if m.part == Part::res {
-        return Some(done(s, St { rs: RoomSt::JOINED, cseq: m.version.seq, cepoch: m.version.epoch, sfu: m.server_config.sfu_id, jid: m.join_id, jsure: true, ..s.clone() }, "ROOM.C.JOINING.join_ok", vec![], vec![Fx::app_joined], vec![Seam { fx: SeamFx::trk_snapshot, to: "TRK", at: "self" }, Seam { fx: SeamFx::link_server_ice, to: "LINK", at: "sameServer" }, Seam { fx: SeamFx::link_table, to: "LINK", at: "sameServer" }, Seam { fx: SeamFx::sdp_rebuild, to: "LINK", at: "sameServer" }, Seam { fx: SeamFx::ready_tracks, to: "SUB", at: "self" }, Seam { fx: SeamFx::room_sub_rooms, to: "ROOM", at: "sameServer" }, Seam { fx: SeamFx::aff_implicit, to: "AFF", at: "self" }, Seam { fx: SeamFx::floor_join, to: "FLR", at: "self" }], vec![]));
+        return Some(done(s, St { rs: RoomSt::JOINED, cseq: m.version.seq, cepoch: m.version.epoch, sfu: m.server_config.sfu_id, jid: m.join_id, jsure: true, ..s.clone() }, "ROOM.C.JOINING.join_ok", vec![], vec![Fx::app_joined], vec![Seam { fx: SeamFx::trk_snapshot, to: "TRK", at: "self" }, Seam { fx: SeamFx::link_server_ice, to: "LINK", at: "sameServer" }, Seam { fx: SeamFx::link_table, to: "LINK", at: "sameServer" }, Seam { fx: SeamFx::sdp_rebuild, to: "LINK", at: "sameServer" }, Seam { fx: SeamFx::ready_tracks, to: "SUB", at: "self" }, Seam { fx: SeamFx::room_sub_rooms, to: "ROOM", at: "sameServer" }, Seam { fx: SeamFx::floor_join, to: "FLR", at: "self" }, Seam { fx: SeamFx::aff_implicit, to: "AFF", at: "self" }], vec![]));
     }
     if m.code == 4009 {
         return Some(done(s, St { retry: true, ..s.clone() }, "ROOM.C.JOINING.join_4009", vec![], vec![], vec![], vec![]));

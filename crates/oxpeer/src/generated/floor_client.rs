@@ -1,5 +1,5 @@
 // ★생성 파일 — gen/floor_client.mts 가 원천(context/spec/protocol · areas/flr/behavior/client.ts)에서 짓는다. 손으로 고치지 않는다.
-// IR sha256 a20f88b2b4a7be13 · 3GPP TS 24.380 §6.2.4 floor participant · Rust 판 — 같은 생성기의 TS 판과 한 뿌리(같은 입구 · 같은 칸 · 같은 라벨).
+// IR sha256 44f4e4316686c2a0 · 3GPP TS 24.380 §6.2.4 floor participant · Rust 판 — 같은 생성기의 TS 판과 한 뿌리(같은 입구 · 같은 칸 · 같은 라벨).
 // 집행은 부르는 쪽 몫이다 — out(DC 로 보낼 것) · ack(ACK 으로 답할 것) · fx(마이크 · 화면 · 앱 알림) · start(다시 걸 타이머). armed() 밖의 타이머는 멈춘다.
 #![allow(dead_code, unused_variables, unused_mut, unused_parens, non_camel_case_types, clippy::all)]
 
@@ -165,6 +165,16 @@ pub struct RxIdle {
 
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RxRevoke {
+    /// 머리의 A 비트 — 서야 ACK 으로 답한다
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ack: bool,
+    pub cause: i64,
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))] pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RxGranted {
     /// 머리의 A 비트 — 서야 ACK 으로 답한다
     #[cfg_attr(feature = "serde", serde(default))]
@@ -201,16 +211,6 @@ pub struct RxQinfo {
 
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct RxRevoke {
-    /// 머리의 A 비트 — 서야 ACK 으로 답한다
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub ack: bool,
-    pub cause: i64,
-    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))] pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RxAck {
     /// 머리의 A 비트 — 서야 ACK 으로 답한다
     #[cfg_attr(feature = "serde", serde(default))]
@@ -227,14 +227,14 @@ pub enum Rx {
     Taken(RxTaken),
     #[cfg_attr(feature = "serde", serde(rename = "IDLE"))]
     Idle(RxIdle),
+    #[cfg_attr(feature = "serde", serde(rename = "REVOKE"))]
+    Revoke(RxRevoke),
     #[cfg_attr(feature = "serde", serde(rename = "GRANTED"))]
     Granted(RxGranted),
     #[cfg_attr(feature = "serde", serde(rename = "DENY"))]
     Deny(RxDeny),
     #[cfg_attr(feature = "serde", serde(rename = "QINFO"))]
     Qinfo(RxQinfo),
-    #[cfg_attr(feature = "serde", serde(rename = "REVOKE"))]
-    Revoke(RxRevoke),
     #[cfg_attr(feature = "serde", serde(rename = "ACK"))]
     Ack(RxAck),
 }
@@ -452,6 +452,12 @@ pub fn receive(s: &Cl, msg: &Rx) -> Step {
             Rx::Idle(m) => {
                 done(s, Cl { shown: None, ..s.clone() }, "FLR.C.NOPERM.rx_IDLE", vec![], vec![], vec![Fx::app_speaker_none], vec![])
             }
+            Rx::Revoke(m) => {
+                if m.cause == 3 {
+                    return done(s, s.clone(), "FLR.C.NOPERM.rx_REVOKE_release", vec![Tx::Release], vec![], vec![], vec![]);
+                }
+                done(s, s.clone(), "FLR.C.NOPERM.rx_REVOKE_other", vec![], vec![], vec![], vec![])
+            }
             _ => {
                 done(s, s.clone(), "FLR.C.NOPERM.rx_other", vec![], vec![], vec![], vec![])
             }
@@ -562,6 +568,12 @@ pub fn rx_from_tlv(msg_type: u8, ack: bool, tlvs: &[(u8, Vec<u8>)]) -> Option<(S
             let seq = get(8).and_then(|v| (if v.len() >= 2 { Some(i64::from(u16::from_be_bytes([v[0], v[1]]))) } else { None }))?;
             Some((room, Rx::Idle(RxIdle { ack, prev, seq })))
         }
+        6 => {
+            let room = get(29).and_then(|v| Some(String::from_utf8_lossy(v).into_owned()))?;
+            let cause = get(2).and_then(|v| v.first().map(|x| i64::from(*x)))?;
+            let reason = get(27).and_then(|v| Some(String::from_utf8_lossy(v).into_owned()));
+            Some((room, Rx::Revoke(RxRevoke { ack, cause, reason })))
+        }
         1 => {
             let room = get(29).and_then(|v| Some(String::from_utf8_lossy(v).into_owned()))?;
             let priority = get(0).and_then(|v| (if v.len() == 2 { Some(i64::from(v[0])) } else { None }))?;
@@ -578,12 +590,6 @@ pub fn rx_from_tlv(msg_type: u8, ack: bool, tlvs: &[(u8, Vec<u8>)]) -> Option<(S
             let room = get(29).and_then(|v| Some(String::from_utf8_lossy(v).into_owned()))?;
             let info = get(3).and_then(|v| (if v.len() >= 2 { Some(RxQinfoInfo { position: i64::from(v[0]), priority: i64::from(v[1]) }) } else { None }))?;
             Some((room, Rx::Qinfo(RxQinfo { ack, info })))
-        }
-        6 => {
-            let room = get(29).and_then(|v| Some(String::from_utf8_lossy(v).into_owned()))?;
-            let cause = get(2).and_then(|v| v.first().map(|x| i64::from(*x)))?;
-            let reason = get(27).and_then(|v| Some(String::from_utf8_lossy(v).into_owned()));
-            Some((room, Rx::Revoke(RxRevoke { ack, cause, reason })))
         }
         10 => {
             let room = get(29).and_then(|v| Some(String::from_utf8_lossy(v).into_owned()))?;

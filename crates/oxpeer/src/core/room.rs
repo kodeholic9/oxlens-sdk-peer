@@ -1025,6 +1025,15 @@ impl Core {
         let shown = r.flr.shown.clone();
         let server = r.sfu.clone();
         self.record("FLR", id, prev.as_str(), plan.state.cs.as_str(), plan.label, cause);
+        // 위 이음매 — mic.open · mic.close 는 그 방의 반이중 발행 게이트로(발행 floorOpen · floorClose).
+        // ★DC 송신보다 먼저 — 놓기(RELEASE)는 송출을 멈춘 뒤 나간다(연:RULE-FLR-MSG-RELEASE · 202611/20261113h · 게이트 닫기는 동기라 곧바로 멈춘다)
+        for f in &plan.routed {
+            match f {
+                fc::Fx::mic_open => self.floor_to_pub(id, true),
+                fc::Fx::mic_close => self.floor_to_pub(id, false),
+                _ => {}
+            }
+        }
         // 보낼 것 · ACK — 그 서버 DC 로(못 보내면 위 타이머가 다시 보낸다)
         let mut out: Vec<Vec<u8>> = plan.send.iter().filter_map(|t| dc::tx(t, id)).collect();
         out.extend(plan.ack.iter().filter_map(|a| dc::ack(a, id)));
@@ -1041,14 +1050,6 @@ impl Core {
                 self.timers.stop(&tk);
             } else if plan.timers.contains(t) || !self.timers.armed(&tk) {
                 self.timers.start(tk, Duration::from_millis(fc::timer_ms(*t) as u64));
-            }
-        }
-        // 위 이음매 — mic.open · mic.close 는 그 방의 반이중 발행 게이트로(발행 floorOpen · floorClose)
-        for f in &plan.routed {
-            match f {
-                fc::Fx::mic_open => self.floor_to_pub(id, true),
-                fc::Fx::mic_close => self.floor_to_pub(id, false),
-                _ => {}
             }
         }
         // 누름 쪽 사건(20261107c) — 허가 · 거절 · 대기 · 회수 · 상태(시한 · 믿음) · 사유 · 허가 시간 · 순번(SDK:IMPL-FLR-EXPOSE)

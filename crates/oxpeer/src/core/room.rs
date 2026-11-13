@@ -51,6 +51,8 @@ pub(crate) struct Room {
     /// 그 방의 미디어 코덱(입장 응답 — 발행은 이것으로 · 연:RULE-ROOM-MEDIA-CODECS) · 이 방에서 말하려고 들어간다(select:true) · 입장 응답의 발행 방
     pub(crate) media: Option<crate::generated::ws_wire::MediaCodecs>,
     pub(crate) select: bool,
+    /// 마지막으로 보낸 ROOM_JOIN 의 select — 응답의 소속 몫(implicit)이 제 요청의 select 를 쓴다 · ★재구축의 다시 들어감은 늘 false(연:RULE-LINK-RECOVERY-REBUILD · context 20261113j ③-4)
+    join_sel: bool,
     /// 들어간 뒤 소속 전환으로 발언 방을 옮긴다(이미 발행 방이 있었다)
     pub(crate) select_after: bool,
     aff_pub: Option<Option<String>>,
@@ -71,6 +73,11 @@ pub(crate) struct Room {
 }
 
 impl Room {
+    /// 이번 ROOM_JOIN 의 select — 앱 입장이면 그때 소속이 정한 값 · ★재구축의 다시 들어감은 false(연:RULE-LINK-RECOVERY-REBUILD — 발행 방은 들어간 뒤 되찾는다)
+    fn join_select(&self) -> bool {
+        self.select && !self.rebuilding
+    }
+
     fn new(id: &str) -> Room {
         Room {
             id: id.to_string(),
@@ -97,6 +104,7 @@ impl Room {
             join_table: None,
             media: None,
             select: false,
+            join_sel: false,
             select_after: false,
             aff_pub: None,
             rebuilding: false,
@@ -275,9 +283,15 @@ impl Core {
         }
     }
 
-    /// 입장 — 듣기(`select:false`) · jid = 갈아 끼울 입장의 join_id(재구축 · 0 = 새 입장 — 연:RULE-ROOM-JOIN-REPLACE)
+    /// 입장 · jid = 갈아 끼울 입장의 join_id(재구축 · 0 = 새 입장 — 연:RULE-ROOM-JOIN-REPLACE)
+    /// select — 앱 입장은 그때 소속이 정한 값(연:RULE-ROOM-JOIN-START 2) · ★재구축의 다시 들어감은 false — 발행 방은 들어간 뒤 되찾는다
+    ///   (처음 입장의 select 를 되실으면 다른 서버가 이미 발행 방을 가졌을 때 발행 방이 둘이 된다 — 소속 판 rebuild_sel 반례 AH2 · context 20261113j ③-4)
     fn send_join(&mut self, id: &str, jid: i64) {
-        let req = RoomJoinReq { room_id: id.to_string(), role: None, select: Some(self.rooms.get(id).is_some_and(|r| r.select)), extmap: None, codecs: None, join_id: self.jids.str(jid).map(str::to_string) };
+        let sel = self.rooms.get(id).is_some_and(Room::join_select);
+        if let Some(r) = self.rooms.get_mut(id) {
+            r.join_sel = sel;
+        }
+        let req = RoomJoinReq { room_id: id.to_string(), role: None, select: Some(sel), extmap: None, codecs: None, join_id: self.jids.str(jid).map(str::to_string) };
         let epoch = self.rooms[id].req_epoch;
         self.request(Op::RoomJoin, super::to_body(&req), Purpose::RoomJoin { room: id.to_string(), epoch, jid });
     }
@@ -638,7 +652,7 @@ impl Core {
             }
             // 소속(발언 방 — 20261107c) — 입장이 곁들여 바꾼 발행 방 · 떠남 · 재구축 · 입장 실패
             rc::SeamFx::aff_implicit => {
-                let (sel, p) = self.rooms.get_mut(id).map(|r| (r.select, r.aff_pub.take().flatten())).unwrap_or((false, None));
+                let (sel, p) = self.rooms.get_mut(id).map(|r| (r.join_sel, r.aff_pub.take().flatten())).unwrap_or((false, None));
                 self.aff_implicit(id, sel, p);
             }
             rc::SeamFx::aff_leave => {
@@ -1287,5 +1301,23 @@ mod own_track_test {
         assert!(!r.own(&other, Some("me")), "남의 트랙은 받는다");
         assert!(!r.own(&slot, Some("me")), "방 슬롯은 내가 말해도 받을 트랙이다");
         assert!(!r.own(&mine, None), "내 신원을 모르면 거르지 않는다");
+    }
+}
+
+#[cfg(test)]
+mod rejoin_select_test {
+    use super::*;
+
+    /// 재구축의 다시 들어감은 select:false — 처음 입장의 select 를 되실으면 다른 서버의 발행 방과 둘이 된다(소속 판 rebuild_sel 반례 AH2 · context 202611/20261113j ③-4)
+    #[test]
+    fn rebuild_rejoin_never_selects() {
+        let mut r = Room::new("r1");
+        assert!(!r.join_select(), "듣기 입장은 select:false");
+        r.select = true;
+        assert!(r.join_select(), "발행 방 없이 말하려는 앱 입장은 select:true(연:RULE-ROOM-JOIN-START 2)");
+        r.rebuilding = true;
+        assert!(!r.join_select(), "재구축의 다시 들어감은 처음 입장이 select:true 였어도 select:false");
+        r.rebuilding = false;
+        assert!(r.join_select(), "재구축이 끝난 뒤 그 방의 앱 입장 값은 그대로");
     }
 }
